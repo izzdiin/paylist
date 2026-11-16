@@ -1,8 +1,8 @@
 # Paylist — Owner Signoff Matrix v1.1
 
-**Status:** PRESENTED FOR OWNER DECISION (MUSE-R36, 16 November 2026) · **Sources:** `04-final-design-v1.1.md` (R36) + `04-file-plan-v1.1.md` (R36) + GitHub Issue izzdiin/paylist#1 · **Mode:** DOCUMENTATION ONLY — this matrix records decisions and evidence; it grants no implementation, pilot, or production authorisation.
+**Status:** PARTIALLY DECIDED (MUSE-R37, 16 November 2026) — 4 of 7 sign-offs decided; D-final, G11-pilot, G11-production remain · **Sources:** `04-final-design-v1.1.md` (R37) + `04-file-plan-v1.1.md` (R37) + GitHub Issue izzdiin/paylist#1 · **Mode:** DOCUMENTATION ONLY — this matrix records decisions and evidence; it grants no implementation, pilot, or production authorisation.
 
-This document answers the recheck's request (comment 6907321403): present the consolidated owner-signoff matrix and evidence before requesting D-final. Nothing in it is approved until the owner says so, per item.
+This document answers the recheck's request (comment 6907321403): present the consolidated owner-signoff matrix and evidence before requesting D-final. Nothing in it is approved until the owner says so, per item. Updated in MUSE-R37 with the owner decisions P2/C4/C20/C21 (comment 6907505460).
 
 ## 1. Decisions already made (owner-locked, for the record)
 
@@ -20,18 +20,20 @@ This document answers the recheck's request (comment 6907321403): present the co
 | §7 exception policy | ACCEPTED: bounded per-route P6 Option B (mixed financial+OTP only, pure-auth excluded, in-memory raw handling) | 6902737515 |
 | Q1 (reconciliation export) | REVISED: structured transaction reconciliation export REQUIRED in v1.1 MVP (CSV mandatory); diagnostic/recovery export remains prohibited | 6905797710 |
 | Export policy trade-offs | LOCKED: identifiers default OFF with no cross-export persistence; recorder records included; stable anonymous row ID required; currency-appropriate decimal amounts | 6905986632 |
+| P2 (supersession) | ACCEPTED: superseded by D8 (revised C4, §7.1–7.2 — financial record preserved, secret span redacted); whole-event drop only for pure-auth events | 6907505460 |
+| C4 (PrivacyGate rule) | APPROVED: §7.1 four-class rule as the final form; residual Option A′ trade-off accepted (security objective, not a proof) | 6907505460 |
+| C20 (PrivacyGate fixtures) | APPROVED: fixture set F1–F19 (§12.3) as the acceptance basis; execution is a Phase 1.3 matter | 6907505460 |
+| C21 (capture handoff gate) | APPROVED: §8.3–8.5, §9 as written; F40 remains conditional until it runs on the actual stack | 6907505460 |
 
 ## 2. Pending owner sign-offs (the matrix)
 
+Items P2, C4, C20, C21 were decided 2026-11-16 (comment 6907505460) and are recorded in §1. Three sign-offs remain:
+
 | # | Decision | What the owner signs | Evidence status | Blockers |
 |---|---|---|---|---|
-| 1 | P2 supersession | Mixed OTP+financial event: superseded by D8 (revised C4, §7.1–7.2 — financial record preserved, secret span redacted) | Design text complete (§7.1–7.2) | Sign-off pending as part of D-final |
-| 2 | C4 approval | PrivacyGate four-class rule (§7.1, final form R8/R9/R10 as amended by R23/R24) | Design text complete | Approval against the consolidated text pending |
-| 3 | C20 approval | PrivacyGate fixture set (F1–F19, §12.3) | Fixtures documented; none executed yet | Approval against the consolidated text pending; execution is a Phase 1.3 matter |
-| 4 | C21 approval | Capture handoff gate (§8.3–8.5, §9 — staging, atomic admission, pre-socket machine, mode/intent table, orphaned-attempt quiescence, per-hop drain, status-query contract, attribution protocol, pre-v1.1 evidence model, negative-query safety, re-gating) | Design text complete | Approval against the consolidated text pending |
-| 5 | D-final | Spec v1.1 approval (the consolidated design + file plan as the buildable specification) | Requires explicit separate approval after the evidence in §3; H1 (independent full-design consolidation/approval gate) is the remaining blocker | H1 open; items 1–4 above |
-| 6 | G11-pilot | Pilot gate: the v1.1 build may run on the pilot device | Blocked on D-final + the pre-pilot evidence (§3) | D-final; F40 on the actual stack; P11 v2New; clean build on laptopgrt; per-route/endpoint contract tables |
-| 7 | G11-production | Production gate: the v1.1 build may run on the production device | Blocked on G11-pilot | G11-pilot |
+| 1 | D-final | Spec v1.1 approval (the consolidated design + file plan as the buildable specification) | Requires explicit separate approval after the evidence in §3; H1 (independent full-design consolidation/approval gate) is the remaining blocker | H1 open |
+| 2 | G11-pilot | Pilot gate: the v1.1 build may run on the pilot device | Blocked on D-final + the pre-pilot evidence (§3) | D-final; F40 on the actual stack; P11 v2New; clean build on laptopgrt; per-route/endpoint contract tables |
+| 3 | G11-production | Production gate: the v1.1 build may run on the production device | Blocked on G11-pilot | G11-pilot |
 
 ## 3. Evidence status (what is verified, what is not)
 
