@@ -1,0 +1,8 @@
+# Gradle / Android build outputs (generated; never committed)
+.gradle/
+app/build/
+build/
+local.properties
+*.iml
+.idea/
+.kotlin/
