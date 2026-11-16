@@ -1,0 +1,18 @@
+{
+  "fixture": "notify-payment-matched-apply-skip",
+  "endpoint": "notify",
+  "event_type": "payment",
+  "http_status": 200,
+  "headers": {},
+  "body": {
+    "ok": true,
+    "duplicate": false,
+    "mode": "observasi",
+    "match": {
+      "status": "matched",
+      "id_pelanggan": 11000099,
+      "payment": 9999,
+      "apply": "skip"
+    }
+  }
+}

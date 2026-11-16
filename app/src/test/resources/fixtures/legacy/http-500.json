@@ -1,0 +1,11 @@
+{
+  "fixture": "http-500",
+  "endpoint": "notify",
+  "event_type": "payment",
+  "http_status": 500,
+  "headers": {},
+  "body": {
+    "ok": false,
+    "error": "db_unavailable"
+  }
+}

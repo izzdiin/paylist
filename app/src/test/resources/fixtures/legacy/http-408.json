@@ -1,0 +1,8 @@
+{
+  "fixture": "http-408",
+  "endpoint": "notify",
+  "event_type": "payment",
+  "http_status": 408,
+  "headers": {},
+  "body": ""
+}

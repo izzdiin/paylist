@@ -1,0 +1,14 @@
+{
+  "fixture": "http-429-retry-after",
+  "endpoint": "notify",
+  "event_type": "payment",
+  "http_status": 429,
+  "headers": {
+    "Retry-After": "120"
+  },
+  "body": {
+    "ok": false,
+    "error": "rate_limited"
+  },
+  "note": "HTTP-level fixture; 429 comes from a proxy/WAF, not the PHP endpoints."
+}

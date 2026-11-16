@@ -1,0 +1,14 @@
+{
+  "fixture": "catat-heartbeat",
+  "endpoint": "catat",
+  "event_type": "heartbeat",
+  "http_status": 200,
+  "headers": {},
+  "body": {
+    "ok": true,
+    "recorded": false,
+    "match": {
+      "status": "logged"
+    }
+  }
+}

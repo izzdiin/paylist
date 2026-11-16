@@ -1,0 +1,13 @@
+{
+  "fixture": "notify-heartbeat-fresh",
+  "endpoint": "notify",
+  "event_type": "heartbeat",
+  "http_status": 200,
+  "headers": {},
+  "body": {
+    "ok": true,
+    "duplicate": false,
+    "mode": "observasi",
+    "match": null
+  }
+}

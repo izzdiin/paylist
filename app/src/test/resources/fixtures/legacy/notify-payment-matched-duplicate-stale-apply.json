@@ -1,0 +1,19 @@
+{
+  "fixture": "notify-payment-matched-duplicate-stale-apply",
+  "endpoint": "notify",
+  "event_type": "payment",
+  "http_status": 200,
+  "headers": {},
+  "body": {
+    "ok": true,
+    "duplicate": true,
+    "mode": "observasi",
+    "match": {
+      "status": "matched",
+      "id_pelanggan": 11000099,
+      "payment": 9999,
+      "apply": "ok"
+    }
+  },
+  "note": "Defensive: the real endpoint never echoes apply on a duplicate; the rule pins that a stale apply value must never be trusted (§5.4)."
+}

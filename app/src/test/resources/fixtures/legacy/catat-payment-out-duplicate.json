@@ -1,0 +1,15 @@
+{
+  "fixture": "catat-payment-out-duplicate",
+  "endpoint": "catat",
+  "event_type": "payment",
+  "http_status": 200,
+  "headers": {},
+  "body": {
+    "ok": true,
+    "recorded": false,
+    "direction": "out",
+    "match": {
+      "status": "logged"
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "fixture": "catat-test",
+  "endpoint": "catat",
+  "event_type": "test",
+  "http_status": 200,
+  "headers": {},
+  "body": {
+    "ok": true,
+    "recorded": false,
+    "match": {
+      "status": "logged"
+    }
+  }
+}

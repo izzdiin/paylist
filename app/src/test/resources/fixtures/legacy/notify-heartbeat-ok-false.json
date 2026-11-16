@@ -1,0 +1,12 @@
+{
+  "fixture": "notify-heartbeat-ok-false",
+  "endpoint": "notify",
+  "event_type": "heartbeat",
+  "http_status": 200,
+  "headers": {},
+  "body": {
+    "ok": false,
+    "error": "synthetic"
+  },
+  "note": "Synthetic: the real endpoint never returns 2xx without ok=true; pins the C1 rule that such a response is a failed attempt."
+}
