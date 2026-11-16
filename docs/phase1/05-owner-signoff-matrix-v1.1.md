@@ -1,15 +1,15 @@
 # Paylist — Owner Signoff Matrix v1.1
 
-**Status:** PARTIALLY DECIDED (MUSE-R37, 16 November 2026) — 4 of 7 sign-offs decided; D-final, G11-pilot, G11-production remain · **Sources:** `04-final-design-v1.1.md` (R37) + `04-file-plan-v1.1.md` (R37) + GitHub Issue izzdiin/paylist#1 · **Mode:** DOCUMENTATION ONLY — this matrix records decisions and evidence; it grants no implementation, pilot, or production authorisation.
+**Status:** PARTIALLY DECIDED (MUSE-R38, 16 November 2026) — 4 of 7 sign-offs decided; D-final, G11-pilot, G11-production remain · **Sources:** `04-final-design-v1.1.md` (R37) + `04-file-plan-v1.1.md` (R37) + GitHub Issue izzdiin/paylist#1 · **Mode:** DOCUMENTATION ONLY — this matrix records decisions and evidence; it grants no implementation, pilot, or production authorisation.
 
-This document answers the recheck's request (comment 6907321403): present the consolidated owner-signoff matrix and evidence before requesting D-final. Nothing in it is approved until the owner says so, per item. Updated in MUSE-R37 with the owner decisions P2/C4/C20/C21 (comment 6907505460).
+This document answers the recheck's request (comment 6907321403): present the consolidated owner-signoff matrix and evidence before requesting D-final. Nothing in it is approved until the owner says so, per item. Updated in MUSE-R37 with the owner decisions P2/C4/C20/C21 (comment 6907505460). Updated in MUSE-R38 with the ChatGPT audit follow-ups (comment 6907620905): matrix §3/§4/§5 cross-reference corrections and the P3 case-B qualifier in §1; no decision change, no normative change.
 
 ## 1. Decisions already made (owner-locked, for the record)
 
 | Decision | Owner decision | Issue comment |
 |---|---|---|
 | P1 (pattern set + disclosure text) | ACCEPTED, subject to the specified tests and platform-policy review | 6902737515 |
-| P3 (identity/attribution) | REVISED, then P3(a)–(d) CONFIRMED: explicit/manual merchant pattern registration only; uniqueness per merchant across all source accounts; cross-account repeat = duplicate evidence | 6902737515, 6903307191 |
+| P3 (identity/attribution) | REVISED, then P3(a)–(d) CONFIRMED: explicit/manual merchant pattern registration only; uniqueness per merchant across all source accounts; cross-account repeat = duplicate evidence ONLY where verified evidence proves the same bank transaction (case B, design §3.1.4; F46/F51) — otherwise distinct/indeterminate evidence ⇒ AMBIGUOUS/NEEDS_REVIEW, never presumed duplicate | 6902737515, 6903307191 |
 | P6 (raw forwarding) | Option B (granular informed opt-in) + guarded best-effort fallback; RAW_UNAVAILABLE is a distinct held state | 6893621818, 6896048588 |
 | P7 (reverse migration) | ACCEPTED: no automated reverse migration in MVP; tested manual recovery runbook is a pre-pilot gate | 6902737515 |
 | P8 (server-side NEEDS_REVIEW) | ACCEPTED: client-side hold for v1.1; server-side validation is post-v1.1 | 6902737515 |
@@ -38,7 +38,7 @@ Items P2, C4, C20, C21 were decided 2026-11-16 (comment 6907505460) and are reco
 ## 3. Evidence status (what is verified, what is not)
 
 **Verified at document level:**
-- The consolidated design (R36) and file plan (R36) are complete, mutually consistent, and committed to `main/docs/phase1` on GitHub.
+- The consolidated design (R37) and file plan (R37) are complete, mutually consistent, and committed to `main/docs/phase1` on GitHub.
 - Independent rechecks R25–R35: every finding raised by the reviewer has been answered in the documents; the R35 recheck verdict is ACCEPTED WITH LIMITATIONS (both R34 findings CLOSED at document level, comment 6907321403).
 - All owner-locked decisions in §1 are recorded in the design (§12.1) and the file plan (consolidation note).
 
@@ -57,10 +57,10 @@ Items P2, C4, C20, C21 were decided 2026-11-16 (comment 6907505460) and are reco
 
 ## 4. H1 status
 
-H1 (re-issue confirmation) remains OPEN and is a D-final blocker. It closes only when the independent reviewer confirms the complete re-issued text (§7.3A/§7.3B/§7.9, patched R26–R36) at the full-design consolidation/approval gate. The R35 recheck closed the two R34 export findings at document level; it did not close H1.
+H1 (re-issue confirmation) remains OPEN and is a D-final blocker. It closes only when the independent reviewer confirms the complete re-issued text (§7.3A/§7.3B/§7.9, patched R26–R37) at the full-design consolidation/approval gate. The R35 recheck closed the two R34 export findings at document level; it did not close H1.
 
 ## 5. What D-final unlocks (and does not)
 
 - D-final approves the v1.1 specification as the buildable design. It does not authorise implementation: Phase 1.3 (on laptopgrt) needs a separate explicit owner authorisation.
-- D-final does not authorise a pilot or production run: G11-pilot and G11-production are separate gates with their own evidence (§2, items 6–7).
+- D-final does not authorise a pilot or production run: G11-pilot and G11-production are separate gates with their own evidence (§2 items 2–3).
 - D-final does not execute any test: the §3 evidence items are worked in Phase 1.3 and the pilot, not by the sign-off itself.
