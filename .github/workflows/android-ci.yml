@@ -1,0 +1,86 @@
+# Paylist Android CI
+#
+# Builds the debug APK and runs the local unit tests on every push and
+# pull request to the phase-1.3 work branches.
+#
+# WHY THIS WORKFLOW USES setup-gradle INSTEAD OF ./gradlew
+# ---------------------------------------------------------
+# The Gradle wrapper JAR (`gradle/wrapper/gradle-wrapper.jar`) is a binary
+# file, and the delivery path available to this project (GitHub MCP
+# `push_files`) only accepts UTF-8 text — the wrapper JAR cannot be pushed
+# to GitHub through it. The wrapper JAR exists locally on laptopgrt (where
+# all Stage A work is built and tested), but until it is uploaded to the
+# branch by hand (GitHub web UI), `./gradlew` cannot run from a fresh
+# checkout. This workflow therefore installs Gradle 8.9 directly with
+# `gradle/actions/setup-gradle` and invokes `gradle` instead of `./gradlew`.
+# Once the wrapper JAR is on the branch, switch the build steps back to
+# `./gradlew` (same Gradle version, 8.9).
+#
+# BINARY PREREQUISITE (same gap, icons)
+# --------------------------------------
+# The 10 launcher icons (`app/src/main/res/mipmap-*/ic_launcher*.png`)
+# are also binaries that cannot go through the text-only push path.
+# `assembleDebug` FAILS without them (the manifest references
+# `@mipmap/ic_launcher` / `@mipmap/ic_launcher_round`). Until the icons
+# are uploaded to the branch by hand, this workflow's build step is
+# expected to fail on a clean checkout; the unit-test step does not need
+# them. See README.md ("Binary assets") for the upload list + md5s.
+#
+# Versions (design §11, C17): JDK 17 (Temurin), Android SDK platform 34 +
+# build-tools 34.0.0, Gradle 8.9, AGP 8.5.2, Kotlin 2.0.20, Room 2.7.0 +
+# KSP2, WorkManager 2.9.0.
+
+name: Android CI
+
+on:
+  push:
+    branches: ["phase-1.3", "main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-and-test:
+    name: assembleDebug + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle 8.9
+        # See the header comment: ./gradlew is unusable until the wrapper
+        # JAR is uploaded to the branch by hand.
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.9"
+
+      - name: Accept SDK licences + install platform 34 / build-tools 34.0.0
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Build debug APK
+        run: >
+          gradle assembleDebug --no-daemon --console=plain
+          -Dorg.gradle.jvmargs="-Xmx2048m" -Dkotlin.daemon.jvm.options="-Xmx1024m"
+
+      - name: Run unit tests
+        run: >
+          gradle testDebugUnitTest --no-daemon --console=plain
+          -Dorg.gradle.jvmargs="-Xmx2048m" -Dkotlin.daemon.jvm.options="-Xmx1024m"
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: app/build/test-results/testDebugUnitTest/
+          if-no-files-found: warn
