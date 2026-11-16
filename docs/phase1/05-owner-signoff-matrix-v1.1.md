@@ -1,6 +1,6 @@
 # Paylist — Owner Signoff Matrix v1.1
 
-**Status:** PARTIALLY DECIDED (MUSE-R41, 16 November 2026) — 4 of 7 sign-offs decided; D-final, G11-pilot, G11-production remain · **Sources:** `04-final-design-v1.1.md` (R41) + `04-file-plan-v1.1.md` (R41) + GitHub Issue izzdiin/paylist#1 · **Mode:** DOCUMENTATION ONLY — this matrix records decisions and evidence; it grants no implementation, pilot, or production authorisation.
+**Status:** PARTIALLY DECIDED (MUSE-R42, 16 November 2026) — 4 of 7 sign-offs decided; D-final, G11-pilot, G11-production remain · **Sources:** `04-final-design-v1.1.md` (R42) + `04-file-plan-v1.1.md` (R42) + GitHub Issue izzdiin/paylist#1 · **Mode:** DOCUMENTATION ONLY — this matrix records decisions and evidence; it grants no implementation, pilot, or production authorisation.
 
 This document answers the recheck's request (comment 6907321403): present the consolidated owner-signoff matrix and evidence before requesting D-final. Nothing in it is approved until the owner says so, per item. Updated in MUSE-R37 with the owner decisions P2/C4/C20/C21 (comment 6907505460). Updated in MUSE-R38 with the ChatGPT audit follow-ups (comment 6907620905): matrix §3/§4/§5 cross-reference corrections and the P3 case-B qualifier in §1; no decision change, no normative change.
 
@@ -38,7 +38,7 @@ Items P2, C4, C20, C21 were decided 2026-11-16 (comment 6907505460) and are reco
 ## 3. Evidence status (what is verified, what is not)
 
 **Verified at document level:**
-- The consolidated design (R41) and file plan (R41) are complete and mutually consistent as local documents; the R37 text is committed to `main/docs/phase1` on GitHub, and the R41 patch awaits publication by owner order and independent recheck (see §4).
+- The consolidated design (R42) and file plan (R42) are complete and mutually consistent as local documents; the R37 text is committed to `main/docs/phase1` on GitHub, and the R42 patch awaits publication by owner order and independent recheck (see §4).
 - Independent rechecks R25–R35: every finding raised by the reviewer has been answered in the documents; the R35 recheck verdict is ACCEPTED WITH LIMITATIONS (both R34 findings CLOSED at document level, comment 6907321403).
 - All owner-locked decisions in §1 are recorded in the design (§12.1) and the file plan (consolidation note).
 
@@ -57,7 +57,7 @@ Items P2, C4, C20, C21 were decided 2026-11-16 (comment 6907505460) and are reco
 
 ## 4. H1 status
 
-H1 (re-issue confirmation) remains OPEN and is a D-final blocker. It closes only when the independent reviewer confirms the complete re-issued text (§7.3A/§7.3B/§7.9, patched R26–R40) at the full-design consolidation/approval gate. The R35 recheck closed the two R34 export findings at document level; it did not close H1. The H1 full-consolidation audit (comment id 6908017568) raised four findings — H1-A (BLOCKER, §7.3B(5) negative reconciliation), H1-B (MAJOR, §8.7 E1/E2 historical binding), H1-C (MAJOR, §7.3A(e) revocation fence), H1-D (MODERATE, §0 stale sign-off list) — all corrected in MUSE-R40; the R40 review (comment id 6908544054) found H1-C's B20(a) internally inconsistent and it was corrected in MUSE-R41 (case (a) struck for the post-read timing; that timing is now case (b), the disclosed residual); H1-A/B/D provisionally addressed pending source verification after publication; recheck pending.
+H1 (re-issue confirmation) remains OPEN and is a D-final blocker. It closes only when the independent reviewer confirms the complete re-issued text (§7.3A/§7.3B/§7.9, patched R26–R40) at the full-design consolidation/approval gate. The R35 recheck closed the two R34 export findings at document level; it did not close H1. The H1 full-consolidation audit (comment id 6908017568) raised four findings — H1-A (BLOCKER, §7.3B(5) negative reconciliation), H1-B (MAJOR, §8.7 E1/E2 historical binding), H1-C (MAJOR, §7.3A(e) revocation fence), H1-D (MODERATE, §0 stale sign-off list) — all corrected in MUSE-R40; the R40 review (comment id 6908544054) found H1-C's B20(a) internally inconsistent and it was corrected in MUSE-R41 (case (a) struck for the post-read timing; that timing is now case (b), the disclosed residual); H1-A/B/D provisionally addressed pending source verification after publication; recheck pending. The R41 review (comment id 6909262016) accepted H1-C in principle with two narrow clarifications — B20(b) must not mandate POST success (ordinary §5.4 taxonomy applies) and 'revocation epoch noted in the audit' must name an existing field (the `delivery_attempts` admission stamp; the revocation epoch value is not pinned per attempt) — both corrected in MUSE-R42, with the pinned-value question left open to the reviewer; H1-A/B/D still provisionally addressed pending source verification after publication; recheck pending.
 
 ## 5. What D-final unlocks (and does not)
 
