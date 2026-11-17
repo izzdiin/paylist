@@ -21,10 +21,9 @@
 # The 10 launcher icons (`app/src/main/res/mipmap-*/ic_launcher*.png`)
 # are also binaries that cannot go through the text-only push path.
 # `assembleDebug` FAILS without them (the manifest references
-# `@mipmap/ic_launcher` / `@mipmap/ic_launcher_round`). Until the icons
-# are uploaded to the branch by hand, this workflow's build step is
-# expected to fail on a clean checkout; the unit-test step does not need
-# them. See README.md ("Binary assets") for the upload list + md5s.
+# `@mipmap/ic_launcher` / `@mipmap/ic_launcher_round`). UPDATE 2026-11-18:
+# the icons AND the wrapper JAR are now on the branch (pushed via git+SSH
+# from laptopgrt2, verified with git ls-tree), so a clean checkout builds.
 #
 # Versions (design §11, C17): JDK 17 (Temurin), Android SDK platform 34 +
 # build-tools 34.0.0, Gradle 8.9, AGP 8.5.2, Kotlin 2.0.20, Room 2.7.0 +
@@ -52,8 +51,11 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # No setup-android step: android-actions/setup-android@v3 fails on
+      # current runners (run 44188118469, step failed in 3s). The
+      # GitHub-hosted runner image already ships the Android SDK
+      # (ANDROID_HOME + sdkmanager on PATH); the step below installs
+      # platform 34 / build-tools 34.0.0 into it.
 
       - name: Set up Gradle 8.9
         # See the header comment: ./gradlew is unusable until the wrapper
