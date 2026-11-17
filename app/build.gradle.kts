@@ -14,6 +14,7 @@ android {
         targetSdk = 34
         versionCode = 4
         versionName = "2.3"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -47,4 +48,12 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
     // Real org.json for JVM unit tests: android.jar's org.json stubs throw.
     testImplementation("org.json:json:20240303")
+
+    // Stage B androidTest (OutboxMigrationTest + DeliveryLeaseTest): real
+    // Room on-device. These COMPILE in CI/on laptopgrt2 but cannot EXECUTE
+    // there (no device/emulator); execution needs a device or an emulator.
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:core:1.6.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }
