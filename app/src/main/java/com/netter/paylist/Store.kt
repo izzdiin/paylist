@@ -254,4 +254,68 @@ class Store(ctx: Context) {
         items.forEach { arr.put(it) }
         sp.edit().putString("queue", arr.toString()).apply()
     }
+
+    // --- Stage B (design §8.2, §8.6; file plan §A) ---
+    // Migration read-only snapshot access + the synchronous queue write.
+    // No mode value lives here: the authoritative mode store is Room
+    // `collector_state` (R14); no code path reads mode from
+    // SharedPreferences (asserted by the F27 static check).
+
+    /**
+     * Read-only snapshot of the legacy queue for the migration
+     * ([com.netter.paylist.migration.LegacyQueueMigration]). The
+     * returned list is a fresh copy; the migration must never mutate
+     * the queue through it. The queue file itself is not modified,
+     * not emptied, not moved by snapshotting (§8.2 step 2).
+     */
+    fun queueSnapshot(): List<JSONObject> = queue()
+
+    /**
+     * Synchronous queue write (design §8.2, §8.6): `commit()` plus a
+     * readback of the queue key. Returns true only when `commit()`
+     * returned true AND the readback agrees (same count, same ordered
+     * `qkey` set).
+     *
+     * Readback, corrected (R19): `commit()` is a synchronous disk
+     * write; the getter readback afterwards reads the in-memory cache
+     * and confirms only that the in-memory view agrees — it is a
+     * sanity check, not crash-proof persistence evidence, and no
+     * sweep decision treats it as the latter. The crash-proof
+     * evidence is the Room sweep intent, written before the queue is
+     * touched. Recovery after a crash re-reads the queue from a fresh
+     * process — a new `SharedPreferences` instance, the pre-crash
+     * cache gone — so a post-restart readback IS a disk read.
+     */
+    fun saveQueueSync(items: List<JSONObject>): Boolean {
+        val arr = JSONArray()
+        items.forEach { arr.put(it) }
+        val committed = sp.edit().putString("queue", arr.toString()).commit()
+        if (!committed) return false
+        val readBack = queue()
+        if (readBack.size != items.size) return false
+        for (i in items.indices) {
+            if (readBack[i].optString("qkey") != items[i].optString("qkey")) return false
+        }
+        return true
+    }
+
+    /**
+     * Removes ONE queue item by `qkey` (Stage C cutover step 6 only).
+     * Clearing the legacy queue after `WORKER_ONLY` is permitted only
+     * for individually verified imported/resolved entries (R29);
+     * quarantined entries are retained and never removed by this
+     * path. There is deliberately NO whole-queue delete in this class
+     * (F54): a blanket queue delete must not exist in the tree.
+     *
+     * @return true when the item was present and the removal committed
+     *   with a agreeing readback; false when the item was absent or
+     *   the write failed.
+     */
+    fun clearQueueItem(qkey: String): Boolean {
+        val q = queue()
+        val idx = q.indexOfFirst { it.optString("qkey") == qkey }
+        if (idx < 0) return false
+        q.removeAt(idx)
+        return saveQueueSync(q)
+    }
 }
