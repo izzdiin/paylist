@@ -1,5 +1,9 @@
 package com.netter.paylist.migration
 
+import com.netter.paylist.Route
+import com.netter.paylist.data.RouteStampMap
+import org.json.JSONArray
+
 import com.netter.paylist.core.model.DeliveryState
 import com.netter.paylist.data.TransactionRunner
 import com.netter.paylist.data.dao.AttemptDao
@@ -961,6 +965,210 @@ class CutoverCoordinator(
             )
         }
         return RecoveryReport(abandoned, neverSent, unknownHeld, orphans.size, stuckOpening)
+    }
+
+    // --- Held-copy release (§8.7 E1/E2, H1-B / F41 J–M) ---
+
+    /**
+     * An authoritative reconciliation record (§9) for one
+     * `dedupe_key`: the P12 status-query answer, supplied by the
+     * caller (the sweep calls the query inline once P12 exists;
+     * until then the operator runbook supplies it). A bare
+     * `found:false` never authorises anything on its own (H1-A):
+     * the record must ALSO show `inFlight=false` and writer
+     * coverage COVERED.
+     */
+    data class ReconciliationRecord(
+        val dedupeKey: String,
+        val systemId: String,
+        val endpointKind: String,
+        val found: Boolean,
+        val inFlight: Boolean,
+        val coverageCovered: Boolean,
+        val queriedAtMs: Long,
+    )
+
+    /**
+     * Operator-confirmed historical binding (§8.7 (b′)): the
+     * operator confirms the route is the same billing system the
+     * copy was queued for. A negative proves absence in a system,
+     * not the copy's historical destination — without the binding,
+     * nothing releases.
+     */
+    data class HistoricalBinding(
+        val routeId: String,
+        val systemId: String,
+        val endpointKind: String,
+        /** SHA-256 hex of the historical endpoint URL. */
+        val urlSha256: String,
+        /** Operator's evidence note (free text, recorded durably). */
+        val evidence: String,
+    )
+
+    sealed interface ReleaseDecision {
+        data class Held(val reason: String) : ReleaseDecision
+        data class Released(val deliveryId: String) : ReleaseDecision
+    }
+
+    /**
+     * Releases a `HELD_AWAITING_RECONCILIATION` delivery for
+     * retry-same-hop, or holds it. Release requires ALL of:
+     *
+     * 1. An authoritative record: `found=false`, `inFlight=false`,
+     *    `coverageCovered=true` (H1-A).
+     * 2. An operator-confirmed historical binding whose system +
+     *    endpoint kind match the record (case L: a negative from
+     *    another system proves nothing about this copy), naming
+     *    the route at the delivery's current hop.
+     * 3. The route still exists, is enabled, and its CURRENT url
+     *    hash matches the binding's historical hash (cases J/K: a
+     *    changed URL or a deleted route never dispatches to the
+     *    current URL).
+     * 4. No UNKNOWN hop for the key anywhere (gate resolution
+     *    4(b)): an unresolved attempt marker blocks release.
+     * 5. The §7.5 release-time re-gate: no consent revocation for
+     *    the route (a `granted=false` record, or an epoch newer
+     *    than the delivery's stamp, blocks the release).
+     *
+     * On release: the delivery returns to `PENDING` at the SAME hop
+     * (`next_route_index` unchanged — retry-same-hop under the
+     * original `dedupe_key`), the event fence is lifted, and a
+     * release record is written durably (route id + system +
+     * binding evidence + re-gate result), all in one transaction.
+     * On hold: nothing changes; the reason names the failed
+     * condition.
+     *
+     * The queue copy is NOT removed here: removal is the sweep's
+     * job (a later sweep step sees `PENDING` and removes it). The
+     * legacy sender never flushes in `WORKER_ONLY`, so a leftover
+     * copy is inert until the sweep removes it.
+     *
+     * @param currentRoute the route as it exists NOW (null when
+     *   deleted). The coordinator takes it as a parameter — it owns
+     *   no route store.
+     */
+    suspend fun releaseHeldCopy(
+        deliveryId: String,
+        dedupeKey: String,
+        record: ReconciliationRecord,
+        binding: HistoricalBinding?,
+        currentRoute: Route?,
+        nowMs: Long,
+    ): ReleaseDecision {
+        val delivery = deliveryDao.getById(deliveryId)
+            ?: return ReleaseDecision.Held("no such delivery: $deliveryId")
+        if (delivery.state != DeliveryState.HELD_AWAITING_RECONCILIATION) {
+            return ReleaseDecision.Held("delivery is ${delivery.state}, not HELD")
+        }
+        if (record.dedupeKey != dedupeKey) {
+            return ReleaseDecision.Held("record answers for a different key")
+        }
+        if (record.found) {
+            return ReleaseDecision.Held("record found:true; E3 path, not a release")
+        }
+        if (record.inFlight) {
+            return ReleaseDecision.Held("record in_flight:true is inconclusive")
+        }
+        if (!record.coverageCovered) {
+            return ReleaseDecision.Held("writer coverage is not COVERED")
+        }
+        if (binding == null) {
+            return ReleaseDecision.Held("no operator-confirmed historical binding")
+        }
+        if (binding.systemId != record.systemId || binding.endpointKind != record.endpointKind) {
+            return ReleaseDecision.Held(
+                "binding names ${binding.systemId}/${binding.endpointKind} " +
+                    "but the record answers for ${record.systemId}/${record.endpointKind}",
+            )
+        }
+        val routeIds = try {
+            Route.jsonStrings(JSONArray(delivery.routeIdsJson))
+        } catch (e: Exception) {
+            return ReleaseDecision.Held("delivery route list is corrupt")
+        }
+        val hopRouteId = routeIds.getOrNull(delivery.nextRouteIndex)
+            ?: return ReleaseDecision.Held("delivery hop index is past the chain")
+        if (binding.routeId != hopRouteId) {
+            return ReleaseDecision.Held(
+                "binding names route ${binding.routeId} but the held hop is $hopRouteId",
+            )
+        }
+        if (currentRoute == null) {
+            return ReleaseDecision.Held("route $hopRouteId no longer exists")
+        }
+        if (!currentRoute.enabled || currentRoute.url.isEmpty()) {
+            return ReleaseDecision.Held("route $hopRouteId is disabled or has no URL")
+        }
+        if (sha256Hex(currentRoute.url) != binding.urlSha256) {
+            return ReleaseDecision.Held("route URL changed since the copy was queued")
+        }
+        if (attemptDao.getUnresolvedByDedupeKey(dedupeKey).isNotEmpty()) {
+            return ReleaseDecision.Held("an UNKNOWN hop exists for this key")
+        }
+        // §7.5 release-time re-gate (consent): a revocation, or an
+        // epoch newer than the delivery's stamp, blocks the release.
+        val stamps = RouteStampMap.fromJsonString(delivery.routeStampsJson)
+        val stamp = stamps[hopRouteId]
+        val consentsJson = readCollectorValue(CollectorStateKeys.ROUTE_CONSENTS)
+        val consentRecord = consentsJson?.let { parseConsentRecord(it, hopRouteId) }
+        if (consentRecord != null) {
+            if (!consentRecord.granted) {
+                return ReleaseDecision.Held("consent for route $hopRouteId is revoked")
+            }
+            if (stamp != null && consentRecord.epoch >= 0 &&
+                consentRecord.epoch != stamp.consentEpoch
+            ) {
+                return ReleaseDecision.Held("consent epoch for route $hopRouteId changed")
+            }
+        }
+        return transactions.run {
+            deliveryDao.setStateIfNotTerminal(deliveryId, DeliveryState.PENDING, nowMs)
+            stateDao.delete(CollectorStateKeys.SWEEP_FENCE_PREFIX + dedupeKey)
+            val releaseRecord = JSONObject().apply {
+                put("dedupe_key", dedupeKey)
+                put("delivery_id", deliveryId)
+                put("route_id", hopRouteId)
+                put("system_id", binding.systemId)
+                put("endpoint_kind", binding.endpointKind)
+                put("binding_evidence", binding.evidence)
+                put("regate", "passed")
+                put("record_queried_at_ms", record.queriedAtMs)
+                put("coverage", "COVERED")
+                put("released_at_ms", nowMs)
+            }
+            stateDao.put(
+                state(
+                    CollectorStateKeys.RELEASE_RECORD_PREFIX + dedupeKey,
+                    releaseRecord.toString(),
+                    nowMs,
+                ),
+            )
+            ReleaseDecision.Released(deliveryId)
+        }
+    }
+
+    private data class ConsentRecord(val granted: Boolean, val epoch: Long)
+
+    private fun parseConsentRecord(consentsJson: String, routeId: String): ConsentRecord? {
+        return try {
+            val routesObj = JSONObject(consentsJson).optJSONObject("routes") ?: return null
+            val record = routesObj.optJSONObject(routeId) ?: return null
+            ConsentRecord(
+                granted = record.optBoolean("granted", true),
+                epoch = record.optLong("epoch", -1),
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private suspend fun readCollectorValue(key: String): String? =
+        deliveryDao.readCollectorValue(key)
+
+    private fun sha256Hex(value: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(value.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
     }
 
     // --- Document helpers ---

@@ -58,6 +58,9 @@ object CollectorStateKeys {
     /** Prefix for sweep records: `sweep_record:<dedupe_key>` (§8.6). */
     const val SWEEP_RECORD_PREFIX: String = "sweep_record:"
 
+    /** Prefix for held-copy release records: `release_record:<dedupe_key>` (§8.7, F41). */
+    const val RELEASE_RECORD_PREFIX: String = "release_record:"
+
     /** Diagnostic counters document (capture/staging/drain counters, §8.3). */
     const val DIAGNOSTICS: String = "diagnostics"
 }

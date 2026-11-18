@@ -1,5 +1,6 @@
 package com.netter.paylist.migration
 
+import com.netter.paylist.Route
 import com.netter.paylist.Store
 import com.netter.paylist.FakeAttemptDao
 import com.netter.paylist.FakeCollectorStateDao
@@ -37,6 +38,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.locks.Lock
 import java.util.concurrent.locks.ReentrantLock
@@ -1251,6 +1253,245 @@ class CutoverTest {
         )
         deliveries.insert(delivery)
         return delivery.deliveryId
+    }
+
+    // =====================================================================
+    // F41 J–M — held-copy release (§8.7 E1/E2, H1-B)
+    // =====================================================================
+
+    private fun f41Record(
+        dedupe: String,
+        systemId: String = "warganet",
+        endpointKind: String = "notify",
+        found: Boolean = false,
+        inFlight: Boolean = false,
+        coverageCovered: Boolean = true,
+    ) = CutoverCoordinator.ReconciliationRecord(
+        dedupeKey = dedupe,
+        systemId = systemId,
+        endpointKind = endpointKind,
+        found = found,
+        inFlight = inFlight,
+        coverageCovered = coverageCovered,
+        queriedAtMs = NOW,
+    )
+
+    private fun f41Binding(
+        url: String,
+        systemId: String = "warganet",
+        endpointKind: String = "notify",
+        routeId: String = ROUTE_1,
+    ) = CutoverCoordinator.HistoricalBinding(
+        routeId = routeId,
+        systemId = systemId,
+        endpointKind = endpointKind,
+        urlSha256 = f41Sha256(url),
+        evidence = "operator confirmed: $routeId is the $systemId $endpointKind endpoint the copy was queued for",
+    )
+
+    private fun f41Route(url: String, enabled: Boolean = true) = Route(
+        ROUTE_1, "Rute 1", listOf("com.gojek.gopay"), url, listOf("gopay"), enabled
+    )
+
+    private fun f41Sha256(value: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(value.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    }
+
+    private suspend fun Harness.heldDelivery(dedupe: String): String {
+        val id = seedDelivery(dedupe)
+        val moved = deliveries.setStateIfNotTerminal(
+            id, DeliveryState.HELD_AWAITING_RECONCILIATION, NOW
+        )
+        assertEquals(1, moved)
+        return id
+    }
+
+    @Test
+    fun f41J_changedUrl_staysHeld() = runBlocking {
+        val h = newHarness()
+        val dedupe = dedupeKey("f41j")
+        val deliveryId = h.heldDelivery(dedupe)
+        val oldUrl = "https://warganet.example.invalid/paylist/notify.php"
+        val newUrl = "https://warganet.example.invalid/paylist/notify-v2.php"
+        // The binding confirms the HISTORICAL url; the route now
+        // points somewhere else: never dispatch to the current url.
+        val decision = h.coordinator.releaseHeldCopy(
+            deliveryId, dedupe,
+            f41Record(dedupe), f41Binding(oldUrl), f41Route(newUrl), NOW
+        )
+        assertTrue("changed URL must hold: $decision", decision is CutoverCoordinator.ReleaseDecision.Held)
+        assertEquals(
+            DeliveryState.HELD_AWAITING_RECONCILIATION,
+            h.deliveries.getById(deliveryId)!!.state
+        )
+        assertNull(h.state.getValue("release_record:$dedupe"))
+    }
+
+    @Test
+    fun f41K_routeDeleted_staysHeld() = runBlocking {
+        val h = newHarness()
+        val dedupe = dedupeKey("f41k")
+        val deliveryId = h.heldDelivery(dedupe)
+        val url = "https://warganet.example.invalid/paylist/notify.php"
+        val decision = h.coordinator.releaseHeldCopy(
+            deliveryId, dedupe,
+            f41Record(dedupe), f41Binding(url), null, NOW
+        )
+        assertTrue("deleted route must hold: $decision", decision is CutoverCoordinator.ReleaseDecision.Held)
+        assertEquals(
+            DeliveryState.HELD_AWAITING_RECONCILIATION,
+            h.deliveries.getById(deliveryId)!!.state
+        )
+    }
+
+    @Test
+    fun f41L_wrongSystem_staysHeld() = runBlocking {
+        val h = newHarness()
+        val dedupe = dedupeKey("f41l")
+        val deliveryId = h.heldDelivery(dedupe)
+        val url = "https://warganet.example.invalid/paylist/notify.php"
+        // The negative answers for v2new; the copy was queued for
+        // warganet: a negative proves absence in a system, not the
+        // copy's historical destination.
+        val wrongSystem = h.coordinator.releaseHeldCopy(
+            deliveryId, dedupe,
+            f41Record(dedupe, systemId = "v2new"), f41Binding(url), f41Route(url), NOW
+        )
+        assertTrue("wrong system must hold: $wrongSystem", wrongSystem is CutoverCoordinator.ReleaseDecision.Held)
+        // And with no binding at all, nothing releases either.
+        val noBinding = h.coordinator.releaseHeldCopy(
+            deliveryId, dedupe,
+            f41Record(dedupe), null, f41Route(url), NOW
+        )
+        assertTrue("missing binding must hold: $noBinding", noBinding is CutoverCoordinator.ReleaseDecision.Held)
+        assertEquals(
+            DeliveryState.HELD_AWAITING_RECONCILIATION,
+            h.deliveries.getById(deliveryId)!!.state
+        )
+    }
+
+    @Test
+    fun f41M_confirmedBinding_releasesSameHop() = runBlocking {
+        val h = newHarness()
+        val dedupe = dedupeKey("f41m")
+        val deliveryId = h.heldDelivery(dedupe)
+        val url = "https://warganet.example.invalid/paylist/notify.php"
+        // The sweep left the copy fenced; the release lifts it.
+        h.state.put(
+            CollectorStateEntity(
+                "sweep_fence:$dedupe",
+                JSONObject().put("fence_id", "f1").toString(),
+                NOW,
+            )
+        )
+        val decision = h.coordinator.releaseHeldCopy(
+            deliveryId, dedupe,
+            f41Record(dedupe), f41Binding(url), f41Route(url), NOW
+        )
+        assertTrue("confirmed binding must release: $decision", decision is CutoverCoordinator.ReleaseDecision.Released)
+        val after = h.deliveries.getById(deliveryId)!!
+        assertEquals(DeliveryState.PENDING, after.state)
+        assertEquals(0, after.nextRouteIndex) // retry-SAME-hop, never advanced
+        assertNull(h.state.getValue("sweep_fence:$dedupe"))
+        // The release record names the route, system, evidence and
+        // re-gate result — durably, for the audit.
+        val recordJson = h.state.getValue("release_record:$dedupe")
+        assertNotNull(recordJson)
+        val record = JSONObject(recordJson!!)
+        assertEquals(ROUTE_1, record.getString("route_id"))
+        assertEquals("warganet", record.getString("system_id"))
+        assertEquals("notify", record.getString("endpoint_kind"))
+        assertTrue(record.getString("binding_evidence").contains("operator confirmed"))
+        assertEquals("passed", record.getString("regate"))
+        assertEquals(dedupe, record.getString("dedupe_key"))
+    }
+
+    @Test
+    fun f41_nonAuthoritativeRecord_staysHeld() = runBlocking {
+        val h = newHarness()
+        val dedupe = dedupeKey("f41n")
+        val deliveryId = h.heldDelivery(dedupe)
+        val url = "https://warganet.example.invalid/paylist/notify.php"
+        val binding = f41Binding(url)
+        val route = f41Route(url)
+        // found:true is the E3 path, not a release.
+        val found = h.coordinator.releaseHeldCopy(
+            deliveryId, dedupe,
+            f41Record(dedupe, found = true), binding, route, NOW
+        )
+        assertTrue("found:true must hold: $found", found is CutoverCoordinator.ReleaseDecision.Held)
+        // in_flight:true is inconclusive, never "no row".
+        val inFlight = h.coordinator.releaseHeldCopy(
+            deliveryId, dedupe,
+            f41Record(dedupe, inFlight = true), binding, route, NOW
+        )
+        assertTrue("in_flight must hold: $inFlight", inFlight is CutoverCoordinator.ReleaseDecision.Held)
+        // A bare found:false without COVERED writer coverage never
+        // authorises anything (H1-A).
+        val noCoverage = h.coordinator.releaseHeldCopy(
+            deliveryId, dedupe,
+            f41Record(dedupe, coverageCovered = false), binding, route, NOW
+        )
+        assertTrue("no coverage must hold: $noCoverage", noCoverage is CutoverCoordinator.ReleaseDecision.Held)
+        assertEquals(
+            DeliveryState.HELD_AWAITING_RECONCILIATION,
+            h.deliveries.getById(deliveryId)!!.state
+        )
+    }
+
+    @Test
+    fun f41_unresolvedMarker_blocksRelease() = runBlocking {
+        val h = newHarness()
+        val dedupe = dedupeKey("f41u")
+        val deliveryId = h.heldDelivery(dedupe)
+        val url = "https://warganet.example.invalid/paylist/notify.php"
+        // An unresolved SOCKET_OPEN attempt for this key: gate
+        // resolution 4(b) — the negative is advisory-only.
+        h.attempts.insert(
+            attemptRow("att-f41u", deliveryId, dedupe, AttemptState.SOCKET_OPEN, BOOT_A)
+        )
+        val decision = h.coordinator.releaseHeldCopy(
+            deliveryId, dedupe,
+            f41Record(dedupe), f41Binding(url), f41Route(url), NOW
+        )
+        assertTrue("unresolved marker must hold: $decision", decision is CutoverCoordinator.ReleaseDecision.Held)
+        assertEquals(
+            DeliveryState.HELD_AWAITING_RECONCILIATION,
+            h.deliveries.getById(deliveryId)!!.state
+        )
+    }
+
+    @Test
+    fun f41_revokedConsent_blocksRelease() = runBlocking {
+        val h = newHarness()
+        val dedupe = dedupeKey("f41c")
+        val deliveryId = h.heldDelivery(dedupe)
+        val url = "https://warganet.example.invalid/paylist/notify.php"
+        h.state.put(
+            CollectorStateEntity(
+                "route_consents",
+                JSONObject().apply {
+                    put("routes", JSONObject().apply {
+                        put(ROUTE_1, JSONObject().apply {
+                            put("granted", false)
+                            put("epoch", 1)
+                        })
+                    })
+                }.toString(),
+                NOW,
+            )
+        )
+        val decision = h.coordinator.releaseHeldCopy(
+            deliveryId, dedupe,
+            f41Record(dedupe), f41Binding(url), f41Route(url), NOW
+        )
+        assertTrue("revoked consent must hold: $decision", decision is CutoverCoordinator.ReleaseDecision.Held)
+        assertEquals(
+            DeliveryState.HELD_AWAITING_RECONCILIATION,
+            h.deliveries.getById(deliveryId)!!.state
+        )
     }
 
     /**
