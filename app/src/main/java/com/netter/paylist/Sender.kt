@@ -174,11 +174,11 @@ class Sender(
                         continue
                     }
                     is SecretResult.Unavailable -> {
-                        store.setLastFailure(
-                            "secret rute ${route.name} tidak bisa dibaca (${s.reason}); masukkan ulang secret",
-                        )
-                        next++
-                        continue
+                        // Retain the payment and current hop until Keystore recovers.
+                        item.put("next", next)
+                        markFail(store, item, describe(payload), route.name,
+                            "secret tidak bisa dibaca (${s.reason}); masukkan ulang secret")
+                        return false
                     }
                 }
                 // Normative mode check before every POST (§8): the
@@ -217,10 +217,9 @@ class Sender(
             is SecretResult.Present -> s.value
             is SecretResult.Missing -> return true // tanpa secret: item tidak bisa dikirim
             is SecretResult.Unavailable -> {
-                store.setLastFailure(
-                    "secret rute ${route.name} tidak bisa dibaca (${s.reason}); masukkan ulang secret",
-                )
-                return true
+                markFail(store, item, describe(payload), route.name,
+                    "secret tidak bisa dibaca (${s.reason}); masukkan ulang secret")
+                return false
             }
         }
         // Heartbeat kedaluwarsa: jendela dedupe-nya sudah lewat > 2 jendela
