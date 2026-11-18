@@ -1,6 +1,9 @@
 package com.netter.paylist
 
 import android.content.Context
+import com.netter.paylist.security.SecretProvider
+import com.netter.paylist.security.SecretResult
+import com.netter.paylist.security.SecretVault
 import org.json.JSONObject
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
@@ -29,7 +32,10 @@ import java.net.URL
  * Header secret tetap X-QRIS-Secret: nama header adalah kontrak endpoint
  * yang sudah berjalan (notify.php), bukan nama app.
  */
-class Sender(private val ctx: Context) {
+class Sender(
+    private val ctx: Context,
+    private val secrets: SecretProvider = SecretVault(ctx),
+) {
     companion object {
         // Antrean dibaca-tulis dari beberapa thread (listener, heartbeat, UI):
         // kunci statis supaya tidak ada event yang hilang karena balapan.
@@ -115,13 +121,29 @@ class Sender(private val ctx: Context) {
             var next = item.optInt("next", 0)
             while (next < ids.size) {
                 val route = store.routeById(ids[next])
-                if (route == null || !route.enabled ||
-                    route.url.isEmpty() || route.secret.isEmpty()
-                ) {
+                if (route == null || !route.enabled || route.url.isEmpty()) {
                     next++
                     continue
                 }
-                val res = post(route, payload)
+                // Stage C: the secret comes from the vault, never from
+                // the route record. No secret (or an unreadable one)
+                // means this hop cannot be attempted: skip it (NO_POST,
+                // §5.5 row 6) and record the reason visibly.
+                val secret = when (val s = secrets.secretFor(route.id)) {
+                    is SecretResult.Present -> s.value
+                    is SecretResult.Missing -> {
+                        next++
+                        continue
+                    }
+                    is SecretResult.Unavailable -> {
+                        store.setLastFailure(
+                            "secret rute ${route.name} tidak bisa dibaca (${s.reason}); masukkan ulang secret",
+                        )
+                        next++
+                        continue
+                    }
+                }
+                val res = post(route, payload, secret)
                 if (res.retryable) {
                     // Simpan posisi; item tertahan, item LAIN tetap diproses.
                     item.put("next", next)
@@ -144,7 +166,18 @@ class Sender(private val ctx: Context) {
         // Item "single" (heartbeat / tes untuk satu rute).
         val route = store.routeById(item.optString("route_id")) ?: return true
         if (!route.enabled) return true // rute dimatikan: item tidak relevan lagi
-        if (route.url.isEmpty() || route.secret.isEmpty()) return true
+        if (route.url.isEmpty()) return true
+        // Stage C: the secret comes from the vault (see the chain path above).
+        val secret = when (val s = secrets.secretFor(route.id)) {
+            is SecretResult.Present -> s.value
+            is SecretResult.Missing -> return true // tanpa secret: item tidak bisa dikirim
+            is SecretResult.Unavailable -> {
+                store.setLastFailure(
+                    "secret rute ${route.name} tidak bisa dibaca (${s.reason}); masukkan ulang secret",
+                )
+                return true
+            }
+        }
         // Heartbeat kedaluwarsa: jendela dedupe-nya sudah lewat > 2 jendela
         // (30 menit) -> buang, heartbeat lama tidak berguna.
         if (payload.optString("type") == "heartbeat") {
@@ -156,7 +189,7 @@ class Sender(private val ctx: Context) {
                 return true
             }
         }
-        val res = post(route, payload)
+        val res = post(route, payload, secret)
         if (res.retryable) {
             markFail(store, item, describe(payload), route.name, res.error ?: "gagal jaringan")
             return false
@@ -178,12 +211,12 @@ class Sender(private val ctx: Context) {
      * - 4xx: tidak dicoba lagi (retryable=false) dengan alasan HTTP-nya.
      * - 5xx / gagal jaringan: retryable=true dengan alasan (kode / exception).
      */
-    private fun post(route: Route, payload: JSONObject): Outcome {
+    private fun post(route: Route, payload: JSONObject, secret: String): Outcome {
         return try {
             val conn = URL(route.url).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
-            conn.setRequestProperty("X-QRIS-Secret", route.secret)
+            conn.setRequestProperty("X-QRIS-Secret", secret)
             conn.connectTimeout = 15000
             conn.readTimeout = 15000
             conn.doOutput = true

@@ -22,6 +22,8 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import com.netter.paylist.security.SecretResult
+import com.netter.paylist.security.SecretVault
 import org.json.JSONObject
 
 /**
@@ -345,7 +347,11 @@ class HeartbeatReceiver : BroadcastReceiver() {
         val store = Store(ctx)
         Thread {
             val sender = Sender(ctx)
-            store.routes().filter { it.enabled && it.url.isNotEmpty() && it.secret.isNotEmpty() }
+            val vault = SecretVault(ctx)
+            store.routes().filter {
+                it.enabled && it.url.isNotEmpty() &&
+                    vault.secretFor(it.id) is SecretResult.Present
+            }
                 .forEach { r ->
                     val payload = JSONObject().apply {
                         put("type", "heartbeat")

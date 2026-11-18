@@ -17,7 +17,6 @@ data class Route(
     val name: String,
     val packages: List<String>,
     val url: String,
-    val secret: String,
     val keywords: List<String>,
     val enabled: Boolean
 ) {
@@ -26,7 +25,6 @@ data class Route(
         put("name", name)
         put("packages", JSONArray(packages))
         put("url", url)
-        put("secret", secret)
         put("keywords", JSONArray(keywords))
         put("enabled", enabled)
     }
@@ -40,7 +38,6 @@ data class Route(
             name = o.optString("name"),
             packages = jsonStrings(o.optJSONArray("packages")),
             url = o.optString("url"),
-            secret = o.optString("secret"),
             keywords = jsonStrings(o.optJSONArray("keywords")).ifEmpty { DEFAULT_KEYWORDS },
             enabled = o.optBoolean("enabled", true)
         )
@@ -78,6 +75,26 @@ class Store(ctx: Context) {
         sp.edit().putString("routes", arr.toString()).apply()
     }
 
+    /**
+     * Synchronous routes write (`commit()` + readback), for the
+     * one-time secret migration (Stage C): the plaintext delete must
+     * be confirmed, not fire-and-forget. Returns true only when
+     * `commit()` returned true AND the readback agrees (same count,
+     * same ordered route ids).
+     */
+    fun saveRoutesSync(routes: List<Route>): Boolean {
+        val arr = JSONArray()
+        routes.forEach { arr.put(it.toJson()) }
+        val committed = sp.edit().putString("routes", arr.toString()).commit()
+        if (!committed) return false
+        val readBack = routes()
+        if (readBack.size != routes.size) return false
+        for (i in routes.indices) {
+            if (readBack[i].id != routes[i].id) return false
+        }
+        return true
+    }
+
     fun routeById(id: String): Route? = routes().firstOrNull { it.id == id }
 
     fun upsertRoute(r: Route) {
@@ -105,7 +122,8 @@ class Store(ctx: Context) {
 
     /**
      * Pertama kali jalan: siapkan draf rute v2New (URL + paket GoPay Merchant
-     * sudah dikenal publik di sistem ini; secret sengaja kosong, diisi pemilik).
+     * sudah dikenal publik di sistem ini; rute lahir tanpa secret — pemilik
+     * memasukkannya lewat form rute, tersimpan di Keystore).
      * Paket aplikasi ini berbeda dari QRIS Listener lama, jadi konfigurasi app
      * lama tidak bisa dibaca dari sini dan memang tidak dipindahkan otomatis.
      */
@@ -118,7 +136,6 @@ class Store(ctx: Context) {
                     "v2New (Netter)",
                     listOf("com.gojek.gopaymerchant"),
                     "https://bill.netterhome.net/bayarQR/notify.php",
-                    "",
                     Route.DEFAULT_KEYWORDS,
                     true
                 )
