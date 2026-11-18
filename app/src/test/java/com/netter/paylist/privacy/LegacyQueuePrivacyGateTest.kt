@@ -451,7 +451,7 @@ class LegacyQueuePrivacyGateTest {
         val root = findSourceRoot() ?: throw AssertionError("source root unavailable")
         val sender = File(root, "com/netter/paylist/Sender.kt").readText()
         val unavailable = Regex(
-            """is SecretResult\\.Unavailable\\s*->\\s*\\{([\\s\\S]*?)\\n\\s*\\}"""
+            """is SecretResult\.Unavailable\s*->\s*\{([\s\S]*?)\n\s*\}"""
         ).findAll(sender).map { it.groupValues[1] }.toList()
         assertEquals("chain and single-route branches", 2, unavailable.size)
         unavailable.forEach { branch ->
