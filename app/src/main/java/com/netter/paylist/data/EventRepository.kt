@@ -86,8 +86,8 @@ class EventRepository(
     suspend fun createEventWithDelivery(event: CanonicalEvent, delivery: Delivery): CreateEventResult {
         return transactions.run {
             val inserted = eventDao.insert(event.toEntity())
-            if (inserted != 0L) {
-                val deliveryInserted = deliveryDao.insert(delivery.toEntity()) != 0L
+            if (inserted != -1L) {
+                val deliveryInserted = deliveryDao.insert(delivery.toEntity()) != -1L
                 CreateEventResult(EventInsertOutcome.INSERTED, deliveryInserted, event.eventId)
             } else {
                 val existing = eventDao.getByDedupeKey(event.dedupeKey)
@@ -99,7 +99,7 @@ class EventRepository(
                 if (outcome == EventInsertOutcome.COLLISION) {
                     CreateEventResult(outcome, false, existing?.eventId ?: event.eventId)
                 } else {
-                    val deliveryInserted = deliveryDao.insert(delivery.toEntity()) != 0L
+                    val deliveryInserted = deliveryDao.insert(delivery.toEntity()) != -1L
                     CreateEventResult(outcome, deliveryInserted, existing?.eventId ?: event.eventId)
                 }
             }
@@ -122,7 +122,7 @@ class EventRepository(
     ): CreateEventResult {
         return transactions.run {
             val inserted = eventDao.insert(event.toEntity())
-            val outcome = if (inserted != 0L) {
+            val outcome = if (inserted != -1L) {
                 EventInsertOutcome.INSERTED
             } else {
                 val existing = eventDao.getByDedupeKey(event.dedupeKey)
@@ -153,7 +153,7 @@ class EventRepository(
         delivery: Delivery,
     ): PromoteResult {
         return transactions.run {
-            val deliveryInserted = deliveryDao.insert(delivery.toEntity()) != 0L
+            val deliveryInserted = deliveryDao.insert(delivery.toEntity()) != -1L
             val stagingDeleted = captureStagingDao.deleteByLegacyQkey(stagingRow.legacyQkey) == 1
             PromoteResult(deliveryInserted, stagingDeleted)
         }

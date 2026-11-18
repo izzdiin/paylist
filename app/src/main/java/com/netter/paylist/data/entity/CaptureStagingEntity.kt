@@ -75,7 +75,7 @@ data class CaptureStagingEntity(
 /** DAO for [CaptureStagingEntity] (file plan §B: carried in this file). */
 @Dao
 interface CaptureStagingDao {
-    /** Insert; returns 0 when a row with this `legacy_qkey` already exists. */
+    /** Insert; returns the row id, or -1 when a row with this `legacy_qkey` already exists. */
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(row: CaptureStagingEntity): Long
 

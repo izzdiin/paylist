@@ -10,13 +10,13 @@ import com.netter.paylist.data.entity.EventEntity
  * DAO for [EventEntity] (design §4.1).
  *
  * Event insert/query (`INSERT OR IGNORE` on `dedupe_key` — file plan
- * §C). Rows-affected = 0 is a duplicate, counted, not retried, not
+ * §C). An ignored insert returns -1: a duplicate, counted, not
  * an error (design §3, R11).
  */
 @Dao
 interface EventDao {
     /**
-     * Insert; returns the row id, or 0 when an event with this
+     * Insert; returns the row id, or -1 when an event with this
      * `dedupe_key` already exists (duplicate — the first event is kept).
      */
     @Insert(onConflict = OnConflictStrategy.IGNORE)

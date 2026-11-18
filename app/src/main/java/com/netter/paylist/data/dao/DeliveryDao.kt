@@ -47,7 +47,7 @@ data class DeliveryStateCount(
 @Dao
 interface DeliveryDao {
 
-    /** Insert; returns 0 when a delivery with this `legacy_qkey` already exists. */
+    /** Insert; returns the row id, or -1 when a delivery with this `legacy_qkey` already exists. */
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(delivery: DeliveryEntity): Long
 

@@ -83,7 +83,7 @@ data class PromotionReceiptEntity(
  */
 @Dao
 interface PromotionReceiptDao {
-    /** Insert; returns 0 when a receipt for this `legacy_qkey` already exists. */
+    /** Insert; returns the row id, or -1 when a receipt for this `legacy_qkey` already exists. */
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(receipt: PromotionReceiptEntity): Long
 

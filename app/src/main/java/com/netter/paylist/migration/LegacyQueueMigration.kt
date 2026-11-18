@@ -397,8 +397,10 @@ class LegacyQueueMigration(
                     val receipt = promotionReceiptDao.getByLegacyQkey(item.qkey)
                     val decision = importStateFor(item, unresolved, receipt)
                     val event = item.toEventEntity(nowMs)
+                    // Room IGNORE insert returns -1 on a unique
+                    // conflict (never 0): -1 means "already there".
                     val eventRow = eventDao.insert(event)
-                    val eventId = if (eventRow != 0L) {
+                    val eventId = if (eventRow != -1L) {
                         batchEvents++
                         event.eventId
                     } else {
@@ -406,7 +408,7 @@ class LegacyQueueMigration(
                         eventDao.getByDedupeKey(item.dedupeKey)?.eventId ?: event.eventId
                     }
                     val delivery = decision.toDeliveryEntity(item, eventId, nowMs)
-                    if (deliveryDao.insert(delivery) != 0L) {
+                    if (deliveryDao.insert(delivery) != -1L) {
                         batchDeliveries++
                         batchStates[delivery.state] = (batchStates[delivery.state] ?: 0) + 1
                     }
