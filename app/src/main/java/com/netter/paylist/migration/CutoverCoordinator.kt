@@ -926,9 +926,27 @@ class CutoverCoordinator(
                         neverSent += attemptDao.markNeverSent(orphan.attemptId, nowMs)
                     } else {
                         unknownHeld++
+                        // §8.5(g): the hop is unknown — hold its
+                        // delivery so it never dispatches on unknown
+                        // evidence. Without this the delivery wedges
+                        // IN_FLIGHT forever (reclaim skips deliveries
+                        // with unresolved markers; the worker never
+                        // posts past one).
+                        deliveryDao.setStateIfNotTerminal(
+                            orphan.deliveryId,
+                            DeliveryState.HELD_AWAITING_RECONCILIATION,
+                            nowMs,
+                        )
                     }
                 }
-                AttemptState.SOCKET_OPEN -> unknownHeld++
+                AttemptState.SOCKET_OPEN -> {
+                    unknownHeld++
+                    deliveryDao.setStateIfNotTerminal(
+                        orphan.deliveryId,
+                        DeliveryState.HELD_AWAITING_RECONCILIATION,
+                        nowMs,
+                    )
+                }
                 else -> Unit
             }
         }

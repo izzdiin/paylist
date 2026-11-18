@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Backup rules, API 28-30 band (design §7.8, P10 option C).
+     Same exclusions as data_extraction_rules.xml: secrets are never
+     restored in any form; the legacy queue and the Room outbox are
+     never restored. Route metadata restore awaits the Stage D
+     prefs split. -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="paylist.xml" />
+    <exclude domain="sharedpref" path="paylist_vault.xml" />
+    <exclude domain="sharedpref" path="paylist_migration.xml" />
+    <exclude domain="database" path="paylist-outbox.db" />
+    <exclude domain="database" path="paylist-outbox.db-wal" />
+    <exclude domain="database" path="paylist-outbox.db-shm" />
+</full-backup-content>
