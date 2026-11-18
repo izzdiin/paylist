@@ -1,0 +1,11 @@
+{
+  "fixture": "http-403",
+  "endpoint": "notify",
+  "event_type": "payment",
+  "http_status": 403,
+  "headers": {},
+  "body": {
+    "ok": false,
+    "error": "forbidden"
+  }
+}

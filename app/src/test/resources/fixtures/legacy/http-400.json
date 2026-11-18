@@ -1,0 +1,11 @@
+{
+  "fixture": "http-400",
+  "endpoint": "notify",
+  "event_type": "payment",
+  "http_status": 400,
+  "headers": {},
+  "body": {
+    "ok": false,
+    "error": "bad_amount"
+  }
+}

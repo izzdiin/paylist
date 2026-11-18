@@ -21,12 +21,17 @@ import android.widget.ListView
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.netter.paylist.security.EndpointValidation
+import com.netter.paylist.security.EndpointValidator
+import com.netter.paylist.security.SecretVault
 import java.util.UUID
 
 /**
  * Form tambah/edit satu rute. Secret tidak pernah ditampilkan kembali:
  * field selalu dibuka kosong; menyimpan dengan secret kosong berarti
  * secret lama dipertahankan (sama seperti perilaku app sebelumnya).
+ * Secret tersimpan di Keystore (SecretVault), bukan di data rute.
+ * URL endpoint divalidasi (HTTPS-only; HTTP butuh konfirmasi eksplisit).
  * Tampilan mengikuti layar utama: terang, kartu, aksen teal brand.
  */
 class RouteEditActivity : Activity() {
@@ -127,23 +132,47 @@ class RouteEditActivity : Activity() {
                 cornerRadius = dp(10).toFloat()
             }
         }
-        saveBtn.setOnClickListener {
+        fun saveRoute(url: String) {
             val typedSecret = secretField.text.toString().trim()
             val route = Route(
                 id = existing?.id ?: UUID.randomUUID().toString(),
                 name = nameField.text.toString().trim().ifEmpty { "Rute" },
                 packages = pkgField.text.toString().split(",")
                     .map { it.trim() }.filter { it.isNotEmpty() },
-                url = urlField.text.toString().trim(),
-                secret = typedSecret.ifEmpty { existing?.secret ?: "" },
+                url = url,
                 keywords = kwField.text.toString().split(",")
                     .map { it.trim().lowercase() }.filter { it.isNotEmpty() }
                     .ifEmpty { Route.DEFAULT_KEYWORDS },
                 enabled = enabledBox.isChecked
             )
+            // Stage C: the secret lives in the Keystore vault, never in
+            // the route record. An empty field keeps the stored secret.
+            if (typedSecret.isNotEmpty()) {
+                if (!SecretVault(this).putSecret(route.id, typedSecret)) {
+                    Toast.makeText(this, "Secret gagal disimpan; rute tidak disimpan.", Toast.LENGTH_LONG).show()
+                    return
+                }
+            }
             store.upsertRoute(route)
             store.logLocal("rute disimpan: ${route.name}")
             finish()
+        }
+        saveBtn.setOnClickListener {
+            val url = urlField.text.toString().trim()
+            when (val validation = EndpointValidator.validate(url)) {
+                is EndpointValidation.Invalid -> {
+                    Toast.makeText(this, "URL tidak valid: ${validation.reason}", Toast.LENGTH_LONG).show()
+                }
+                is EndpointValidation.LegacyHttp -> {
+                    AlertDialog.Builder(this)
+                        .setTitle("URL masih HTTP")
+                        .setMessage("Rute ini memakai HTTP tanpa enkripsi. Secret akan dikirim tanpa TLS. Simpan sebagai rute legacy?")
+                        .setPositiveButton("Simpan") { _, _ -> saveRoute(url) }
+                        .setNegativeButton("Batal", null)
+                        .show()
+                }
+                is EndpointValidation.Valid -> saveRoute(url)
+            }
         }
         layout.addView(saveBtn)
 
@@ -159,6 +188,7 @@ class RouteEditActivity : Activity() {
             }
             delBtn.setOnClickListener {
                 store.deleteRoute(existing.id)
+                SecretVault(this).deleteSecret(existing.id)
                 store.logLocal("rute dihapus: ${existing.name}")
                 finish()
             }

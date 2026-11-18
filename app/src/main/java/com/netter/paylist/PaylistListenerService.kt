@@ -186,7 +186,7 @@ class PaylistListenerService : NotificationListenerService() {
             "payment: Rp$amount dari $pkg -> " +
                 matched.joinToString(" > ") { it.name }
         )
-        Sender(this).enqueueChain(payload, matched.map { it.id })
+        appSender().enqueueChain(payload, matched.map { it.id })
         return true
     }
 

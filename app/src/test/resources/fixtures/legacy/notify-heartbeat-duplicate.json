@@ -1,0 +1,15 @@
+{
+  "fixture": "notify-heartbeat-duplicate",
+  "endpoint": "notify",
+  "event_type": "heartbeat",
+  "http_status": 200,
+  "headers": {},
+  "body": {
+    "ok": true,
+    "duplicate": true,
+    "mode": "observasi",
+    "match": {
+      "status": "logged"
+    }
+  }
+}

@@ -22,6 +22,9 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
+import com.netter.paylist.security.SecretResult
+import com.netter.paylist.security.SecretVault
 import org.json.JSONObject
 
 /**
@@ -228,6 +231,45 @@ class MainActivity : Activity() {
         statusCard.addView(notifBtn)
         root.addView(statusCard)
 
+        // --- Pengiriman baru (Worker, Stage C; aktivasi menunggu Stage D) ---
+        // Cutover memigrasikan antrean legacy ke Room lalu mengaktifkan
+        // SyncWorker. Di Stage C tombolnya nonaktif: jalur capture ke
+        // Room (Stage D) belum ada, dan mengaktifkan Worker sekarang
+        // akan menghentikan pengiriman pembayaran baru.
+        val cutoverCard = cardLayout()
+        cutoverCard.addView(TextView(this).apply {
+            text = "PENGIRIMAN BARU (WORKER)"
+            textSize = 12f
+            setTextColor(TEAL)
+            setTypeface(typeface, Typeface.BOLD)
+        })
+        cutoverCard.addView(TextView(this).apply {
+            text = "Cutover memindahkan antrean ke pengiriman baru (WorkManager + Room). " +
+                "Aktivasi menunggu Stage D (jalur capture ke Room)."
+            textSize = 13f
+            setTextColor(GRAY)
+            setPadding(0, dp(4), 0, dp(8))
+        })
+        val cutoverBtn = primaryButton("Aktifkan Pengiriman Baru")
+        cutoverBtn.isEnabled = false
+        cutoverBtn.setOnClickListener {
+            cutoverBtn.isEnabled = false
+            Thread {
+                val app = application as PaylistApplication
+                val result = app.runCutover { msg ->
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+                    }
+                }
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, result, Toast.LENGTH_LONG).show()
+                    buildUi()
+                }
+            }.start()
+        }
+        cutoverCard.addView(cutoverBtn)
+        root.addView(cutoverCard)
+
         // --- Daftar rute ---
         root.addView(TextView(this).apply {
             text = "RUTE (atas = prioritas pertama)"
@@ -295,7 +337,7 @@ class MainActivity : Activity() {
                     put("title", "Tes")
                     put("text", "tes endpoint dari Paylist")
                 }
-                Sender(this@MainActivity).enqueueToRoute(payload, r.id)
+                appSender().enqueueToRoute(payload, r.id)
                 store.logLocal("tes diantrekan ke rute ${r.name}; hasil kirimnya tercatat di log ini")
                 buildUi()
             }
@@ -338,14 +380,22 @@ class HeartbeatReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent?) {
         if (intent?.action == Intent.ACTION_BOOT_COMPLETED) {
             // Setelah reboot: cukup jadwalkan ulang heartbeat + flush antrean.
-            Thread { Sender(ctx).flush() }.start()
+            Thread { ctx.appSender().flush() }.start()
             schedule(ctx)
             return
         }
         val store = Store(ctx)
         Thread {
-            val sender = Sender(ctx)
-            store.routes().filter { it.enabled && it.url.isNotEmpty() && it.secret.isNotEmpty() }
+            // Jangan antrekan heartbeat bila sender tidak bisa flush
+            // (mode bukan LEGACY_ONLY): itemnya hanya menumpuk.
+            val app = ctx.applicationContext as? PaylistApplication
+            if (app != null && !app.modeGate.isLegacyOnly()) return@Thread
+            val sender = ctx.appSender()
+            val vault = SecretVault(ctx)
+            store.routes().filter {
+                it.enabled && it.url.isNotEmpty() &&
+                    vault.secretFor(it.id) is SecretResult.Present
+            }
                 .forEach { r ->
                     val payload = JSONObject().apply {
                         put("type", "heartbeat")

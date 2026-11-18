@@ -1,0 +1,13 @@
+{
+  "fixture": "notify-test-fresh",
+  "endpoint": "notify",
+  "event_type": "test",
+  "http_status": 200,
+  "headers": {},
+  "body": {
+    "ok": true,
+    "duplicate": false,
+    "mode": "observasi",
+    "match": null
+  }
+}

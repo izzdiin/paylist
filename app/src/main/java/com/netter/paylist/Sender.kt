@@ -1,10 +1,27 @@
 package com.netter.paylist
 
 import android.content.Context
+import com.netter.paylist.delivery.HttpTransportClient
+import com.netter.paylist.delivery.LegacyResponseClassifier
+import com.netter.paylist.delivery.ResponseClassification
+import com.netter.paylist.delivery.TransportClient
+import com.netter.paylist.delivery.TransportRequest
+import com.netter.paylist.delivery.TransportResult
+import com.netter.paylist.security.SecretProvider
+import com.netter.paylist.security.SecretResult
+import com.netter.paylist.security.SecretVault
+import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
-import java.io.OutputStreamWriter
-import java.net.HttpURLConnection
-import java.net.URL
+import kotlin.concurrent.withLock
+
+/**
+ * The app's single legacy sender (mode-gated, vault-backed). Falls
+ * back to an unfenced sender only when the Application is not
+ * [PaylistApplication] (never in production).
+ */
+fun Context.appSender(): Sender =
+    (applicationContext as? PaylistApplication)?.sender
+        ?: Sender(this, ModeGate.ALWAYS_LEGACY)
 
 /**
  * Mesin pengiriman antrean dengan rute.
@@ -26,15 +43,39 @@ import java.net.URL
  * dicatat ke log lokal DENGAN ALASANNYA (kode HTTP / jenis exception) dan
  * diringkas di Store.lastFailure supaya terlihat di layar utama.
  *
- * Header secret tetap X-QRIS-Secret: nama header adalah kontrak endpoint
+ * Header secret tetap X-QRIS-Secret: <redacted>
  * yang sudah berjalan (notify.php), bukan nama app.
+ *
+ * Stage C (design §8, §5.4, §5.5):
+ * - The queue lock is the shared fair [SenderLock]: the cutover
+ *   coordinator takes the same lock (timed, 45 s) before committing
+ *   `DRAINING`, so no flush is running at the commit. Quiescence for
+ *   the legacy path comes from the lock plus the mode flag — the
+ *   legacy flush writes NO attempt rows (legacy items have no Room
+ *   delivery to attach them to; the attempt protocol is the worker's
+ *   path, and the queue file + `dedupe_key` idempotency cover the
+ *   crash windows instead, T22).
+ * - Every POST start requires the lock plus a `LEGACY_ONLY` check
+ *   performed under the lock ([modeGate]). Past the `DRAINING`
+ *   commit, no POST can start.
+ * - POSTs go through [TransportClient] with [LegacyResponseClassifier]
+ *   semantics shared with the worker: redirects never followed (C9),
+ *   malformed 2xx retries the same hop, 4xx halts the chain (§5.5
+ *   row 3 — the item stays queued at the same hop instead of
+ *   advancing, so no payment is lost to a rejected hop), unknown
+ *   hops keep the item queued at the same hop.
+ * - Known legacy limitations (the Room worker handles these properly
+ *   post-cutover): a matched-but-unconfirmed hop (apply error/absent)
+ *   removes the item with a log line (no HELD state exists here);
+ *   a 4xx keeps the item queued and re-posts it on every flush until
+ *   the operator fixes the route.
  */
-class Sender(private val ctx: Context) {
-    companion object {
-        // Antrean dibaca-tulis dari beberapa thread (listener, heartbeat, UI):
-        // kunci statis supaya tidak ada event yang hilang karena balapan.
-        private val LOCK = Any()
-    }
+class Sender(
+    private val ctx: Context,
+    private val modeGate: ModeGate,
+    private val secrets: SecretProvider = SecretVault(ctx),
+    private val transport: TransportClient = HttpTransportClient(),
+) {
 
     fun enqueueToRoute(payload: JSONObject, routeId: String) {
         val item = JSONObject().apply {
@@ -56,7 +97,7 @@ class Sender(private val ctx: Context) {
     }
 
     private fun enqueueItem(item: JSONObject, qkey: String) {
-        synchronized(LOCK) {
+        SenderLock.lock.withLock {
             val store = Store(ctx)
             val q = store.queue()
             if (q.none { it.optString("qkey") == qkey }) {
@@ -70,10 +111,13 @@ class Sender(private val ctx: Context) {
     }
 
     fun flush() {
-        synchronized(LOCK) { flushLocked() }
+        SenderLock.lock.withLock { flushLocked() }
     }
 
     private fun flushLocked() {
+        // Mode gate at flush entry (defence in depth; the per-POST
+        // check inside processItem is the normative one).
+        if (!modeGate.isLegacyOnly()) return
         val store = Store(ctx)
         // Proses SEMUA item; yang belum selesai tetap di antrean dengan
         // urutan asal. Kegagalan satu item tidak menghentikan item lain.
@@ -115,13 +159,36 @@ class Sender(private val ctx: Context) {
             var next = item.optInt("next", 0)
             while (next < ids.size) {
                 val route = store.routeById(ids[next])
-                if (route == null || !route.enabled ||
-                    route.url.isEmpty() || route.secret.isEmpty()
-                ) {
+                if (route == null || !route.enabled || route.url.isEmpty()) {
                     next++
                     continue
                 }
-                val res = post(route, payload)
+                // Stage C: the secret comes from the vault, never from
+                // the route record. No secret (or an unreadable one)
+                // means this hop cannot be attempted: skip it (NO_POST,
+                // §5.5 row 6) and record the reason visibly.
+                val secret = when (val s = secrets.secretFor(route.id)) {
+                    is SecretResult.Present -> s.value
+                    is SecretResult.Missing -> {
+                        next++
+                        continue
+                    }
+                    is SecretResult.Unavailable -> {
+                        store.setLastFailure(
+                            "secret rute ${route.name} tidak bisa dibaca (${s.reason}); masukkan ulang secret",
+                        )
+                        next++
+                        continue
+                    }
+                }
+                // Normative mode check before every POST (§8): the
+                // mode cannot change mid-flush (the coordinator needs
+                // this lock first), so this is defence in depth.
+                if (!modeGate.isLegacyOnly()) {
+                    item.put("next", next)
+                    return false
+                }
+                val res = post(route, payload, secret)
                 if (res.retryable) {
                     // Simpan posisi; item tertahan, item LAIN tetap diproses.
                     item.put("next", next)
@@ -144,7 +211,18 @@ class Sender(private val ctx: Context) {
         // Item "single" (heartbeat / tes untuk satu rute).
         val route = store.routeById(item.optString("route_id")) ?: return true
         if (!route.enabled) return true // rute dimatikan: item tidak relevan lagi
-        if (route.url.isEmpty() || route.secret.isEmpty()) return true
+        if (route.url.isEmpty()) return true
+        // Stage C: the secret comes from the vault (see the chain path above).
+        val secret = when (val s = secrets.secretFor(route.id)) {
+            is SecretResult.Present -> s.value
+            is SecretResult.Missing -> return true // tanpa secret: item tidak bisa dikirim
+            is SecretResult.Unavailable -> {
+                store.setLastFailure(
+                    "secret rute ${route.name} tidak bisa dibaca (${s.reason}); masukkan ulang secret",
+                )
+                return true
+            }
+        }
         // Heartbeat kedaluwarsa: jendela dedupe-nya sudah lewat > 2 jendela
         // (30 menit) -> buang, heartbeat lama tidak berguna.
         if (payload.optString("type") == "heartbeat") {
@@ -156,7 +234,8 @@ class Sender(private val ctx: Context) {
                 return true
             }
         }
-        val res = post(route, payload)
+        if (!modeGate.isLegacyOnly()) return false
+        val res = post(route, payload, secret)
         if (res.retryable) {
             markFail(store, item, describe(payload), route.name, res.error ?: "gagal jaringan")
             return false
@@ -173,54 +252,62 @@ class Sender(private val ctx: Context) {
     private class Outcome(val matched: Boolean, val retryable: Boolean, val error: String?)
 
     /**
-     * POST satu payload ke satu rute.
-     * - 2xx: Outcome(matched dari blok "match"; 'matched'/'ambiguous' = diklaim).
-     * - 4xx: tidak dicoba lagi (retryable=false) dengan alasan HTTP-nya.
-     * - 5xx / gagal jaringan: retryable=true dengan alasan (kode / exception).
+     * POST satu payload ke satu rute via [TransportClient], classified
+     * with the shared §5.4 taxonomy ([LegacyResponseClassifier]).
+     * The checkpoint callback is trivially true: the legacy flush has
+     * no attempt row to checkpoint (see the class KDoc).
      */
-    private fun post(route: Route, payload: JSONObject): Outcome {
-        return try {
-            val conn = URL(route.url).openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.setRequestProperty("X-QRIS-Secret", route.secret)
-            conn.connectTimeout = 15000
-            conn.readTimeout = 15000
-            conn.doOutput = true
-            OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { w ->
-                w.write(payload.toString())
-            }
-            val code = conn.responseCode
-            val body = try {
-                val stream =
-                    if (code in 200..299) conn.inputStream else conn.errorStream
-                stream?.bufferedReader()?.readText().orEmpty()
-            } catch (e: Exception) {
-                ""
-            }
-            conn.disconnect()
-            when {
-                code in 200..299 -> {
-                    // Kontrak endpoint notify.php: match.status salah satu dari
-                    // 'matched' | 'ambiguous' | 'logged'. 'matched' berarti
-                    // pembayaran diklaim rute ini; 'ambiguous' juga menghentikan
-                    // rantai (pembayaran parkir di log rute ini untuk ditinjau
-                    // manual — meneruskannya bisa melunasi dua sistem sekaligus).
-                    // 'logged' / tanpa blok match = bukan milik rute ini.
-                    val m = try {
-                        JSONObject(body).optJSONObject("match")
-                    } catch (e: Exception) {
-                        null
-                    }
-                    val st = m?.optString("status").orEmpty()
-                    Outcome(st == "matched" || st == "ambiguous", false, null)
-                }
-                code in 400..499 -> Outcome(false, false, "ditolak server (HTTP $code)")
-                else -> Outcome(false, true, "server menjawab HTTP $code")
+    private fun post(route: Route, payload: JSONObject, secret: String): Outcome {
+        val eventType = payload.optString("type").ifEmpty { "payment" }
+        val result = try {
+            runBlocking {
+                transport.post(
+                    TransportRequest(route.url, secret, payload.toString())
+                ) { true }
             }
         } catch (e: Exception) {
             val msg = e.message?.take(90)?.replace('\n', ' ').orEmpty()
-            Outcome(false, true, "${e.javaClass.simpleName}${if (msg.isNotEmpty()) ": $msg" else ""}")
+            return Outcome(false, true, "${e.javaClass.simpleName}${if (msg.isNotEmpty()) ": $msg" else ""}")
+        }
+        return when (result) {
+            is TransportResult.Http -> {
+                val outcome = LegacyResponseClassifier.classify(
+                    result.status, result.headers, result.body, eventType
+                )
+                when (outcome.classification) {
+                    ResponseClassification.MATCHED_SETTLED,
+                    ResponseClassification.MATCHED_NOT_APPLIED,
+                    ResponseClassification.MATCHED_UNCONFIRMED,
+                    ResponseClassification.AMBIGUOUS,
+                    -> {
+                        // Chain stops; the item is done. An unconfirmed
+                        // match is logged (no HELD state exists here).
+                        val error = if (outcome.classification == ResponseClassification.MATCHED_UNCONFIRMED) {
+                            "hasil apply belum terkonfirmasi; periksa log server"
+                        } else {
+                            null
+                        }
+                        Outcome(true, false, error)
+                    }
+                    ResponseClassification.LOGGED,
+                    ResponseClassification.ACK,
+                    -> Outcome(false, false, null)
+                    ResponseClassification.RETRY ->
+                        Outcome(false, true, "HTTP ${result.status}")
+                    ResponseClassification.BLOCKED -> {
+                        // §5.5 row 3: halt — the item stays queued at
+                        // this hop (never advances, never lost).
+                        val location = outcome.location?.let { "; redirect ke $it" }.orEmpty()
+                        Outcome(false, true, "ditolak server (HTTP ${result.status})$location")
+                    }
+                    ResponseClassification.UNKNOWN_PENDING_RECONCILIATION ->
+                        Outcome(false, true, "hasil tidak diketahui (HTTP ${result.status})")
+                }
+            }
+            is TransportResult.NetworkError ->
+                Outcome(false, true, result.errorCode)
+            is TransportResult.CheckpointFailed ->
+                Outcome(false, true, "checkpoint gagal")
         }
     }
 }

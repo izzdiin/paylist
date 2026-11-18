@@ -1,0 +1,15 @@
+{
+  "fixture": "notify-payment-duplicate-logged",
+  "endpoint": "notify",
+  "event_type": "payment",
+  "http_status": 200,
+  "headers": {},
+  "body": {
+    "ok": true,
+    "duplicate": true,
+    "mode": "observasi",
+    "match": {
+      "status": "logged"
+    }
+  }
+}

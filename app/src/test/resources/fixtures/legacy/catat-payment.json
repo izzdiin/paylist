@@ -1,0 +1,15 @@
+{
+  "fixture": "catat-payment",
+  "endpoint": "catat",
+  "event_type": "payment",
+  "http_status": 200,
+  "headers": {},
+  "body": {
+    "ok": true,
+    "recorded": true,
+    "direction": "in",
+    "match": {
+      "status": "logged"
+    }
+  }
+}

@@ -1,0 +1,147 @@
+# Paylist Android CI
+#
+# Builds the debug APK, runs the local unit tests, and runs the
+# instrumented tests (OutboxMigrationTest + DeliveryLeaseTest) on an
+# API 28 emulator, on every push and pull request to the phase-1.3
+# work branches.
+#
+# INSTRUMENTED TESTS ON CI (2026-11-18): these used to run on a local
+# BlueStacks emulator (MSI App Player on the owner's PC), but the
+# player died within ~1-5 minutes of every boot (VM clock lagging
+# 60s+, cause never fully pinned down), so the tests moved here to
+# reactivecircus/android-emulator-runner on the GitHub runner.
+#
+# WHY THIS WORKFLOW USES setup-gradle INSTEAD OF ./gradlew
+# ---------------------------------------------------------
+# The Gradle wrapper JAR (`gradle/wrapper/gradle-wrapper.jar`) is a binary
+# file, and the delivery path available to this project (GitHub MCP
+# `push_files`) only accepts UTF-8 text — the wrapper JAR cannot be pushed
+# to GitHub through it. The wrapper JAR exists locally on laptopgrt (where
+# all Stage A work is built and tested), but until it is uploaded to the
+# branch by hand (GitHub web UI), `./gradlew` cannot run from a fresh
+# checkout. This workflow therefore installs Gradle 8.9 directly with
+# `gradle/actions/setup-gradle` and invokes `gradle` instead of `./gradlew`.
+# Once the wrapper JAR is on the branch, switch the build steps back to
+# `./gradlew` (same Gradle version, 8.9).
+#
+# BINARY PREREQUISITE (same gap, icons)
+# --------------------------------------
+# The 10 launcher icons (`app/src/main/res/mipmap-*/ic_launcher*.png`)
+# are also binaries that cannot go through the text-only push path.
+# `assembleDebug` FAILS without them (the manifest references
+# `@mipmap/ic_launcher` / `@mipmap/ic_launcher_round`). UPDATE 2026-11-18:
+# the icons AND the wrapper JAR are now on the branch (pushed via git+SSH
+# from laptopgrt2, verified with git ls-tree), so a clean checkout builds.
+#
+# Versions (design §11, C17): JDK 17 (Temurin), Android SDK platform 34 +
+# build-tools 34.0.0, Gradle 8.9, AGP 8.5.2, Kotlin 2.0.20, Room 2.7.0 +
+# KSP2, WorkManager 2.9.0.
+
+name: Android CI
+
+on:
+  push:
+    branches: ["phase-1.3", "main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-and-test:
+    name: assembleDebug + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # No setup-android step: android-actions/setup-android@v3 fails on
+      # current runners (run 44188118469, step failed in 3s). The
+      # GitHub-hosted runner image already ships the Android SDK at
+      # $ANDROID_HOME, but cmdline-tools/bin is NOT on PATH (run
+      # 44202570968: "sdkmanager: command not found"), so the step below
+      # adds it to PATH first, then installs platform 34 / build-tools.
+
+      - name: Set up Gradle 8.9
+        # See the header comment: ./gradlew is unusable until the wrapper
+        # JAR is uploaded to the branch by hand.
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.9"
+
+      - name: Accept SDK licences + install platform 34 / build-tools 34.0.0
+        run: |
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Build debug APK
+        run: >
+          gradle assembleDebug --no-daemon --console=plain
+          -Dorg.gradle.jvmargs="-Xmx2048m" -Dkotlin.daemon.jvm.options="-Xmx1024m"
+
+      - name: Run unit tests
+        run: >
+          gradle testDebugUnitTest --no-daemon --console=plain
+          -Dorg.gradle.jvmargs="-Xmx2048m" -Dkotlin.daemon.jvm.options="-Xmx1024m"
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: app/build/test-results/testDebugUnitTest/
+          if-no-files-found: warn
+
+  instrumented-tests:
+    name: instrumented tests (API 28 emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.9"
+
+      - name: Accept SDK licences + install platform 34 / build-tools 34.0.0
+        run: |
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Run instrumented tests on emulator (API 28)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 28
+          target: default
+          arch: x86_64
+          profile: pixel_4
+          # NOTE: do NOT add --tests here. Gradle rejects it for
+          # connected* tasks (CommandLineArgumentException: Unknown
+          # command-line option '--tests', run #4 re-run). The
+          # androidTest source set currently holds exactly the two
+          # Stage B tests, so the unfiltered task runs precisely them.
+          script: >-
+            gradle connectedDebugAndroidTest --no-daemon --console=plain
+            -Dorg.gradle.jvmargs="-Xmx2048m" -Dkotlin.daemon.jvm.options="-Xmx1024m"
+
+      - name: Upload instrumented test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrumented-test-reports
+          path: app/build/outputs/androidTest-results/connected/
+          if-no-files-found: warn
