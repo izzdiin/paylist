@@ -3,6 +3,7 @@ package com.netter.paylist.delivery
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.net.ConnectException
 import java.net.HttpURLConnection
 import java.net.Proxy
 import java.net.SocketTimeoutException
@@ -44,9 +45,12 @@ sealed interface TransportResult {
     ) : TransportResult
 
     /**
-     * No HTTP response: the request provably did not reach the server
-     * as a completed POST (`NO_POST`, §5.5 row 5). `errorCode` is one
-     * of `dns`, `connect_timeout`, `read_timeout`, `ssl`, `io`.
+     * No HTTP response. `errorCode` is one of:
+     * - `dns`, `connect_timeout`, `connect_refused`, `ssl`,
+     *   `io_connect`: the connection never established — the request
+     *   provably did not reach the server (`NO_POST`, §5.5 row 5).
+     * - `write_timeout`, `read_timeout`, `io`: the request may have
+     *   been sent — the hop outcome is `UNKNOWN`, never `NO_POST`.
      */
     data class NetworkError(val errorCode: String) : TransportResult
 
@@ -180,13 +184,23 @@ class HttpTransportClient(
         } catch (e: UnknownHostException) {
             TransportResult.NetworkError("dns")
         } catch (e: SSLException) {
+            // TLS failure: the tunnel never established, so no HTTP
+            // request could have been sent (NO_POST).
             TransportResult.NetworkError("ssl")
+        } catch (e: ConnectException) {
+            TransportResult.NetworkError("connect_refused")
         } catch (e: SocketTimeoutException) {
             TransportResult.NetworkError(
-                if (phase == "connect") "connect_timeout" else "read_timeout"
+                when (phase) {
+                    "connect" -> "connect_timeout"
+                    "write" -> "write_timeout"
+                    else -> "read_timeout"
+                }
             )
         } catch (e: IOException) {
-            TransportResult.NetworkError("io")
+            // Connect-phase I/O means the request never left (NO_POST);
+            // write/read-phase I/O means it may have been sent (UNKNOWN).
+            TransportResult.NetworkError(if (phase == "connect") "io_connect" else "io")
         } finally {
             conn.disconnect()
         }

@@ -221,6 +221,29 @@ interface DeliveryDao {
     ): Int
 
     /**
+     * `IN_FLIGHT → HELD_AWAITING_RECONCILIATION`, only while the
+     * caller's lease is held and unexpired (§5.5 rows 4/8b/9/10:
+     * unknown hop, reconciliation only). Persists the hop checkpoint
+     * (next index + outcomes) with the hold, like `retryWait`.
+     */
+    @Query(
+        "UPDATE deliveries SET state = 'HELD_AWAITING_RECONCILIATION', " +
+            "last_error_code = :errorCode, last_error_summary = :errorSummary, " +
+            "next_route_index = :nextRouteIndex, hop_outcomes_json = :hopOutcomesJson, " +
+            "updated_at_ms = :now WHERE delivery_id = :id AND state = 'IN_FLIGHT' " +
+            "AND lease_owner = :leaseOwner AND lease_until_ms > :now",
+    )
+    suspend fun holdForReconciliationIfLeaseHeld(
+        id: String,
+        leaseOwner: String,
+        now: Long,
+        errorCode: String?,
+        errorSummary: String?,
+        nextRouteIndex: Int,
+        hopOutcomesJson: String,
+    ): Int
+
+    /**
      * Per-hop checkpoint (§5.5): persist `next_route_index` +
      * `hop_outcomes` after a POST returns, only while the caller's
      * lease is held and unexpired.

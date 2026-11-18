@@ -317,7 +317,7 @@ private fun Map<String, RouteStamp>.toJsonString(): String = JSONObject().apply 
     }
 }.toString()
 
-private object RouteStampMap {
+internal object RouteStampMap {
     fun fromJsonString(json: String): Map<String, RouteStamp> {
         return try {
             val o = JSONObject(json)

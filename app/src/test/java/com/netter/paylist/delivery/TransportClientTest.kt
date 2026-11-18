@@ -637,7 +637,7 @@ class TransportClientTest {
                 request("http://127.0.0.1:$closedPort/notify.php")
             ) { true }
         }
-        assertEquals(TransportResult.NetworkError("io"), result)
+        assertEquals(TransportResult.NetworkError("connect_refused"), result)
     }
 
     @Test

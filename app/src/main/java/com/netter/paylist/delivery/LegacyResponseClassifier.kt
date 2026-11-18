@@ -68,6 +68,8 @@ data class ClassificationOutcome(
     val classification: ResponseClassification,
     val chain: ChainAction,
     val lastApplyStatus: String? = null,
+    /** The server's `match.status` string as observed (`matched`/`logged`/`ambiguous`/…), or null when absent. */
+    val matchStatus: String? = null,
     /** "auth" (401/403) | "payload" (other 4xx) | "config" (3xx). */
     val blockedCategory: String? = null,
     /** Parsed `Retry-After` (seconds), clamped to [0, 7200]; null if absent/invalid. */
@@ -126,11 +128,17 @@ object LegacyResponseClassifier {
             }
             if (eventType != "payment") {
                 // C1: ACK on ok=true whatever `match` contains.
+                val matchStatus = body.optJSONObject("match")
+                    ?.optString("status")?.ifEmpty { null }
                 return if (body.optBoolean("ok", false)) {
-                    ClassificationOutcome(ResponseClassification.ACK, ChainAction.STOP)
+                    ClassificationOutcome(
+                        ResponseClassification.ACK, ChainAction.STOP,
+                        matchStatus = matchStatus
+                    )
                 } else {
                     ClassificationOutcome(
-                        ResponseClassification.RETRY, ChainAction.RETRY_BACKOFF
+                        ResponseClassification.RETRY, ChainAction.RETRY_BACKOFF,
+                        matchStatus = matchStatus
                     )
                 }
             }
@@ -143,7 +151,8 @@ object LegacyResponseClassifier {
                     )
                 }
             val duplicate = body.optBoolean("duplicate", false)
-            return when (val status = match.optString("status", "")) {
+            val status = match.optString("status", "")
+            val outcome = when (status) {
                 "matched" -> {
                     if (duplicate) {
                         // Apply is definitionally absent on a duplicate;
@@ -204,6 +213,7 @@ object LegacyResponseClassifier {
                     )
                 }
             }
+            return outcome.copy(matchStatus = status.ifEmpty { null })
         }
         // Non-2xx on a re-POST proves nothing about the first attempt
         // (§5.5 row 10): the hop stays unknown, never retried past it.
