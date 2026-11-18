@@ -313,6 +313,54 @@ class CutoverEndToEndTest {
         assertTrue("the item must deliver after the abort", store.queueSnapshot().isEmpty())
     }
 
+    @Test
+    fun abortThenRetryCutover_succeedsWithoutDuplicatesOrLoss() = runBlocking {
+        setBootId(BOOT_A)
+        seedQueue(
+            listOf(
+                chainQueueItem(paymentPayload("e2e-retry1"), ROUTES),
+                chainQueueItem(paymentPayload("e2e-retry2"), ROUTES),
+            ),
+        )
+        val coordinator = newCoordinator(storeQueueSource())
+
+        // Attempt 1: the preflight write fails → abort (row 5:
+        // LEGACY_ONLY / ABORTED), queue untouched.
+        val failing = FailingQueueSource(storeQueueSource(), failWrites = true)
+        assertTrue(coordinator.requestDrain(NOW) is CutoverCommit.Success)
+        assertEquals(1L, coordinator.getDrainGeneration())
+        val failed = CutoverPrivacyPreflight().run(failing, NOW)
+        assertFalse("attempt 1 preflight must fail on the write failure", failed.ok)
+        assertEquals("privacy_write_failed", failed.reason)
+        assertTrue(coordinator.abortCutover(NOW) is CutoverCommit.Success)
+        assertEquals(CutoverMode.LEGACY_ONLY, coordinator.getMode())
+        assertEquals(DrainIntent.ABORTED, coordinator.getDrainIntent())
+        assertEquals(2, store.queueSnapshot().size)
+
+        // Attempt 2: the next cutover attempt (design §7.3A(h)) starts
+        // from ABORTED with a fresh generation — before the fix this
+        // requestDrain was rejected and no retry was possible.
+        val retried = coordinator.requestDrain(NOW)
+        assertTrue("requestDrain after abort must succeed: $retried", retried is CutoverCommit.Success)
+        assertEquals(2L, coordinator.getDrainGeneration())
+        assertEquals(DrainIntent.PENDING, coordinator.getDrainIntent())
+        withSenderLock {
+            val preflight = CutoverPrivacyPreflight().run(storeQueueSource(), NOW)
+            assertTrue("attempt 2 preflight must succeed: ${preflight.reason}", preflight.ok)
+            val committed = coordinator.commitDraining(NOW)
+            assertTrue("commitDraining must succeed on retry: $committed", committed is CutoverCommit.Success)
+        }
+        val drained = coordinator.drain(GateBackedInspector, NOW)
+        assertTrue("drain must succeed: ${drained.error}", drained.ok)
+        assertEquals(2, drained.imported)
+        assertEquals(2, drained.removed)
+        assertTrue(coordinator.commitWorkerOnly(NOW) is CutoverCommit.Success)
+        assertEquals(CutoverMode.WORKER_ONLY, coordinator.getMode())
+        assertTrue(store.queueSnapshot().isEmpty())
+        assertEquals(2, db.eventDao().count())
+        assertEquals(2, db.deliveryDao().claimBatch(10, NOW, LEASE_MS).size)
+    }
+
     // =====================================================================
     // Crash windows
     // =====================================================================

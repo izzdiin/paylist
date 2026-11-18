@@ -418,6 +418,31 @@ class CutoverTest {
     }
 
     @Test
+    fun requestDrain_afterAbort_startsCleanRetry() = runBlocking {
+        val h = newHarness()
+        // Attempt 1: request, then abort (row 5: LEGACY_ONLY / ABORTED).
+        val first = h.coordinator.requestDrain(NOW)
+        assertTrue("first requestDrain must succeed: $first", first is CutoverCommit.Success)
+        assertEquals(1L, h.coordinator.getDrainGeneration())
+        val aborted = h.coordinator.abortCutover(NOW)
+        assertTrue("abort must succeed: $aborted", aborted is CutoverCommit.Success)
+        assertEquals(CutoverMode.LEGACY_ONLY, h.coordinator.getMode())
+        assertEquals(DrainIntent.ABORTED, h.coordinator.getDrainIntent())
+        // Attempt 2: the next cutover attempt (design §7.3A(h)) starts
+        // from ABORTED with a FRESH generation — the aborted attempt's
+        // awaited set is re-snapshotted, never reused. Before the fix
+        // this requestDrain was rejected and no retry was possible.
+        val second = h.coordinator.requestDrain(NOW)
+        assertTrue("requestDrain after abort must succeed: $second", second is CutoverCommit.Success)
+        assertEquals(2L, h.coordinator.getDrainGeneration())
+        assertEquals(DrainIntent.PENDING, h.coordinator.getDrainIntent())
+        // And the retry can complete the cutover.
+        val committed = h.coordinator.commitDraining(NOW)
+        assertTrue("commitDraining must succeed on retry: $committed", committed is CutoverCommit.Success)
+        assertEquals(CutoverMode.DRAINING, h.coordinator.getMode())
+    }
+
+    @Test
     fun commitDraining_requiresRequestedDrain() = runBlocking {
         val h = newHarness()
         // No drain requested: the commit is refused (R19 correction of F37a).
