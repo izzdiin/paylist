@@ -1,7 +1,8 @@
 # Paylist Android CI
 #
 # Builds the debug APK, runs the local unit tests, and runs the
-# instrumented tests (OutboxMigrationTest + DeliveryLeaseTest) on an
+# instrumented tests (OutboxMigrationTest + DeliveryLeaseTest +
+# SenderRetentionTest + CutoverEndToEndTest) on an
 # API 28 emulator, on every push and pull request to phase-1.3
 # and main.
 #
@@ -132,8 +133,9 @@ jobs:
           # NOTE: do NOT add --tests here. Gradle rejects it for
           # connected* tasks (CommandLineArgumentException: Unknown
           # command-line option '--tests', run #4 re-run). The
-          # androidTest source set currently holds exactly the two
-          # Stage B tests, so the unfiltered task runs precisely them.
+          # androidTest source set holds the two Stage B tests plus the
+          # Stage C end-to-end tests (SenderRetentionTest,
+          # CutoverEndToEndTest), so the unfiltered task runs all of them.
           script: >-
             gradle connectedDebugAndroidTest --no-daemon --console=plain
             -Dorg.gradle.jvmargs="-Xmx2048m" -Dkotlin.daemon.jvm.options="-Xmx1024m"

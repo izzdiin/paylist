@@ -49,9 +49,10 @@ dependencies {
     // Real org.json for JVM unit tests: android.jar's org.json stubs throw.
     testImplementation("org.json:json:20240303")
 
-    // Stage B androidTest (OutboxMigrationTest + DeliveryLeaseTest): real
-    // Room on-device. These COMPILE in CI/on laptopgrt2 but cannot EXECUTE
-    // there (no device/emulator); execution needs a device or an emulator.
+    // androidTest: Stage B (OutboxMigrationTest + DeliveryLeaseTest,
+    // real Room on-device) + Stage C end-to-end (SenderRetentionTest +
+    // CutoverEndToEndTest). These COMPILE in CI/on laptopgrt2 but cannot
+    // EXECUTE there (no device/emulator); execution needs a device or an emulator.
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test:core:1.6.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
