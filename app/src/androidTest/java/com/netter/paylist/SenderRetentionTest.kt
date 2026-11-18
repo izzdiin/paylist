@@ -6,6 +6,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.netter.paylist.migration.LegacyQkey
 import com.netter.paylist.security.SecretResult
 import com.netter.paylist.security.SecretVault
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -196,6 +197,48 @@ class SenderRetentionTest {
         )
         assertEquals(1, transport.requests.size)
         assertEquals("s3cr3t-real", transport.requests.single().authSecret)
+    }
+
+    @Test
+    fun corruptItemWithoutPayload_doesNotKillFlush_healthyItemStillDelivers() {
+        val secrets = ToggleSecrets(SecretResult.Present("s3cr3t"))
+        val transport = FakeTransport()
+        val sender = Sender(ctx, ModeGate.ALWAYS_LEGACY, secrets, transport)
+        // The corrupt item comes FIRST: before the fix, getJSONObject
+        // threw on it and the healthy item behind it was never
+        // attempted in that flush.
+        val corrupt = JSONObject().apply {
+            put("qkey", "corrupt|chain|route-1,route-2")
+            put("kind", "chain")
+            put("route_ids", JSONArray(listOf("route-1", "route-2")))
+            put("next", 0)
+            put("attempts", 0)
+            // No "payload" key at all.
+        }
+        val healthy = chainQueueItem(
+            paymentPayload("retain-corrupt-healthy"),
+            listOf("route-1", "route-2"),
+        )
+        assertTrue(Store(ctx).saveQueueSync(listOf(corrupt, healthy)))
+
+        sender.flush() // Must not throw.
+
+        // The healthy item delivered; exactly one POST went out.
+        assertEquals(1, transport.requests.size)
+        assertTrue(
+            "the delivered body must carry the healthy payment",
+            transport.requests.single().body.contains("retain-corrupt-healthy"),
+        )
+        // The corrupt item stays queued (never silently deleted),
+        // marked failed with a visible reason.
+        val remaining = Store(ctx).queue()
+        assertEquals(1, remaining.size)
+        assertEquals("corrupt|chain|route-1,route-2", remaining.single().optString("qkey"))
+        assertEquals(1, remaining.single().optInt("attempts"))
+        assertTrue(
+            "the failure reason must name the missing payload",
+            remaining.single().optString("last_error").contains("payload"),
+        )
     }
 
     /** Polls [condition] until true or the timeout lapses (then fails). */

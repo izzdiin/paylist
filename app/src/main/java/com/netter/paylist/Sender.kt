@@ -151,9 +151,29 @@ class Sender(
         }
     }
 
+    /** Best-effort route label for failure logs: route_id (single) or the active hop (chain). */
+    private fun routeLabel(item: JSONObject): String {
+        val single = item.optString("route_id")
+        if (single.isNotEmpty()) return single
+        val ids = Route.jsonStrings(item.optJSONArray("route_ids"))
+        return ids.getOrNull(item.optInt("next", 0)) ?: item.optString("qkey", "?")
+    }
+
     /** @return true bila item selesai dan boleh dihapus dari antrean. */
     private fun processItem(store: Store, item: JSONObject): Boolean {
-        val payload = item.getJSONObject("payload")
+        // An item without a payload cannot be sent — but one corrupt
+        // item must not kill the whole flush: getJSONObject would
+        // throw and the remaining items (including healthy ones)
+        // would never be attempted in this flush. Mark it failed and
+        // retain it in the queue (never silently deleted), like any
+        // other retryable failure; the operator can see it in
+        // last_error. Same defensive shape as the P9 gate, which
+        // counts payload-less items corrupt via optJSONObject.
+        val payload = item.optJSONObject("payload")
+        if (payload == null) {
+            markFail(store, item, "item antrean", routeLabel(item), "payload tidak ada atau korup")
+            return false
+        }
         if (item.optString("kind") == "chain") {
             val ids = Route.jsonStrings(item.optJSONArray("route_ids"))
             var next = item.optInt("next", 0)
