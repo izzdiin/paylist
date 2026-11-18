@@ -129,11 +129,14 @@ jobs:
           target: default
           arch: x86_64
           profile: pixel_4
+          # NOTE: do NOT add --tests here. Gradle rejects it for
+          # connected* tasks (CommandLineArgumentException: Unknown
+          # command-line option '--tests', run #4 re-run). The
+          # androidTest source set currently holds exactly the two
+          # Stage B tests, so the unfiltered task runs precisely them.
           script: >-
             gradle connectedDebugAndroidTest --no-daemon --console=plain
             -Dorg.gradle.jvmargs="-Xmx2048m" -Dkotlin.daemon.jvm.options="-Xmx1024m"
-            --tests "com.netter.paylist.data.OutboxMigrationTest"
-            --tests "com.netter.paylist.data.DeliveryLeaseTest"
 
       - name: Upload instrumented test reports
         if: always()
