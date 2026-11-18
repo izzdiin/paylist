@@ -155,6 +155,9 @@ class CutoverTest {
         /** Test hook: the next insert throws, simulating a Room-insert failure (F12). */
         var failNextInsert: Boolean = false
 
+        // Room IGNORE insert returns -1 on a unique conflict
+        // (never 0): the fakes must model that, or they mask
+        // the real duplicate-detection behaviour.
         override suspend fun insert(event: EventEntity): Long = store.lock.withLock {
             if (failNextInsert) {
                 failNextInsert = false
@@ -164,7 +167,7 @@ class CutoverTest {
                 store.eventsByDedupe.containsKey(event.dedupeKey) ||
                 store.eventsByExportRef.containsKey(event.exportRef)
             ) {
-                return@withLock 0L
+                return@withLock -1L
             }
             store.events[event.eventId] = event
             store.eventsByDedupe[event.dedupeKey] = event
@@ -218,9 +221,9 @@ class CutoverTest {
 
     private class FakeDeliveryDao(private val store: FakeStore) : DeliveryDao {
         override suspend fun insert(delivery: DeliveryEntity): Long = store.lock.withLock {
-            if (store.deliveries.containsKey(delivery.deliveryId)) return@withLock 0L
+            if (store.deliveries.containsKey(delivery.deliveryId)) return@withLock -1L
             val qkey = delivery.legacyQkey
-            if (qkey != null && store.deliveriesByQkey.containsKey(qkey)) return@withLock 0L
+            if (qkey != null && store.deliveriesByQkey.containsKey(qkey)) return@withLock -1L
             store.deliveries[delivery.deliveryId] = delivery
             if (qkey != null) store.deliveriesByQkey[qkey] = delivery
             1L
@@ -554,7 +557,7 @@ class CutoverTest {
 
     private class FakePromotionReceiptDao(private val store: FakeStore) : PromotionReceiptDao {
         override suspend fun insert(receipt: PromotionReceiptEntity): Long = store.lock.withLock {
-            if (store.receipts.containsKey(receipt.legacyQkey)) return@withLock 0L
+            if (store.receipts.containsKey(receipt.legacyQkey)) return@withLock -1L
             store.receipts[receipt.legacyQkey] = receipt
             1L
         }
