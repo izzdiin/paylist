@@ -17,6 +17,8 @@ import com.netter.paylist.data.entity.EventEntity
 import com.netter.paylist.data.entity.PromotionReceiptDao
 import com.netter.paylist.data.entity.PromotionReceiptEntity
 import com.netter.paylist.data.entity.ReceiptState
+import com.netter.paylist.privacy.GateBackedInspector
+import com.netter.paylist.privacy.LegacyQueuePrivacyGate
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
@@ -1598,6 +1600,80 @@ class CutoverTest {
         assertEquals(2, drain.quarantined)
         assertEquals(0, h.events.count())
         assertEquals(2, h.queue.qkeys().size)
+    }
+
+    @Test
+    fun f54_realInspectorMixedQueue() = runBlocking {
+        // Stage C: the real gate-backed inspector drives the partition.
+        val clean = queueItem(dedupeKey("f54g1"))
+        val otp = queueItem(
+            dedupeKey("f54g2"),
+            payload = paymentPayload(dedupeKey("f54g2")).apply {
+                put("text", "Pembayaran Rp100.800 diterima. Kode OTP 123456")
+            },
+        )
+        val ambiguous = queueItem(
+            dedupeKey("f54g3"),
+            payload = paymentPayload(dedupeKey("f54g3")).apply {
+                put("text", "Pembayaran Rp100.800 diterima. 123456")
+            },
+        )
+        val h = newHarness(listOf(clean, otp, ambiguous))
+        val gate = LegacyQueuePrivacyGate()
+        val report = gate.reprocess(h.queue, NOW)
+        assertEquals(1, report.clean)
+        assertEquals(1, report.redacted)
+        assertEquals(1, report.quarantined)
+        assertTrue(report.writeOk)
+        // An item that arrives AFTER reprocessing is uninspected: it
+        // must not import (fail-closed).
+        val late = queueItem(dedupeKey("f54g4"))
+        h.queue.saveQueueSync(h.queue.queueSnapshot() + late)
+        val drain = h.fullCutover(GateBackedInspector)
+        assertEquals(2, drain.imported)
+        assertEquals(2, drain.quarantined)
+        assertEquals(2, h.events.count())
+        // The imported OTP item carries the REDACTED payload, never the code.
+        val otpDelivery = h.deliveries.getByLegacyQkey(otp.optString("qkey"))!!
+        val otpEvent = h.events.getById(otpDelivery.eventId)!!
+        assertFalse(otpEvent.legacyPayloadJson.orEmpty().contains("123456"))
+        assertTrue(otpEvent.legacyPayloadJson.orEmpty().contains("[REDACTED]"))
+        // Quarantined items are preserved through WORKER_ONLY; imported
+        // ones are swept.
+        assertEquals(CutoverMode.WORKER_ONLY, h.coordinator.getMode())
+        val remaining = h.queue.qkeys()
+        assertEquals(2, remaining.size)
+        assertTrue(remaining.contains(ambiguous.optString("qkey")))
+        assertTrue(remaining.contains(late.optString("qkey")))
+    }
+
+    @Test
+    fun f50_cleanItemReGatesOnHeldHop() = runBlocking {
+        // F50: a clean-item passthrough is still subject to the
+        // uncertain-POST reconciliation gate — a clean item past a held
+        // hop is not auto-released (§7.7 integration constraint 1).
+        val item = queueItem(dedupeKey("f50m"))
+        val h = newHarness(listOf(item))
+        val gate = LegacyQueuePrivacyGate()
+        val report = gate.reprocess(h.queue, NOW)
+        assertEquals(1, report.clean)
+        // An unresolved in-flight attempt for this dedupe key.
+        h.attempts.insert(
+            attemptRow(
+                "attempt-held",
+                "delivery-held",
+                dedupeKey("f50m"),
+                AttemptState.SOCKET_OPEN,
+                BOOT_A,
+            ),
+        )
+        val snapshot = h.migration.snapshot(h.queue.queueSnapshot(), NOW)
+        val partitioned = h.migration.partition(snapshot, GateBackedInspector)
+        assertEquals(1, partitioned.importable.size)
+        val imported = h.migration.import(partitioned, NOW)
+        assertEquals(1, imported.deliveriesImported)
+        val delivery = h.deliveries.getByLegacyQkey(item.optString("qkey"))!!
+        assertEquals(DeliveryState.HELD_AWAITING_RECONCILIATION, delivery.state)
     }
 
     // =====================================================================

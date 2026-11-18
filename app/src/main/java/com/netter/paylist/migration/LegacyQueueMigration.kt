@@ -132,6 +132,13 @@ data class LegacyQueueItem(
     val type: String,
     /** v1.1 flush checkpoint (`hop_outcomes`), absent for pre-v1.1 items. */
     val hopOutcomesJson: String?,
+    /**
+     * P9 gate markers (Stage C, design §7.7): set by
+     * `LegacyQueuePrivacyGate.reprocess()` on the raw queue item.
+     * Absent (false) on items that never went through the gate.
+     */
+    val privacyReprocessed: Boolean = false,
+    val privacyQuarantined: Boolean = false,
 ) {
     companion object {
         /**
@@ -175,6 +182,8 @@ data class LegacyQueueItem(
                 dedupeKey = dedupeKey,
                 type = type,
                 hopOutcomesJson = hopOutcomes,
+                privacyReprocessed = o.optBoolean("privacy_reprocessed", false),
+                privacyQuarantined = o.optBoolean("privacy_quarantine", false),
             )
         }
     }
