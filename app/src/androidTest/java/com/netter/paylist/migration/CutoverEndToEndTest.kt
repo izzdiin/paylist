@@ -39,7 +39,7 @@ import java.util.concurrent.TimeUnit
 /**
  * End-to-end cutover tests (ChatGPT Stage C audit, finding 2): the
  * full cutover path — [CutoverPrivacyPreflight] → [CutoverCoordinator]
- * → Room import → sweep — against REAL Room (in-memory) and the REAL
+ * → Room import → sweep — against REAL file-backed Room and the REAL
  * [Store] queue, with the REAL legacy [Sender] where the mode gate is
  * under test.
  *
@@ -55,11 +55,14 @@ import java.util.concurrent.TimeUnit
  *   `runCutover` performs them (requestDrain → sender lock →
  *   preflight → snapshot/save/verify → commitDraining → drain →
  *   commitWorkerOnly). The gate is asserted still closed below.
- * - A "crash" here is a dropped coordinator rebuilt over the same
- *   durable state (the `CutoverTest.restart()` pattern) — a fresh
- *   process is not killed inside one test method. What survives is
- *   exactly what a real restart would see: Room rows + the queue
- *   file, both durable.
+ * - Room here is FILE-backed (P1-1): an in-memory database dies
+ *   with the process, so a "crash" rebuilt over it proves nothing
+ *   about durability. A "crash" in this class is still a dropped
+ *   coordinator rebuilt over the same durable state (the
+ *   `CutoverTest.restart()` pattern) — a fresh process is not
+ *   killed inside one test method. The REAL process-death
+ *   coverage (kill + relaunch + reconcile, R03/R04/R05) lives in
+ *   ProcessDeathPhaseA/B, run by scripts/process_death_tests.sh.
  *
  * EXECUTION NOTE: these tests need a device or an emulator. They
  * COMPILE on laptopgrt2 (`assembleDebugAndroidTest`) but cannot
@@ -90,12 +93,18 @@ class CutoverEndToEndTest {
                 ),
             ),
         )
-        db = Room.inMemoryDatabaseBuilder(ctx, PaylistDatabase::class.java).build()
+        // File-backed Room (P1-1): an in-memory database dies with the
+        // process, so a "crash" rebuilt over it proves nothing about
+        // durability. The file is deleted first so every test starts
+        // from an empty schema.
+        ctx.deleteDatabase(TEST_DB_NAME)
+        db = Room.databaseBuilder(ctx, PaylistDatabase::class.java, TEST_DB_NAME).build()
     }
 
     @After
     fun tearDown() {
         db.close()
+        ctx.deleteDatabase(TEST_DB_NAME)
         ctx.getSharedPreferences("paylist", Context.MODE_PRIVATE).edit().clear().commit()
     }
 
@@ -525,6 +534,9 @@ class CutoverEndToEndTest {
     }
 
     companion object {
+        /** File-backed Room database for these tests (P1-1, never in-memory). */
+        const val TEST_DB_NAME: String = "paylist-e2e-test.db"
+
         const val NOW: Long = 1_795_000_000_000L
 
         /** Lease length, design §5.1: 5 min, no renewal. */

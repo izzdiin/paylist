@@ -15,6 +15,14 @@ android {
         versionCode = 4
         versionName = "2.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Process-death tests (ProcessDeathPhaseA/B) kill their own
+        // process and must never run under connectedDebugAndroidTest
+        // (the kill would abort the whole run; PhaseB also fails
+        // without a preceding PhaseA run). They run via
+        // scripts/process_death_tests.sh instead — separate
+        // `am instrument` invocations per phase, on the CI emulator.
+        testInstrumentationRunnerArguments["notClass"] =
+            "com.netter.paylist.ProcessDeathPhaseA,com.netter.paylist.ProcessDeathPhaseB"
     }
 
     buildTypes {
