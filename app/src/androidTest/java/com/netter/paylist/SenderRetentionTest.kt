@@ -27,6 +27,11 @@ import org.junit.runner.RunWith
  * no POST is attempted, and the SAME item delivers normally once the
  * secret is readable again — no dequeue, no skip, no duplicate.
  *
+ * P1-3 (ChatGPT re-audit, R01) extends the same guarantee to a
+ * MISSING secret: no skip past the hop, no silent dequeue — the
+ * item stays queued at the same hop with a visible error until the
+ * operator enters the secret.
+ *
  * EXECUTION NOTE: these tests need a device or an emulator. They
  * COMPILE on laptopgrt2 (`assembleDebugAndroidTest`) but cannot
  * execute there — there is no device/emulator on that box. Do not
@@ -238,6 +243,166 @@ class SenderRetentionTest {
         assertTrue(
             "the failure reason must name the missing payload",
             remaining.single().optString("last_error").contains("payload"),
+        )
+    }
+
+    @Test
+    fun chainItemRetainedWhileSecretMissing_thenDeliveredAfterSecretEntered() {
+        // P1-3 (R01): a missing secret retains the payment at its hop —
+        // it must NOT skip past every hop and dequeue the payment.
+        val secrets = ToggleSecrets(SecretResult.Missing)
+        val transport = FakeTransport()
+        val sender = Sender(ctx, ModeGate.ALWAYS_LEGACY, secrets, transport)
+        val payload = paymentPayload("retain-missing-chain")
+        val qkey = chainQkey("retain-missing-chain", listOf("route-1", "route-2"))
+        val item = chainQueueItem(payload, listOf("route-1", "route-2"))
+        assertTrue(Store(ctx).saveQueueSync(listOf(item)))
+
+        sender.flush()
+        val retained = Store(ctx).queue()
+        assertEquals(1, retained.size)
+        assertEquals(qkey, retained.single().optString("qkey"))
+        assertEquals(0, retained.single().optInt("next"))
+        assertTrue(
+            "the failure reason must name the missing secret",
+            retained.single().optString("last_error").contains("secret belum diatur"),
+        )
+        assertTrue(
+            "no POST may start while the secret is missing",
+            transport.requests.isEmpty(),
+        )
+
+        // The operator enters the secret: the SAME item delivers to route-1.
+        secrets.result = SecretResult.Present("s3cr3t")
+        sender.flush()
+        assertTrue(
+            "the retained item must deliver after the secret is entered",
+            Store(ctx).queue().isEmpty(),
+        )
+        assertEquals(1, transport.requests.size)
+        assertEquals("https://example.invalid/notify-1", transport.requests.single().url)
+        assertEquals("s3cr3t", transport.requests.single().authSecret)
+    }
+
+    @Test
+    fun chainDoesNotSkipMissingHopToNextRoute() {
+        // P1-3 (R01, mixed): the first hop's secret is missing while
+        // the second hop's is present — the chain must NOT skip to
+        // route-2. The payment may belong to route-1; only the
+        // operator entering the secret (or disabling the route)
+        // moves it on.
+        val secrets = MapSecrets(
+            mutableMapOf(
+                "route-1" to SecretResult.Missing,
+                "route-2" to SecretResult.Present("s3cr3t-2"),
+            ),
+        )
+        val transport = FakeTransport()
+        val sender = Sender(ctx, ModeGate.ALWAYS_LEGACY, secrets, transport)
+        val payload = paymentPayload("retain-missing-mixed")
+        val item = chainQueueItem(payload, listOf("route-1", "route-2"))
+        assertTrue(Store(ctx).saveQueueSync(listOf(item)))
+
+        sender.flush()
+        val retained = Store(ctx).queue()
+        assertEquals(1, retained.size)
+        assertEquals(0, retained.single().optInt("next"))
+        assertTrue(
+            "no POST may go to route-2 while route-1's secret is missing",
+            transport.requests.isEmpty(),
+        )
+
+        // The operator enters route-1's secret: the item delivers to route-1.
+        secrets.set("route-1", SecretResult.Present("s3cr3t-1"))
+        sender.flush()
+        assertTrue(
+            "the retained item must deliver after the secret is entered",
+            Store(ctx).queue().isEmpty(),
+        )
+        assertEquals(1, transport.requests.size)
+        assertEquals("https://example.invalid/notify-1", transport.requests.single().url)
+        assertEquals("s3cr3t-1", transport.requests.single().authSecret)
+    }
+
+    @Test
+    fun singleItemRetainedWhileSecretMissing_thenDeliveredAfterSecretEntered() {
+        // P1-3 (R01, single path): a missing secret must not silently
+        // dequeue a test item either.
+        val secrets = ToggleSecrets(SecretResult.Missing)
+        val transport = FakeTransport(responder = { FakeTransport.ackResponse() })
+        val sender = Sender(ctx, ModeGate.ALWAYS_LEGACY, secrets, transport)
+        val payload = JSONObject().apply {
+            put("type", "test")
+            put("device", "moto-g57")
+            put("dedupe_key", "test|retain-missing-single")
+        }
+        val qkey = LegacyQkey.build("test|retain-missing-single", LegacyQkey.KIND_SINGLE, listOf("route-1"))
+        val item = JSONObject().apply {
+            put("qkey", qkey)
+            put("kind", "single")
+            put("route_id", "route-1")
+            put("payload", payload)
+        }
+        assertTrue(Store(ctx).saveQueueSync(listOf(item)))
+
+        sender.flush()
+        val retained = Store(ctx).queue()
+        assertEquals(1, retained.size)
+        assertEquals(qkey, retained.single().optString("qkey"))
+        assertEquals(1, retained.single().optInt("attempts"))
+        assertTrue(
+            "the failure reason must name the missing secret",
+            retained.single().optString("last_error").contains("secret belum diatur"),
+        )
+        assertTrue(
+            "no POST may start while the secret is missing",
+            transport.requests.isEmpty(),
+        )
+
+        secrets.result = SecretResult.Present("s3cr3t")
+        sender.flush()
+        assertTrue(
+            "the retained item must deliver after the secret is entered",
+            Store(ctx).queue().isEmpty(),
+        )
+        assertEquals(1, transport.requests.size)
+        assertEquals("https://example.invalid/notify-1", transport.requests.single().url)
+        assertEquals("s3cr3t", transport.requests.single().authSecret)
+    }
+
+    @Test
+    fun expiredHeartbeatWithMissingSecret_isDroppedNotRetained() {
+        // The heartbeat-expiry check runs BEFORE the secret check:
+        // an expired heartbeat is useless whatever the secret state,
+        // or dead heartbeats would pile up forever on secret-less
+        // routes (one per 15-minute window).
+        val secrets = ToggleSecrets(SecretResult.Missing)
+        val transport = FakeTransport(responder = { FakeTransport.ackResponse() })
+        val sender = Sender(ctx, ModeGate.ALWAYS_LEGACY, secrets, transport)
+        val nowBucket = System.currentTimeMillis() / 900000
+        val dedupeKey = "heartbeat-${nowBucket - 3}"
+        val payload = JSONObject().apply {
+            put("type", "heartbeat")
+            put("device", "moto-g57")
+            put("dedupe_key", dedupeKey)
+        }
+        val qkey = LegacyQkey.build(dedupeKey, LegacyQkey.KIND_SINGLE, listOf("route-1"))
+        val item = JSONObject().apply {
+            put("qkey", qkey)
+            put("kind", "single")
+            put("route_id", "route-1")
+            put("payload", payload)
+        }
+        assertTrue(Store(ctx).saveQueueSync(listOf(item)))
+
+        sender.flush()
+        assertTrue(
+            "an expired heartbeat must drop even with a missing secret",
+            Store(ctx).queue().isEmpty(),
+        )
+        assertTrue(
+            "no POST may start for an expired heartbeat",
+            transport.requests.isEmpty(),
         )
     }
 

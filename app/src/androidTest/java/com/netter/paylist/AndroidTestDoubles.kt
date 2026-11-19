@@ -48,6 +48,21 @@ class ToggleSecrets(var result: SecretResult) : SecretProvider {
     override fun secretFor(routeId: String): SecretResult = result
 }
 
+/**
+ * A secret provider with a per-route answer (for mixed-hop tests:
+ * one hop missing, another present). Unlisted routes answer
+ * [SecretResult.Missing] — fail closed, like the real vault for a
+ * route whose secret was never entered.
+ */
+class MapSecrets(private val byRoute: MutableMap<String, SecretResult>) : SecretProvider {
+    override fun secretFor(routeId: String): SecretResult =
+        byRoute[routeId] ?: SecretResult.Missing
+
+    fun set(routeId: String, result: SecretResult) {
+        byRoute[routeId] = result
+    }
+}
+
 /** The canonical test payment payload for one tag. */
 fun paymentPayload(tag: String, text: String = "Pembayaran Rp100.800 diterima"): JSONObject {
     val dedupeKey = "com.gojek.gopaymerchant|1795000000000|100800|$tag"
