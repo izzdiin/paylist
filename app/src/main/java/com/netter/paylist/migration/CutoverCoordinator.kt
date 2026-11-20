@@ -393,14 +393,24 @@ class CutoverCoordinator(
      * install time: no attempt can be admitted afterwards while the
      * intent is `PENDING` (`DRAIN_PENDING`).
      *
-     * Requires (`LEGACY_ONLY`, `NONE`). The drain itself starts only
-     * with [commitDraining], which requires the awaited set resolved.
+     * Requires (`LEGACY_ONLY`, `NONE`) — or (`LEGACY_ONLY`,
+     * `ABORTED`) for the next cutover attempt after an abort
+     * (design §7.3A(h): "the next cutover attempt re-runs the
+     * import idempotently"). A retry installs a FRESH intent with a
+     * new generation, so the awaited set is re-snapshotted and no
+     * state from the aborted attempt leaks in; the `ABORTED` record
+     * itself is preserved until the retry starts (row 5 stays a
+     * legal, observable state per §8.4). The drain itself starts
+     * only with [commitDraining], which requires the awaited set
+     * resolved.
      */
     suspend fun requestDrain(nowMs: Long): CutoverCommit {
         return transactions.run {
             val mode = getMode()
             val intent = getDrainIntent()
-            if (mode != CutoverMode.LEGACY_ONLY || intent != DrainIntent.NONE) {
+            if (mode != CutoverMode.LEGACY_ONLY ||
+                (intent != DrainIntent.NONE && intent != DrainIntent.ABORTED)
+            ) {
                 return@run CutoverCommit.Rejected(
                     "cannot request drain from mode=$mode intent=$intent",
                 )

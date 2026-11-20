@@ -1,9 +1,16 @@
 # Paylist Android CI
 #
 # Builds the debug APK, runs the local unit tests, and runs the
-# instrumented tests (OutboxMigrationTest + DeliveryLeaseTest) on an
-# API 28 emulator, on every push and pull request to the phase-1.3
-# work branches.
+# instrumented tests (OutboxMigrationTest + DeliveryLeaseTest +
+# SenderRetentionTest + CutoverEndToEndTest + ServerLedgerTest) on an
+# API 28 emulator, on every push and pull request to phase-1.3
+# and main. A separate job runs the real process-death tests
+# (ProcessDeathPhaseA/B, R03/R04/R05) via
+# scripts/process_death_tests.sh — those kill their own process and
+# cannot run under connectedDebugAndroidTest. A fourth job runs the
+# negative control (`--negative-control`): PhaseA writes the marker
+# but deliberately does NOT kill, and the job is green only if the
+# harness correctly fails that run.
 #
 # INSTRUMENTED TESTS ON CI (2026-11-18): these used to run on a local
 # BlueStacks emulator (MSI App Player on the owner's PC), but the
@@ -43,7 +50,7 @@ on:
   push:
     branches: ["phase-1.3", "main"]
   pull_request:
-    branches: ["main"]
+    branches: ["phase-1.3", "main"]
 
 jobs:
   build-and-test:
@@ -132,8 +139,9 @@ jobs:
           # NOTE: do NOT add --tests here. Gradle rejects it for
           # connected* tasks (CommandLineArgumentException: Unknown
           # command-line option '--tests', run #4 re-run). The
-          # androidTest source set currently holds exactly the two
-          # Stage B tests, so the unfiltered task runs precisely them.
+          # androidTest source set holds the two Stage B tests plus the
+          # Stage C end-to-end tests (SenderRetentionTest,
+          # CutoverEndToEndTest), so the unfiltered task runs all of them.
           script: >-
             gradle connectedDebugAndroidTest --no-daemon --console=plain
             -Dorg.gradle.jvmargs="-Xmx2048m" -Dkotlin.daemon.jvm.options="-Xmx1024m"
@@ -145,3 +153,84 @@ jobs:
           name: instrumented-test-reports
           path: app/build/outputs/androidTest-results/connected/
           if-no-files-found: warn
+
+  process-death-tests:
+    name: process-death tests (API 28 emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.9"
+
+      - name: Accept SDK licences + install platform 34 / build-tools 34.0.0
+        run: |
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      # P1-1 (ChatGPT re-audit, R03/R04/R05): the PhaseA tests kill
+      # their own process, so they cannot run under
+      # connectedDebugAndroidTest (excluded via notClass in
+      # build.gradle.kts). This job runs them as separate
+      # `am instrument` invocations per phase through
+      # scripts/process_death_tests.sh; the script exits non-zero
+      # unless every PhaseB passes.
+      - name: Run process-death tests on emulator (API 28)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 28
+          target: default
+          arch: x86_64
+          profile: pixel_4
+          script: bash scripts/process_death_tests.sh
+
+  process-death-negative-control:
+    name: process-death negative control (API 28 emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.9"
+
+      - name: Accept SDK licences + install platform 34 / build-tools 34.0.0
+        run: |
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      # Negative control (ChatGPT re-review, PR #4 @ a6bfa1f): the r06
+      # PhaseA writes the marker but deliberately does NOT kill its
+      # process. The script's exit code is INVERTED in this mode — 0
+      # means the harness correctly FAILED the run (the control
+      # works), non-zero means the run passed (the false-positive is
+      # still open). This job is green only when the control works.
+      - name: Run process-death negative control on emulator (API 28)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 28
+          target: default
+          arch: x86_64
+          profile: pixel_4
+          script: bash scripts/process_death_tests.sh --negative-control

@@ -14,6 +14,7 @@ import com.netter.paylist.migration.CutoverMode
 import com.netter.paylist.migration.LegacyQueueMigration
 import com.netter.paylist.migration.LegacyQueueSnapshotSource
 import com.netter.paylist.privacy.GateBackedInspector
+import com.netter.paylist.privacy.CutoverPrivacyPreflight
 import com.netter.paylist.security.SecretVault
 import com.netter.paylist.security.SharedPreferencesKeyValueStore
 import com.netter.paylist.migration.SecretMigration
@@ -218,6 +219,18 @@ class PaylistApplication : Application(), Configuration.Provider {
             )
         }
         try {
+            // P9 reprocessing must be durable before DRAINING. The sender
+            // lock prevents concurrent legacy queue mutation.
+            val privacy = CutoverPrivacyPreflight().run(object : LegacyQueueSnapshotSource {
+                override fun queueSnapshot(): List<JSONObject> = store.queueSnapshot()
+                override fun saveQueueSync(items: List<JSONObject>): Boolean =
+                    store.saveQueueSync(items)
+            }, System.currentTimeMillis())
+            if (!privacy.ok) {
+                return abortAndReturn(
+                    "Cutover dibatalkan: pemeriksaan privasi antrean gagal (${privacy.reason})."
+                )
+            }
             // Durable flush: commit the current queue and verify the
             // readback before any state change (fail closed).
             val snapshot = store.queueSnapshot()

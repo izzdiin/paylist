@@ -64,6 +64,15 @@ fun Context.appSender(): Sender =
  *   row 3 — the item stays queued at the same hop instead of
  *   advancing, so no payment is lost to a rejected hop), unknown
  *   hops keep the item queued at the same hop.
+ * - A MISSING secret retains the item at its hop (P1-3, ChatGPT
+ *   re-audit): the route is live and the payment may settle on it
+ *   once the operator enters the secret. This deviates from design
+ *   §5.5 row 6 (NO_POST skip) for financial items — skipping past
+ *   every hop dequeues the payment with no record. Route
+ *   null/disabled/empty-URL hops still skip: those hops genuinely
+ *   cannot receive the payment. (The Room worker still follows row
+ *   6, but records every NO_POST hop durably — nothing is silent
+ *   there; the legacy queue has no such record, hence the retain.)
  * - Known legacy limitations (the Room worker handles these properly
  *   post-cutover): a matched-but-unconfirmed hop (apply error/absent)
  *   removes the item with a log line (no HELD state exists here);
@@ -151,9 +160,29 @@ class Sender(
         }
     }
 
+    /** Best-effort route label for failure logs: route_id (single) or the active hop (chain). */
+    private fun routeLabel(item: JSONObject): String {
+        val single = item.optString("route_id")
+        if (single.isNotEmpty()) return single
+        val ids = Route.jsonStrings(item.optJSONArray("route_ids"))
+        return ids.getOrNull(item.optInt("next", 0)) ?: item.optString("qkey", "?")
+    }
+
     /** @return true bila item selesai dan boleh dihapus dari antrean. */
     private fun processItem(store: Store, item: JSONObject): Boolean {
-        val payload = item.getJSONObject("payload")
+        // An item without a payload cannot be sent — but one corrupt
+        // item must not kill the whole flush: getJSONObject would
+        // throw and the remaining items (including healthy ones)
+        // would never be attempted in this flush. Mark it failed and
+        // retain it in the queue (never silently deleted), like any
+        // other retryable failure; the operator can see it in
+        // last_error. Same defensive shape as the P9 gate, which
+        // counts payload-less items corrupt via optJSONObject.
+        val payload = item.optJSONObject("payload")
+        if (payload == null) {
+            markFail(store, item, "item antrean", routeLabel(item), "payload tidak ada atau korup")
+            return false
+        }
         if (item.optString("kind") == "chain") {
             val ids = Route.jsonStrings(item.optJSONArray("route_ids"))
             var next = item.optInt("next", 0)
@@ -164,21 +193,34 @@ class Sender(
                     continue
                 }
                 // Stage C: the secret comes from the vault, never from
-                // the route record. No secret (or an unreadable one)
-                // means this hop cannot be attempted: skip it (NO_POST,
-                // §5.5 row 6) and record the reason visibly.
+                // the route record. An unreadable secret retains the
+                // payment at this hop (PR #4); a MISSING secret does
+                // the same (P1-3): a missing secret is an
+                // operator-configuration state, not proof the payment
+                // cannot settle on this route — the route is live and
+                // the payment may match it once the secret is entered.
+                // This deviates from design §5.5 row 6 (NO_POST skip)
+                // for financial items: skipping past every hop
+                // dequeues the payment with no record. Route
+                // null/disabled/empty-URL hops still skip above —
+                // those hops genuinely cannot receive the payment.
                 val secret = when (val s = secrets.secretFor(route.id)) {
                     is SecretResult.Present -> s.value
                     is SecretResult.Missing -> {
-                        next++
-                        continue
+                        // Retain the payment and current hop until the
+                        // operator enters the secret (same shape as
+                        // Unavailable: visible error, no skip, no dequeue).
+                        item.put("next", next)
+                        markFail(store, item, describe(payload), route.name,
+                            "secret belum diatur untuk rute ini; masukkan secret")
+                        return false
                     }
                     is SecretResult.Unavailable -> {
-                        store.setLastFailure(
-                            "secret rute ${route.name} tidak bisa dibaca (${s.reason}); masukkan ulang secret",
-                        )
-                        next++
-                        continue
+                        // Retain the payment and current hop until Keystore recovers.
+                        item.put("next", next)
+                        markFail(store, item, describe(payload), route.name,
+                            "secret tidak bisa dibaca (${s.reason}); masukkan ulang secret")
+                        return false
                     }
                 }
                 // Normative mode check before every POST (§8): the
@@ -212,19 +254,12 @@ class Sender(
         val route = store.routeById(item.optString("route_id")) ?: return true
         if (!route.enabled) return true // rute dimatikan: item tidak relevan lagi
         if (route.url.isEmpty()) return true
-        // Stage C: the secret comes from the vault (see the chain path above).
-        val secret = when (val s = secrets.secretFor(route.id)) {
-            is SecretResult.Present -> s.value
-            is SecretResult.Missing -> return true // tanpa secret: item tidak bisa dikirim
-            is SecretResult.Unavailable -> {
-                store.setLastFailure(
-                    "secret rute ${route.name} tidak bisa dibaca (${s.reason}); masukkan ulang secret",
-                )
-                return true
-            }
-        }
         // Heartbeat kedaluwarsa: jendela dedupe-nya sudah lewat > 2 jendela
-        // (30 menit) -> buang, heartbeat lama tidak berguna.
+        // (30 menit) -> buang, heartbeat lama tidak berguna. Checked BEFORE
+        // the secret: expiry is a property of the item, not of the route —
+        // an expired heartbeat must drop even when the secret is missing
+        // or unreadable, or dead heartbeats would pile up in the queue
+        // forever (one per 15-minute window per secret-less route).
         if (payload.optString("type") == "heartbeat") {
             val bucket = payload.optString("dedupe_key")
                 .substringAfterLast('-').toLongOrNull()
@@ -232,6 +267,22 @@ class Sender(
             if (bucket != null && nowBucket - bucket >= 2) {
                 store.logLocal("heartbeat kedaluwarsa untuk rute ${route.name} dibuang")
                 return true
+            }
+        }
+        // Stage C: the secret comes from the vault (see the chain path
+        // above). Missing retains like Unavailable (P1-3): never silently
+        // dequeue — the operator enters the secret and the item delivers.
+        val secret = when (val s = secrets.secretFor(route.id)) {
+            is SecretResult.Present -> s.value
+            is SecretResult.Missing -> {
+                markFail(store, item, describe(payload), route.name,
+                    "secret belum diatur untuk rute ini; masukkan secret")
+                return false
+            }
+            is SecretResult.Unavailable -> {
+                markFail(store, item, describe(payload), route.name,
+                    "secret tidak bisa dibaca (${s.reason}); masukkan ulang secret")
+                return false
             }
         }
         if (!modeGate.isLegacyOnly()) return false

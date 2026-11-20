@@ -15,6 +15,14 @@ android {
         versionCode = 4
         versionName = "2.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Process-death tests (ProcessDeathPhaseA/B) kill their own
+        // process and must never run under connectedDebugAndroidTest
+        // (the kill would abort the whole run; PhaseB also fails
+        // without a preceding PhaseA run). They run via
+        // scripts/process_death_tests.sh instead — separate
+        // `am instrument` invocations per phase, on the CI emulator.
+        testInstrumentationRunnerArguments["notClass"] =
+            "com.netter.paylist.ProcessDeathPhaseA,com.netter.paylist.ProcessDeathPhaseB"
     }
 
     buildTypes {
@@ -49,9 +57,10 @@ dependencies {
     // Real org.json for JVM unit tests: android.jar's org.json stubs throw.
     testImplementation("org.json:json:20240303")
 
-    // Stage B androidTest (OutboxMigrationTest + DeliveryLeaseTest): real
-    // Room on-device. These COMPILE in CI/on laptopgrt2 but cannot EXECUTE
-    // there (no device/emulator); execution needs a device or an emulator.
+    // androidTest: Stage B (OutboxMigrationTest + DeliveryLeaseTest,
+    // real Room on-device) + Stage C end-to-end (SenderRetentionTest +
+    // CutoverEndToEndTest). These COMPILE in CI/on laptopgrt2 but cannot
+    // EXECUTE there (no device/emulator); execution needs a device or an emulator.
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test:core:1.6.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
