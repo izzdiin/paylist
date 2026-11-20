@@ -26,8 +26,11 @@ import org.junit.runner.RunWith
  * file-backed Room database, the SharedPreferences queue, the server
  * ledger — and asserts the recovery.
  *
- * Each method FIRST requires its PhaseA marker: if PhaseA never
- * reached its kill point (or never ran), the method fails loudly
+ * Each method FIRST requires its PhaseA marker AND a fresh process
+ * (PID + process start time differ from the identity PhaseA
+ * recorded in the marker): if PhaseA never reached its kill point
+ * (or never ran), or if the kill never happened and this invocation
+ * reused PhaseA's still-alive process, the method fails loudly
  * instead of asserting against an unrelated state.
  *
  * setUp here deliberately does NOT clear anything — the durable
@@ -55,17 +58,37 @@ class ProcessDeathPhaseB {
         ProcessDeathHarness.clearAllDurableState(ctx)
     }
 
-    private fun requireMarker(scenario: String) {
-        assertEquals(
+    /**
+     * Require PhaseA's marker AND a fresh process. The marker alone
+     * proves PhaseA reached the kill point; the identity check proves
+     * THIS process is not PhaseA's still-alive process — if the kill
+     * never happened and the system reused PhaseA's process for this
+     * invocation, the PID + start time match and the test fails
+     * loudly instead of asserting recovery against a state no crash
+     * ever produced (ChatGPT re-review, PR #4 @ a6bfa1f).
+     */
+    private fun requireFreshProcess(scenario: String) {
+        val recorded = ProcessDeathHarness.readMarkerIdentity(ctx, scenario)
+        assertNotNull(
             "PhaseA must have reached the kill point for $scenario (run PhaseA first)",
-            "a-complete",
-            ProcessDeathHarness.readMarker(ctx, scenario),
+            recorded,
+        )
+        val mine = ProcessDeathHarness.currentProcessIdentity()
+        // Same process iff the PID matches AND (either start time is
+        // unknown, or both start times match).
+        val sameProcess = mine.pid == recorded!!.pid &&
+            (recorded.startTicks == -1L || mine.startTicks == -1L ||
+                mine.startTicks == recorded.startTicks)
+        assertFalse(
+            "PhaseB runs in PhaseA's process (pid=${mine.pid}) — the kill " +
+                "never happened for $scenario; refusing to assert recovery",
+            sameProcess,
         )
     }
 
     @Test
     fun r03RetryCompletesWithoutDuplicatesOrLoss() = runBlocking {
-        requireMarker("r03")
+        requireFreshProcess("r03")
         val store = Store(ctx)
         val db = ProcessDeathHarness.openTestDb(ctx)
         try {
@@ -110,7 +133,7 @@ class ProcessDeathPhaseB {
 
     @Test
     fun r04CommitWorkerOnlyOnRestart() = runBlocking {
-        requireMarker("r04")
+        requireFreshProcess("r04")
         val store = Store(ctx)
         val db = ProcessDeathHarness.openTestDb(ctx)
         try {
@@ -146,7 +169,7 @@ class ProcessDeathPhaseB {
 
     @Test
     fun r05RetryDeliversExactlyOnce() {
-        requireMarker("r05")
+        requireFreshProcess("r05")
         val store = Store(ctx)
         val ledger = ServerLedger.open(ctx)
         val dedupeKey = paymentPayload("death-r05").optString("dedupe_key")

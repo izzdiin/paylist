@@ -33,18 +33,64 @@ object ProcessDeathHarness {
 
     val ROUTES: List<String> = listOf("route-1", "route-2")
 
+    /**
+     * Identity of one OS process: PID + start time (clock ticks since
+     * boot, field 22 of /proc/self/stat). A PID alone can
+     * theoretically be reused; PID + start time cannot collide for
+     * two distinct processes. `startTicks == -1` means the stat file
+     * was unreadable (callers fall back to a PID-only comparison).
+     */
+    data class ProcessIdentity(val pid: Int, val startTicks: Long)
+
+    /** Identity of the process calling this. */
+    fun currentProcessIdentity(): ProcessIdentity {
+        val startTicks = try {
+            // /proc/self/stat: "pid (comm) state ppid ... starttime ..."
+            // comm may contain spaces/parens, so split after the LAST ')'.
+            val stat = java.io.File("/proc/self/stat").readText()
+            val afterComm = stat.substringAfterLast(") ").split(" ")
+            // Fields after comm start at field 3 (state); starttime is
+            // field 22 -> index 19 in the remainder.
+            afterComm.getOrNull(19)?.toLongOrNull() ?: -1L
+        } catch (_: Exception) {
+            -1L
+        }
+        return ProcessIdentity(android.os.Process.myPid(), startTicks)
+    }
+
     /** Marker key in the "paylist" prefs: PhaseA writes, PhaseB requires. */
     fun markerKey(scenario: String): String = "process_death_$scenario"
 
+    /**
+     * Marker value: "a-complete pid=<pid> start=<startTicks>".
+     * The PID handshake (ChatGPT re-review, PR #4 @ a6bfa1f): the
+     * marker alone proves PhaseA REACHED the kill point, not that the
+     * process actually died — PhaseB must also confirm it runs in a
+     * FRESH process (an identity different from the one recorded
+     * here), and the runner must observe the process disappear.
+     */
     fun writeMarker(ctx: Context, scenario: String) {
+        val id = currentProcessIdentity()
+        val value = "a-complete pid=${id.pid} start=${id.startTicks}"
         val ok = ctx.getSharedPreferences("paylist", Context.MODE_PRIVATE).edit()
-            .putString(markerKey(scenario), "a-complete").commit()
+            .putString(markerKey(scenario), value).commit()
         check(ok) { "marker write must commit for $scenario" }
     }
 
     fun readMarker(ctx: Context, scenario: String): String? =
         ctx.getSharedPreferences("paylist", Context.MODE_PRIVATE)
             .getString(markerKey(scenario), null)
+
+    /** Parse the process identity recorded in PhaseA's marker, or null. */
+    fun readMarkerIdentity(ctx: Context, scenario: String): ProcessIdentity? {
+        val raw = readMarker(ctx, scenario) ?: return null
+        val match = Regex("""^a-complete pid=(\d+) start=(-?\d+)$""")
+            .matchEntire(raw.trim()) ?: return null
+        return ProcessIdentity(
+            match.groupValues[1].toInt(),
+            match.groupValues[2].toLong(),
+        )
+    }
 
     /** Fresh state for PhaseA: empty prefs, no test DB, no ledger. */
     fun clearAllDurableState(ctx: Context) {
