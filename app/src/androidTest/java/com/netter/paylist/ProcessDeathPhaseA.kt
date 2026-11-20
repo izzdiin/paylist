@@ -38,6 +38,9 @@ import org.junit.runner.RunWith
  * process is still alive to execute it, the kill did not happen and
  * the test must fail loudly — a PhaseA that "passes" without dying
  * would make PhaseB assert against a state no crash ever produced.
+ * The ONE exception is [r06NegativeControlMarkerWithoutKill], the
+ * negative control, which deliberately returns normally without
+ * killing — the runner and PhaseB must catch the missing kill.
  *
  * The Room database is deliberately NOT closed before the kill: a
  * real crash does not close it either (SQLite WAL recovery replays
@@ -59,14 +62,19 @@ class ProcessDeathPhaseA {
     // NOTE: no @After — the process is killed inside each test; there
     // is nothing to tear down, and PhaseB cleans up after itself.
 
-    @Test
-    fun r03KillAfterImportBeforeSweep() = runBlocking {
+    /**
+     * Drive the cutover to the R03 crash window ("import done, sweep
+     * not started": imported=2, removed=0, queue intact) and prove
+     * the durable state. Shared by r03 (which then kills) and the r06
+     * negative control (which deliberately does not).
+     */
+    private suspend fun driveToImportBeforeSweep(tagA: String, tagB: String) {
         val store = Store(ctx)
         val db = ProcessDeathHarness.openTestDb(ctx)
         ProcessDeathHarness.setBootId(db, ProcessDeathHarness.BOOT_A)
         val items = listOf(
-            chainQueueItem(paymentPayload("death-r03-a"), ProcessDeathHarness.ROUTES),
-            chainQueueItem(paymentPayload("death-r03-b"), ProcessDeathHarness.ROUTES),
+            chainQueueItem(paymentPayload(tagA), ProcessDeathHarness.ROUTES),
+            chainQueueItem(paymentPayload(tagB), ProcessDeathHarness.ROUTES),
         )
         assertTrue(store.saveQueueSync(items))
         val failing = FailingQueueSource(
@@ -94,10 +102,31 @@ class ProcessDeathPhaseA {
         assertEquals(CutoverMode.DRAINING, coordinator.getMode())
         assertEquals(2, db.eventDao().count())
         assertEquals(2, store.queueSnapshot().size)
+    }
 
+    @Test
+    fun r03KillAfterImportBeforeSweep() = runBlocking {
+        driveToImportBeforeSweep("death-r03-a", "death-r03-b")
         ProcessDeathHarness.writeMarker(ctx, "r03")
         Process.killProcess(Process.myPid())
         fail("the process must have died")
+    }
+
+    /**
+     * NEGATIVE CONTROL — do NOT add a kill here. This method drives
+     * to the same crash window as r03 and writes the marker, then
+     * returns NORMALLY without killing the process. The runner (the
+     * clean-pass / process-alive checks) and PhaseB (the fresh-PID
+     * check) must catch the missing kill and fail the run; if this
+     * scenario ever passes, the harness has a false-positive. Run
+     * ONLY via scripts/process_death_tests.sh --negative-control.
+     */
+    @Test
+    fun r06NegativeControlMarkerWithoutKill() = runBlocking {
+        driveToImportBeforeSweep("death-r06-a", "death-r06-b")
+        ProcessDeathHarness.writeMarker(ctx, "r06")
+        // Deliberately NO killProcess and NO fail(): returning normally
+        // IS the control.
     }
 
     @Test

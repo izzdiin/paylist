@@ -32,6 +32,12 @@
 # missing kill — fails the script without running that PhaseB.
 #
 #   bash scripts/process_death_tests.sh                # R03/R04/R05
+#   bash scripts/process_death_tests.sh --negative-control
+#     Runs ONLY the r06 scenario, in which PhaseA writes the marker
+#     but deliberately does NOT kill. The exit code is INVERTED: 0
+#     means the harness correctly FAILED the run (the control works),
+#     non-zero means the run passed (the false-positive is still
+#     open). CI runs this as a separate job.
 set -u
 
 TEST_PKG="com.netter.paylist.test"
@@ -47,7 +53,15 @@ SCENARIOS=(
   "r05KillAfterPostBeforeAckPersistence:r05RetryDeliversExactlyOnce"
 )
 
+# Negative control: PhaseA writes the marker but deliberately does
+# NOT kill. The harness must fail this run.
+NEGATIVE_CONTROL="r06NegativeControlMarkerWithoutKill:r06NegativeControlMustFail"
+
 fail=0
+negative_control=0
+if [ "${1:-}" = "--negative-control" ]; then
+  negative_control=1
+fi
 
 cd "$(dirname "$0")/.." || exit 1
 
@@ -127,6 +141,32 @@ run_phase_b() {
   echo "FAIL: PhaseB $method ($PHASE_B_VERDICT)"
   return 1
 }
+
+if [ "$negative_control" -eq 1 ]; then
+  method_a="${NEGATIVE_CONTROL%%:*}"
+  method_b="${NEGATIVE_CONTROL##*:}"
+  echo "== NEGATIVE CONTROL: PhaseA writes the marker but does NOT kill =="
+  echo "== (the harness must FAIL this run; a pass means the false-positive is still open) =="
+  control_caught=""
+  if ! run_phase_a "$method_a"; then
+    control_caught="runner: $PHASE_A_VERDICT"
+  fi
+  # Run PhaseB anyway: if the system reused PhaseA's still-alive
+  # process, the fresh-PID check is a second, independent catch.
+  if ! run_phase_b "$method_b"; then
+    if [ -n "$control_caught" ]; then
+      control_caught="$control_caught; PhaseB: $PHASE_B_VERDICT"
+    else
+      control_caught="PhaseB: $PHASE_B_VERDICT"
+    fi
+  fi
+  if [ -n "$control_caught" ]; then
+    echo "NEGATIVE CONTROL: PASSED — the harness correctly failed the no-kill run ($control_caught)"
+    exit 0
+  fi
+  echo "NEGATIVE CONTROL: FAILED — the no-kill run PASSED (runner: $PHASE_A_VERDICT; PhaseB: $PHASE_B_VERDICT). The false-positive is still open."
+  exit 1
+fi
 
 for pair in "${SCENARIOS[@]}"; do
   method_a="${pair%%:*}"

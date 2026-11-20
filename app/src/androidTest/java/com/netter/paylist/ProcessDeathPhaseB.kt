@@ -86,9 +86,13 @@ class ProcessDeathPhaseB {
         )
     }
 
-    @Test
-    fun r03RetryCompletesWithoutDuplicatesOrLoss() = runBlocking {
-        requireFreshProcess("r03")
+    /**
+     * The r03-style recovery: retry the drain after a crash in the
+     * "import done, sweep not started" window. Shared by r03 and the
+     * r06 negative control (whose PhaseB must pass on state alone, so
+     * the ONLY reason it can fail is the freshness check).
+     */
+    private suspend fun retryCompletesWithoutDuplicatesOrLoss(tagA: String, tagB: String) {
         val store = Store(ctx)
         val db = ProcessDeathHarness.openTestDb(ctx)
         try {
@@ -114,7 +118,7 @@ class ProcessDeathPhaseB {
             assertTrue(store.queueSnapshot().isEmpty())
             assertEquals(2, db.eventDao().count())
             // qkeys stable: the same two deliveries, PENDING, claimable.
-            for (tag in listOf("death-r03-a", "death-r03-b")) {
+            for (tag in listOf(tagA, tagB)) {
                 val delivery = db.deliveryDao()
                     .getByLegacyQkey(chainQkey(tag, ProcessDeathHarness.ROUTES))
                 assertNotNull("Room delivery must exist for $tag", delivery)
@@ -129,6 +133,25 @@ class ProcessDeathPhaseB {
         } finally {
             db.close()
         }
+    }
+
+    @Test
+    fun r03RetryCompletesWithoutDuplicatesOrLoss() = runBlocking {
+        requireFreshProcess("r03")
+        retryCompletesWithoutDuplicatesOrLoss("death-r03-a", "death-r03-b")
+    }
+
+    @Test
+    fun r06NegativeControlMustFail() = runBlocking {
+        // Negative control (see ProcessDeathPhaseA): PhaseA wrote the
+        // marker but deliberately did NOT kill its process. This
+        // method asserts the same recovery as r03, so the ONLY reason
+        // it can fail is the freshness check above (or the runner,
+        // which refuses to run PhaseB at all when PhaseA's process is
+        // still alive). Run ONLY via
+        // scripts/process_death_tests.sh --negative-control.
+        requireFreshProcess("r06")
+        retryCompletesWithoutDuplicatesOrLoss("death-r06-a", "death-r06-b")
     }
 
     @Test
