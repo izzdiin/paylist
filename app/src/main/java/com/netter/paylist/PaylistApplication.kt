@@ -10,7 +10,9 @@ import com.netter.paylist.delivery.SyncScheduler
 import com.netter.paylist.delivery.SyncWorkerFactory
 import com.netter.paylist.migration.CutoverCommit
 import com.netter.paylist.migration.CutoverCoordinator
+import com.netter.paylist.migration.CutoverFlushGate
 import com.netter.paylist.migration.CutoverMode
+import com.netter.paylist.migration.FlushResult
 import com.netter.paylist.migration.LegacyQueueMigration
 import com.netter.paylist.migration.LegacyQueueSnapshotSource
 import com.netter.paylist.privacy.GateBackedInspector
@@ -191,7 +193,8 @@ class PaylistApplication : Application(), Configuration.Provider {
      * Returns the final user-facing message (Indonesian).
      *
      * Steps: request the drain → acquire the sender lock (45 s, fail
-     * closed) → durable flush + verify → commit `DRAINING` →
+     * closed) → durable flush + verify (R07: content/identity readback;
+     * a same-count mutation aborts before `DRAINING`) → commit `DRAINING` →
      * drain (import + sweep) → commit `WORKER_ONLY` → request a sync.
      * On any failure after the drain request, the cutover is aborted
      * back to `LEGACY_ONLY` so the legacy sender resumes.
@@ -231,26 +234,37 @@ class PaylistApplication : Application(), Configuration.Provider {
             )
         }
         try {
-            // P9 reprocessing must be durable before DRAINING. The sender
-            // lock prevents concurrent legacy queue mutation.
-            val privacy = CutoverPrivacyPreflight().run(object : LegacyQueueSnapshotSource {
+            val queueSource = object : LegacyQueueSnapshotSource {
                 override fun queueSnapshot(): List<JSONObject> = store.queueSnapshot()
                 override fun saveQueueSync(items: List<JSONObject>): Boolean =
                     store.saveQueueSync(items)
-            }, System.currentTimeMillis())
+            }
+            // P9 reprocessing must be durable before DRAINING. The sender
+            // lock prevents concurrent legacy queue mutation.
+            val privacy = CutoverPrivacyPreflight().run(queueSource, System.currentTimeMillis())
             if (!privacy.ok) {
                 return abortAndReturn(
                     "Cutover dibatalkan: pemeriksaan privasi antrean gagal (${privacy.reason})."
                 )
             }
             // Durable flush: commit the current queue and verify the
-            // readback before any state change (fail closed).
-            val snapshot = store.queueSnapshot()
-            if (!store.saveQueueSync(snapshot)) {
-                return abortAndReturn("Cutover dibatalkan: antrean gagal ditulis sinkron.")
-            }
-            if (store.queueSnapshot().size != snapshot.size) {
-                return abortAndReturn("Cutover dibatalkan: verifikasi antrean tidak cocok.")
+            // readback before any state change (fail closed). R07: the
+            // readback is content/identity verification (qkey set, next
+            // hop, payload, routes, and every other parsed field — see
+            // QueueFlushVerifier), not a size check, so a same-count
+            // mutation aborts here, before commitDraining. The gate
+            // aborts the coordinator itself; this branch only reports.
+            val snapshot = queueSource.queueSnapshot()
+            when (val flushed = runBlocking {
+                CutoverFlushGate.flushOrAbort(
+                    coordinator, queueSource, snapshot, System.currentTimeMillis()
+                )
+            }) {
+                is FlushResult.Verified -> Unit
+                is FlushResult.Failed -> {
+                    store.logLocal("cutover dibatalkan: verifikasi antrean gagal (${flushed.reason})")
+                    return "Cutover dibatalkan: verifikasi antrean tidak cocok (${flushed.reason})."
+                }
             }
             progress("Mengunci antrean, masuk mode DRAINING…")
             when (val draining = runBlocking { coordinator.commitDraining(now) }) {
