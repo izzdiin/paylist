@@ -633,6 +633,115 @@ class CutoverCoordinator(
     }
 
     /**
+     * Re-drains legacy-queue leftovers AFTER the `WORKER_ONLY` commit
+     * (R08, review 6011401446): captures that landed after the drain
+     * snapshot — or after `commitDraining`, unmarked by the preflight —
+     * sit in the legacy queue with the sender gated off and no Room
+     * delivery; without this they strand there forever. The re-drain
+     * reuses the drain's own path (snapshot → P9 partition →
+     * idempotent import → verify → sweep) under a FRESH sweep fence,
+     * so it is resumable and idempotent like the drain itself.
+     *
+     * Requires `WORKER_ONLY` mode and a verified `worker_only` phase
+     * marker. The marker is NOT touched: it stays the main drain's
+     * audit record (its snapshot/import counts describe the cutover
+     * drain, not this re-drain). The migration-clear record is
+     * likewise left alone; the per-item sweep records are the
+     * durable audit for re-drained removals.
+     *
+     * The caller MUST run the privacy preflight first (see
+     * [com.netter.paylist.privacy.CutoverPrivacyPreflight]): the
+     * fail-closed inspector quarantines never-preflighted items, so
+     * a re-drain without a preflight would leave exactly the items
+     * it is meant to rescue. Call under the sender lock, so no
+     * capture can land unmarked between the preflight and the
+     * re-drain snapshot.
+     *
+     * Safe to call repeatedly: a second run finds nothing importable
+     * and returns `ok` with zero counts. A failed run releases its
+     * fence; the next run installs a fresh one and resumes (sweep
+     * records make already-removed items a no-op).
+     */
+    suspend fun redrainLeftovers(inspector: LegacyQueueInspector, nowMs: Long): DrainResult {
+        val mode = getMode()
+        if (mode != CutoverMode.WORKER_ONLY) {
+            return DrainResult(false, 0, 0, 0, 0, 0, 0, false, "mode is $mode, expected WORKER_ONLY")
+        }
+        val marker = getPhaseMarker()
+        if (marker == null || marker.phase != "worker_only" || !marker.verified) {
+            return DrainResult(
+                false, 0, 0, 0, 0, 0, 0, false,
+                "no verified WORKER_ONLY cutover; run drain() + commitWorkerOnly first",
+            )
+        }
+        val fenceId = UUID.randomUUID().toString()
+        val generation = getDrainGeneration() ?: 0L
+        transactions.run {
+            stateDao.put(
+                state(
+                    CollectorStateKeys.SWEEP_FENCE_PREFIX + fenceId,
+                    SweepFence(fenceId, "legacy_queue_redrain", generation, nowMs)
+                        .toJson().toString(),
+                    nowMs,
+                ),
+            )
+        }
+        try {
+            val snapshot = migration.snapshot(queue.queueSnapshot(), nowMs)
+            val partitioned = migration.partition(snapshot, inspector)
+            val report = migration.import(partitioned, nowMs)
+            val verification = migration.verify(partitioned, queue.queueSnapshot(), nowMs)
+            if (!verification.ok) {
+                return DrainResult(
+                    ok = false,
+                    imported = report.deliveriesImported,
+                    removed = 0,
+                    skippedHeld = 0,
+                    quarantined = report.quarantinedExcluded,
+                    expiredSkipped = report.expiredSkipped,
+                    corrupt = report.corruptCount,
+                    verified = false,
+                    error = verification.detail,
+                )
+            }
+            var removed = 0
+            var skippedHeld = 0
+            for (item in partitioned.importable) {
+                when (val step = sweepStep(item, fenceId, nowMs)) {
+                    SweepStepResult.Removed -> removed++
+                    SweepStepResult.SkippedHeld -> skippedHeld++
+                    is SweepStepResult.Failed -> return DrainResult(
+                        ok = false,
+                        imported = report.deliveriesImported,
+                        removed = removed,
+                        skippedHeld = skippedHeld,
+                        quarantined = report.quarantinedExcluded,
+                        expiredSkipped = report.expiredSkipped,
+                        corrupt = report.corruptCount,
+                        verified = true,
+                        error = step.reason,
+                    )
+                }
+            }
+            return DrainResult(
+                ok = true,
+                imported = report.deliveriesImported,
+                removed = removed,
+                skippedHeld = skippedHeld,
+                quarantined = report.quarantinedExcluded,
+                expiredSkipped = report.expiredSkipped,
+                corrupt = report.corruptCount,
+                verified = true,
+                error = null,
+            )
+        } finally {
+            transactions.run {
+                stateDao.delete(CollectorStateKeys.SWEEP_FENCE_PREFIX + fenceId)
+            }
+        }
+    }
+
+    /**
      * Aborts the cutover back to `LEGACY_ONLY` / `ABORTED` (§8.4).
      * The sweep fence is released. Room events captured during
      * `DRAINING` stay in Room, visible — re-promotion to the legacy

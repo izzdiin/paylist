@@ -62,18 +62,21 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - B2: capture AFTER `requestDrain`, BEFORE `commitDraining` (intent
  *   `PENDING`) → imported, delivered.
  * - B3a: capture AFTER `commitDraining`, BEFORE the drain snapshot →
- *   STRANDED (see below).
+ *   stranded without the fix, delivered after the re-drain.
  * - B3b: capture AFTER the drain snapshot, BEFORE `commitWorkerOnly` →
- *   STRANDED (see below).
- * - B3c: capture AFTER `commitWorkerOnly` → STRANDED (see below).
+ *   stranded without the fix, delivered after the re-drain.
+ * - B3c: capture AFTER `commitWorkerOnly` → stranded without the fix,
+ *   delivered after the re-drain.
  *
- * The B3a/B3b/B3c tests assert the ACTUAL current behaviour — the
- * payment stays in the legacy queue with no Room delivery and no
- * worker claim — so the stranding is proven by a green test, not by
- * reading the code. The fix (a post-commit re-drain) flips these
- * three tests to delivery assertions in a follow-up commit.
+ * The B3a/B3b/B3c tests first prove the stranding WITHOUT the fix —
+ * the payment sits in the legacy queue with no Room delivery and no
+ * worker claim after a worker pass — and then prove the fix: the
+ * post-commit re-drain (privacy preflight +
+ * [CutoverCoordinator.redrainLeftovers], as `runCutover` performs
+ * it) imports the payment and the worker delivers it (exactly one
+ * POST + `ACKED`, queue clean).
  *
- * Why B3a/B3b/B3c strand, as the tests prove it:
+ * Why B3a/B3b/B3c strand without the fix, as the tests prove it:
  * - B3a: the capture lands after the privacy preflight, so the
  *   fail-closed [GateBackedInspector] quarantines it instead of
  *   importing it (`drained.quarantined == 1`, `imported == 0`).
@@ -83,7 +86,15 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   sender is gated off and the worker only claims Room rows.
  * In all three the legacy sender records zero POST attempts for the
  * tag (the mode gate is closed) and the worker records zero POSTs
- * (no Room delivery exists) — one owner (legacy only), no delivery.
+ * before the re-drain (no Room delivery exists) — one owner (legacy
+ * only), no delivery — until the re-drain moves the payment to Room.
+ *
+ * Production note on B3c: in Stage D capture targets Room, so no
+ * capture can land in the legacy queue after `WORKER_ONLY` at all —
+ * the B3c test proves the re-drain MECHANISM (a post-commit capture
+ * is deliverable when the re-drain runs), and `runCutover` runs the
+ * re-drain once after the commit, under the sender lock, so every
+ * capture present-or-arriving during the cutover itself is covered.
  *
  * Capture path: the test drives [Sender.enqueueChain] on a REAL
  * [Sender] — the exact method `PaylistListenerService` calls — with
@@ -363,6 +374,21 @@ class CaptureDuringCutoverTest {
     }
 
     /**
+     * The R08 post-commit re-drain, in the order `runCutover`
+     * performs it: privacy preflight → coordinator re-drain, under
+     * the sender lock (so no capture can land unmarked mid-redrain).
+     */
+    private suspend fun redrainLeftoversOrFail(coordinator: CutoverCoordinator): DrainResult {
+        return withSenderLock {
+            val preflight = CutoverPrivacyPreflight().run(storeQueueSource(), NOW)
+            assertTrue("redrain preflight must succeed: ${preflight.reason}", preflight.ok)
+            val redrained = coordinator.redrainLeftovers(GateBackedInspector, NOW)
+            assertTrue("redrain must succeed: ${redrained.error}", redrained.ok)
+            redrained
+        }
+    }
+
+    /**
      * Asserts eventual claim/delivery for [tag] through the worker:
      * exactly one Room delivery (`ACKED`), exactly one Room event,
      * exactly one worker POST, and the legacy queue clean of the
@@ -490,11 +516,12 @@ class CaptureDuringCutoverTest {
     }
 
     // =====================================================================
-    // B3a: capture AFTER commitDraining, BEFORE the snapshot → STRANDED
+    // B3a: capture AFTER commitDraining, BEFORE the snapshot →
+    // stranded without the fix, delivered after the re-drain
     // =====================================================================
 
     @Test
-    fun captureAfterCommitDraining_strandedWithoutRedrain() = runBlocking {
+    fun captureAfterCommitDraining_deliveredAfterRedrain() = runBlocking {
         setBootId(BOOT_A)
         val tag = "r08-b3a"
         val coordinator = newCoordinator(storeQueueSource())
@@ -523,6 +550,7 @@ class CaptureDuringCutoverTest {
         assertEquals(0, drained.imported)
         assertEquals(1, drained.quarantined)
 
+        // Stranded WITHOUT the fix: a worker pass delivers nothing.
         assertFalse(processor.processDueWork())
         assertStrandedInLegacyQueue(tag, workerTransport)
         assertTrue(
@@ -530,14 +558,39 @@ class CaptureDuringCutoverTest {
             legacyTransport.attemptsFor(dedupeKey(tag)).isEmpty(),
         )
         assertEquals(0, db.eventDao().count())
+
+        // The fix: the re-drain (preflight + import + sweep) rescues
+        // the payment, and the worker delivers it.
+        val redrained = redrainLeftoversOrFail(coordinator)
+        assertEquals(1, redrained.imported)
+        assertEquals(1, redrained.removed)
+        assertEquals(0, redrained.quarantined)
+        // Idempotent: a second re-drain is a no-op success.
+        val again = coordinator.redrainLeftovers(GateBackedInspector, NOW)
+        assertTrue("second redrain must succeed: ${again.error}", again.ok)
+        assertEquals(0, again.imported)
+        assertEquals(0, again.removed)
+        // The phase marker still describes the MAIN drain, untouched
+        // by the re-drain (its audit record is not rewritten).
+        val marker = coordinator.getPhaseMarker()
+        assertNotNull("the phase marker must survive the redrain", marker)
+        assertEquals("worker_only", marker!!.phase)
+        assertEquals(1, marker.snapshotCount)
+        assertEquals(0, marker.importedCount)
+        assertTrue(marker.verified)
+
+        assertFalse("no due work must remain after the pass", processor.processDueWork())
+        assertDeliveredByWorker(tag, workerTransport)
+        assertEquals(1, db.eventDao().count())
     }
 
     // =====================================================================
-    // B3b: capture AFTER the snapshot, BEFORE commitWorkerOnly → STRANDED
+    // B3b: capture AFTER the snapshot, BEFORE commitWorkerOnly →
+    // stranded without the fix, delivered after the re-drain
     // =====================================================================
 
     @Test
-    fun captureAfterDrainSnapshot_strandedWithoutRedrain() = runBlocking {
+    fun captureAfterDrainSnapshot_deliveredAfterRedrain() = runBlocking {
         setBootId(BOOT_A)
         val anchorTag = "r08-b3b-anchor"
         val tag = "r08-b3b"
@@ -570,6 +623,8 @@ class CaptureDuringCutoverTest {
 
         assertFalse(processor.processDueWork())
         assertDeliveredByWorker(anchorTag, workerTransport)
+        // Stranded WITHOUT the fix: the worker delivered the anchor
+        // but never saw the B3b payment.
         assertStrandedInLegacyQueue(tag, workerTransport)
         assertTrue(
             "the legacy sender must never POST after DRAINING",
@@ -582,14 +637,24 @@ class CaptureDuringCutoverTest {
             .single { it.optString("qkey") == chainQkey(tag, ROUTES) }
         assertFalse(stranded.optBoolean(LegacyQueuePrivacyGate.KEY_REPROCESSED, false))
         assertEquals(1, db.eventDao().count())
+
+        // The fix: the re-drain rescues the payment.
+        val redrained = redrainLeftoversOrFail(coordinator)
+        assertEquals(1, redrained.imported)
+        assertEquals(1, redrained.removed)
+        assertFalse("no due work must remain after the pass", processor.processDueWork())
+        assertDeliveredByWorker(tag, workerTransport)
+        assertEquals(2, db.eventDao().count())
+        assertTrue("the queue must be empty at the end", store.queueSnapshot().isEmpty())
     }
 
     // =====================================================================
-    // B3c: capture AFTER commitWorkerOnly → STRANDED
+    // B3c: capture AFTER commitWorkerOnly →
+    // stranded without the fix, delivered after the re-drain
     // =====================================================================
 
     @Test
-    fun captureAfterCommitWorkerOnly_strandedWithoutRedrain() = runBlocking {
+    fun captureAfterCommitWorkerOnly_deliveredAfterRedrain() = runBlocking {
         setBootId(BOOT_A)
         val anchorTag = "r08-b3c-anchor"
         val tag = "r08-b3c"
@@ -618,12 +683,59 @@ class CaptureDuringCutoverTest {
 
         assertFalse(processor.processDueWork())
         assertDeliveredByWorker(anchorTag, workerTransport)
+        // Stranded WITHOUT the fix: the worker delivered the anchor
+        // but never saw the B3c payment.
         assertStrandedInLegacyQueue(tag, workerTransport)
         assertTrue(
             "the legacy sender must never POST after WORKER_ONLY",
             legacyTransport.attemptsFor(dedupeKey(tag)).isEmpty(),
         )
         assertEquals(1, db.eventDao().count())
+
+        // The fix: the re-drain rescues the payment.
+        val redrained = redrainLeftoversOrFail(coordinator)
+        assertEquals(1, redrained.imported)
+        assertEquals(1, redrained.removed)
+        assertFalse("no due work must remain after the pass", processor.processDueWork())
+        assertDeliveredByWorker(tag, workerTransport)
+        assertEquals(2, db.eventDao().count())
+        assertTrue("the queue must be empty at the end", store.queueSnapshot().isEmpty())
+    }
+
+    // =====================================================================
+    // Re-drain guards: refuses outside WORKER_ONLY, no-op on empty queue
+    // =====================================================================
+
+    @Test
+    fun redrainLeftovers_refusesOutsideWorkerOnly_noopOnEmptyQueue() = runBlocking {
+        setBootId(BOOT_A)
+        val coordinator = newCoordinator(storeQueueSource())
+
+        // LEGACY_ONLY: no cutover has run.
+        val beforeCutover = coordinator.redrainLeftovers(GateBackedInspector, NOW)
+        assertFalse("redrain must refuse in LEGACY_ONLY", beforeCutover.ok)
+        assertTrue(
+            "the refusal must name the expected mode: ${beforeCutover.error}",
+            beforeCutover.error!!.contains("WORKER_ONLY"),
+        )
+
+        // DRAINING: the main drain owns the queue here, not the redrain.
+        requestDrainOrFail(coordinator)
+        preflightAndCommitDraining(coordinator)
+        val draining = coordinator.redrainLeftovers(GateBackedInspector, NOW)
+        assertFalse("redrain must refuse in DRAINING", draining.ok)
+        assertTrue(
+            "the refusal must name the expected mode: ${draining.error}",
+            draining.error!!.contains("WORKER_ONLY"),
+        )
+
+        // WORKER_ONLY with an empty queue: a no-op success.
+        drainAndCommitWorkerOnly(coordinator)
+        val empty = coordinator.redrainLeftovers(GateBackedInspector, NOW)
+        assertTrue("empty redrain must succeed: ${empty.error}", empty.ok)
+        assertEquals(0, empty.imported)
+        assertEquals(0, empty.removed)
+        assertEquals(0, empty.quarantined)
     }
 
     companion object {

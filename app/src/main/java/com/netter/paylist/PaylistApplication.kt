@@ -195,15 +195,22 @@ class PaylistApplication : Application(), Configuration.Provider {
      * Steps: request the drain → acquire the sender lock (45 s, fail
      * closed) → durable flush + verify (R07: content/identity readback;
      * a same-count mutation aborts before `DRAINING`) → commit `DRAINING` →
-     * drain (import + sweep) → commit `WORKER_ONLY` → request a sync.
+     * drain (import + sweep) → commit `WORKER_ONLY` → request a sync →
+     * re-drain leftovers (R08).
      * On any failure after the drain request, the cutover is aborted
      * back to `LEGACY_ONLY` so the legacy sender resumes.
      *
-     * Known Stage C limitation: captures arriving between the drain
-     * snapshot and the `WORKER_ONLY` commit land in the legacy queue
-     * after the snapshot (Stage C capture still enqueues there; the
-     * Stage D capture rewire sends them to Room instead). The window
-     * is seconds; a non-empty queue afterwards is logged loudly.
+     * R08: captures arriving after the drain snapshot — or after
+     * `commitDraining`, unmarked by the preflight — land in the
+     * legacy queue while the sender is gated off (Stage C capture
+     * still enqueues there; the Stage D capture rewire sends them
+     * to Room instead). They are NOT left for manual handling: after
+     * the `WORKER_ONLY` commit, [redrainLeftoversAfterCommit]
+     * re-runs the privacy preflight and re-drains whatever is left,
+     * under the sender lock, so no capture can land unmarked
+     * mid-redrain. In Stage D no capture can land in the legacy
+     * queue after the re-drain at all (capture targets Room), so
+     * the re-drain closes the window for good.
      */
     fun runCutover(progress: (String) -> Unit): String {
         if (!CAPTURE_TO_ROOM_READY) {
@@ -233,12 +240,12 @@ class PaylistApplication : Application(), Configuration.Provider {
                     "Coba lagi beberapa menit lagi."
             )
         }
+        val queueSource = object : LegacyQueueSnapshotSource {
+            override fun queueSnapshot(): List<JSONObject> = store.queueSnapshot()
+            override fun saveQueueSync(items: List<JSONObject>): Boolean =
+                store.saveQueueSync(items)
+        }
         try {
-            val queueSource = object : LegacyQueueSnapshotSource {
-                override fun queueSnapshot(): List<JSONObject> = store.queueSnapshot()
-                override fun saveQueueSync(items: List<JSONObject>): Boolean =
-                    store.saveQueueSync(items)
-            }
             // P9 reprocessing must be durable before DRAINING. The sender
             // lock prevents concurrent legacy queue mutation.
             val privacy = CutoverPrivacyPreflight().run(queueSource, System.currentTimeMillis())
@@ -293,14 +300,66 @@ class PaylistApplication : Application(), Configuration.Provider {
             "${drained.quarantined} dikarantina (privasi), ${drained.corrupt} rusak dilewati."
         store.logLocal("cutover selesai: $summary")
         if (leftover > 0) {
-            // Captures that landed after the drain snapshot (see the
-            // KDoc): visible, never silent.
-            store.logLocal(
-                "PERHATIAN cutover: $leftover item masih di antrean legacy " +
-                    "setelah aktivasi (tiba saat drain); perlu penanganan manual"
-            )
-            store.setLastFailure("cutover: $leftover item tersisa di antrean legacy")
+            // R08: captures that landed after the drain snapshot (or
+            // after commitDraining, unmarked by the preflight) would
+            // strand in the legacy queue — the sender is gated off in
+            // WORKER_ONLY and the worker only claims Room rows. Re-drain
+            // them instead of leaving them for manual handling.
+            store.logLocal(redrainLeftoversAfterCommit(queueSource))
         }
         return summary
+    }
+
+    /**
+     * R08: re-drains legacy-queue leftovers after the `WORKER_ONLY`
+     * commit — captures that landed after the drain snapshot (or
+     * after `commitDraining`, unmarked by the preflight). Runs the
+     * privacy preflight first (the fail-closed inspector would
+     * quarantine never-preflighted items), then the coordinator's
+     * [CutoverCoordinator.redrainLeftovers], all under the sender
+     * lock so no capture can land unmarked mid-redrain. On success
+     * with imported items, requests another sync so the worker
+     * picks them up promptly. Returns a log line describing the
+     * outcome; never throws (a failure leaves the leftovers visible
+     * in the queue + `lastFailure`, exactly as before R08).
+     */
+    private fun redrainLeftoversAfterCommit(queueSource: LegacyQueueSnapshotSource): String {
+        val locked = try {
+            SenderLock.lock.tryLock(45, TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!locked) {
+            val msg = "cutover redrain dibatalkan: antrean sibuk; " +
+                "${store.queueSnapshot().size} item tersisa di antrean legacy"
+            store.setLastFailure(msg)
+            return "PERHATIAN $msg"
+        }
+        try {
+            val now = System.currentTimeMillis()
+            val preflight = CutoverPrivacyPreflight().run(queueSource, now)
+            if (!preflight.ok) {
+                val msg = "cutover redrain dibatalkan: pemeriksaan privasi gagal " +
+                    "(${preflight.reason}); item tersisa di antrean legacy"
+                store.setLastFailure(msg)
+                return "PERHATIAN $msg"
+            }
+            val redrained = runBlocking { coordinator.redrainLeftovers(GateBackedInspector, now) }
+            if (!redrained.ok) {
+                val msg = "cutover redrain gagal: ${redrained.error ?: "tidak diketahui"}; " +
+                    "item tersisa di antrean legacy"
+                store.setLastFailure(msg)
+                return "PERHATIAN $msg"
+            }
+            if (redrained.imported > 0) SyncScheduler.requestSync(this)
+            val remaining = store.queueSnapshot().size
+            return "cutover redrain: ${redrained.imported} item tersisa dimigrasikan " +
+                "(${redrained.removed} dihapus dari antrean, " +
+                "${redrained.quarantined} dikarantina); $remaining item masih di antrean " +
+                "(karantina/rusak/kedaluwarsa)"
+        } finally {
+            SenderLock.lock.unlock()
+        }
     }
 }

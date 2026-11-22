@@ -457,7 +457,12 @@ object GateBackedInspector : LegacyQueueInspector {
         }
 }
 
-/** Durable P9 gate: call under SenderLock before committing DRAINING. */
+/**
+ * Durable P9 gate: call under SenderLock before committing DRAINING —
+ * and again before a post-commit re-drain (R08): leftovers that
+ * arrived after the first preflight carry no markers, and the
+ * fail-closed inspector would quarantine them instead of importing.
+ */
 class CutoverPrivacyPreflight(
     private val gate: LegacyQueuePrivacyGate = LegacyQueuePrivacyGate(),
 ) {
