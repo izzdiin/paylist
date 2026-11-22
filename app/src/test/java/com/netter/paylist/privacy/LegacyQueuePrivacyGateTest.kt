@@ -400,6 +400,80 @@ class LegacyQueuePrivacyGateTest {
         assertEquals(Inspection.QUARANTINED, GateBackedInspector.inspect(quarantined))
     }
 
+
+    @Test
+    fun regression_cutoverPreflightMarksEveryPaymentBeforeImport() {
+        val first = queueItem("preflight-clean", "GoPay", "Pembayaran Rp100.800 berhasil")
+        val second = queueItem("preflight-ambiguous", "GoPay", "Kode 123456 untuk pembayaran")
+        val source = FakeQueueSource(listOf(first, second))
+        val before = source.current().map { it.getString("qkey") }
+        val result = CutoverPrivacyPreflight().run(source, NOW)
+        assertTrue("preflight must succeed with durable markers", result.ok)
+        assertEquals(before, source.current().map { it.getString("qkey") })
+        assertEquals(2, source.current().size)
+        assertTrue(source.current().all {
+            it.optBoolean(LegacyQueuePrivacyGate.KEY_REPROCESSED, false) ||
+                it.optBoolean(LegacyQueuePrivacyGate.KEY_QUARANTINE, false)
+        })
+    }
+
+    @Test
+    fun regression_cutoverPreflightWriteFailureRetainsQueueAndBlocksTransition() {
+        val item = queueItem("preflight-fail", "GoPay", "Pembayaran Rp100.800 berhasil")
+        val source = FakeQueueSource(listOf(item)).apply { failWrites = true }
+        val before = source.current().single().toString()
+        val result = CutoverPrivacyPreflight().run(source, NOW)
+        assertFalse("cutover must not continue after a failed privacy write", result.ok)
+        assertEquals("privacy_write_failed", result.reason)
+        assertEquals(before, source.current().single().toString())
+        assertEquals(1, source.current().size)
+    }
+
+    @Test
+    fun regression_cutoverPreflightRejectsUnpersistedPrivacyMarkers() {
+        val item = queueItem("preflight-lying", "GoPay", "Pembayaran Rp100.800 berhasil")
+        val source = object : LegacyQueueSnapshotSource {
+            private val original = JSONObject(item.toString())
+            override fun queueSnapshot(): List<JSONObject> =
+                listOf(JSONObject(original.toString()))
+            override fun saveQueueSync(items: List<JSONObject>): Boolean = true
+        }
+        val result = CutoverPrivacyPreflight().run(source, NOW)
+        assertFalse("a lying write success must not authorize cutover", result.ok)
+        assertEquals("privacy_marker_missing", result.reason)
+    }
+
+    @Test
+    fun regression_legacySenderUnreadableSecretMustRetainBothQueueKinds() {
+        // Static regression for Android-backed Sender (plain JVM tests
+        // cannot instantiate a real Android Store). Both unavailable
+        // branches must fail processItem, not advance or dequeue.
+        val root = findSourceRoot() ?: throw AssertionError("source root unavailable")
+        val sender = File(root, "com/netter/paylist/Sender.kt").readText()
+        val unavailable = Regex(
+            """is SecretResult\.Unavailable\s*->\s*\{([\s\S]*?return false)"""
+        ).findAll(sender).map { it.groupValues[1] }.toList()
+        assertEquals("chain and single-route branches", 2, unavailable.size)
+        unavailable.forEach { branch ->
+            assertTrue("unreadable secret must retain item", branch.contains("return false"))
+            assertFalse("unreadable secret must not advance chain", branch.contains("next++"))
+            assertFalse("unreadable secret must not dequeue", branch.contains("return true"))
+        }
+    }
+
+    @Test
+    fun regression_cutoverCallsPrivacyPreflightBeforeDrain() {
+        val root = findSourceRoot() ?: throw AssertionError("source root unavailable")
+        val app = File(root, "com/netter/paylist/PaylistApplication.kt").readText()
+        val preflight = app.indexOf("CutoverPrivacyPreflight().run(")
+        val draining = app.indexOf("coordinator.commitDraining(now)")
+        val drain = app.indexOf("coordinator.drain(GateBackedInspector, now)")
+        assertTrue("preflight must exist", preflight >= 0)
+        assertTrue("preflight must precede DRAINING", preflight < draining)
+        assertTrue("preflight must precede drain", preflight < drain)
+        assertTrue("preflight failure must abort", app.contains("if (!privacy.ok)"))
+    }
+
     /**
      * Locates `src/main/java` for the static check (mirrors CutoverTest).
      * Tries the module dir, then the project root, then walks up from

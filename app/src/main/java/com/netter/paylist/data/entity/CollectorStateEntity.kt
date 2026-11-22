@@ -61,6 +61,9 @@ object CollectorStateKeys {
     /** Prefix for held-copy release records: `release_record:<dedupe_key>` (§8.7, F41). */
     const val RELEASE_RECORD_PREFIX: String = "release_record:"
 
+    /** Prefix for per-item quarantine records: `quarantine_record:<dedupe_key>` (P2). */
+    const val QUARANTINE_RECORD_PREFIX: String = "quarantine_record:"
+
     /** Diagnostic counters document (capture/staging/drain counters, §8.3). */
     const val DIAGNOSTICS: String = "diagnostics"
 }

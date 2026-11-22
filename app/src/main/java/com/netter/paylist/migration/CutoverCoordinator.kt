@@ -185,6 +185,101 @@ sealed interface CutoverCommit {
     data class Rejected(val reason: String) : CutoverCommit
 }
 
+/**
+ * A durable per-item quarantine record, stored at
+ * `quarantine_record:<dedupe_key>` (P2, review 6011401446). The phase
+ * marker holds only the aggregate quarantine count + checksum; this
+ * record is what makes each quarantined financial item individually
+ * visible and reconcilable after `WORKER_ONLY`: its identity
+ * (`qkey`/`dedupe_key`), the stable quarantine reason code, the span
+ * classes (never content), and the financial metadata the Stage D
+ * discard audit owes (amount, package — never raw spans).
+ *
+ * Written by [CutoverCoordinator.drain] and
+ * [CutoverCoordinator.redrainLeftovers] when an item is quarantined,
+ * `putIfAbsent`: a later drain/redrain never overwrites the original
+ * record — its fence still names the drain that quarantined the item,
+ * so reconciliation against the phase marker stays exact. When a
+ * later re-drain recovers the item (a never-preflighted item imported
+ * after the preflight), `resolution` becomes `imported`; the record
+ * stays as the audit trail, it is never deleted.
+ */
+data class QuarantineRecord(
+    val dedupeKey: String,
+    val qkey: String,
+    val reason: String,
+    val spanClasses: String?,
+    val amount: Long?,
+    val sourcePackage: String?,
+    val quarantinedAtMs: Long,
+    val fenceId: String,
+    val drainGeneration: Long,
+    val source: String,
+    val resolution: String?,
+    val resolvedAtMs: Long?,
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("dedupe_key", dedupeKey)
+        put("qkey", qkey)
+        put("reason", reason)
+        if (spanClasses != null) put("span_classes", spanClasses)
+        if (amount != null) put("amount", amount)
+        if (sourcePackage != null) put("source_package", sourcePackage)
+        put("quarantined_at_ms", quarantinedAtMs)
+        put("fence_id", fenceId)
+        put("drain_generation", drainGeneration)
+        put("source", source)
+        if (resolution != null) put("resolution", resolution)
+        if (resolvedAtMs != null) put("resolved_at_ms", resolvedAtMs)
+    }
+
+    companion object {
+        /** The record was written by the main drain. */
+        const val SOURCE_DRAIN: String = "drain"
+
+        /** The record was written by a post-commit re-drain. */
+        const val SOURCE_REDRAIN: String = "redrain"
+
+        /** Resolution: the item was later imported by a re-drain. */
+        const val RESOLUTION_IMPORTED: String = "imported"
+
+        fun fromJson(o: JSONObject): QuarantineRecord = QuarantineRecord(
+            dedupeKey = o.optString("dedupe_key"),
+            qkey = o.optString("qkey"),
+            reason = o.optString("reason"),
+            spanClasses = o.optString("span_classes").ifEmpty { null },
+            amount = if (o.has("amount")) o.optLong("amount") else null,
+            sourcePackage = o.optString("source_package").ifEmpty { null },
+            quarantinedAtMs = o.optLong("quarantined_at_ms"),
+            fenceId = o.optString("fence_id"),
+            drainGeneration = o.optLong("drain_generation"),
+            source = o.optString("source"),
+            resolution = o.optString("resolution").ifEmpty { null },
+            resolvedAtMs = if (o.has("resolved_at_ms")) o.optLong("resolved_at_ms") else null,
+        )
+    }
+}
+
+/** One quarantined item as reported by a drain run (identity + reason, never content). */
+data class QuarantinedItemInfo(
+    val qkey: String,
+    val dedupeKey: String,
+    val reason: String,
+)
+
+/** Result of [CutoverCoordinator.reconcileQuarantine] (P2): the phase marker vs the per-item records. */
+data class QuarantineReconciliation(
+    val markerQuarantinedCount: Int,
+    val markerChecksum: String,
+    /** Records naming the marker's fence (the main drain's quarantined set). */
+    val recordCount: Int,
+    val unresolvedCount: Int,
+    val resolvedCount: Int,
+    val countsMatch: Boolean,
+    val checksumMatches: Boolean,
+    val ok: Boolean,
+)
+
 /** Result of one `drain()` run. */
 data class DrainResult(
     val ok: Boolean,
@@ -196,6 +291,8 @@ data class DrainResult(
     val corrupt: Int,
     val verified: Boolean,
     val error: String?,
+    /** The quarantined items of this run, individually identified (P2; empty on failure). */
+    val quarantinedItems: List<QuarantinedItemInfo> = emptyList(),
 )
 
 /** One admission request (§8.5(a)): the drain epoch a worker thread presents. */
@@ -378,6 +475,46 @@ class CutoverCoordinator(
         return CutoverPhaseMarker.fromJson(doc)
     }
 
+    /** All durable per-item quarantine records, sorted by `qkey` (P2). */
+    suspend fun getQuarantineRecords(): List<QuarantineRecord> {
+        return stateDao.getAll()
+            .filter { it.key.startsWith(CollectorStateKeys.QUARANTINE_RECORD_PREFIX) }
+            .mapNotNull { runCatching { QuarantineRecord.fromJson(JSONObject(it.valueJson)) }.getOrNull() }
+            .sortedBy { it.qkey }
+    }
+
+    /**
+     * Reconciles the phase marker's aggregate quarantine accounting
+     * against the durable per-item records (P2): the records naming
+     * the marker's fence must number exactly the marker's quarantined
+     * count, and their (`qkey`, reason) checksum must equal the
+     * marker's quarantine checksum. Resolved records still count —
+     * they WERE quarantined by the main drain; the resolution is the
+     * audit trail of their later recovery. Records from a later
+     * re-drain name a different fence and are excluded here (they
+     * reconcile against their own drain's `DrainResult`, not the
+     * marker). Returns null when no phase marker exists yet.
+     */
+    suspend fun reconcileQuarantine(): QuarantineReconciliation? {
+        val marker = getPhaseMarker() ?: return null
+        val records = getQuarantineRecords().filter { it.fenceId == marker.fenceId }
+        val checksum = LegacyQueueMigration.quarantineChecksumOf(
+            records.map { it.qkey to it.reason },
+        )
+        val countsMatch = records.size == marker.quarantinedCount
+        val checksumMatches = checksum == marker.quarantineChecksum
+        return QuarantineReconciliation(
+            markerQuarantinedCount = marker.quarantinedCount,
+            markerChecksum = marker.quarantineChecksum,
+            recordCount = records.size,
+            unresolvedCount = records.count { it.resolution == null },
+            resolvedCount = records.count { it.resolution != null },
+            countsMatch = countsMatch,
+            checksumMatches = checksumMatches,
+            ok = countsMatch && checksumMatches,
+        )
+    }
+
     suspend fun isSenderFenced(): Boolean {
         val doc = readDoc(CollectorStateKeys.SENDER_FENCED) ?: return false
         return doc.optBoolean("fenced")
@@ -393,14 +530,24 @@ class CutoverCoordinator(
      * install time: no attempt can be admitted afterwards while the
      * intent is `PENDING` (`DRAIN_PENDING`).
      *
-     * Requires (`LEGACY_ONLY`, `NONE`). The drain itself starts only
-     * with [commitDraining], which requires the awaited set resolved.
+     * Requires (`LEGACY_ONLY`, `NONE`) — or (`LEGACY_ONLY`,
+     * `ABORTED`) for the next cutover attempt after an abort
+     * (design §7.3A(h): "the next cutover attempt re-runs the
+     * import idempotently"). A retry installs a FRESH intent with a
+     * new generation, so the awaited set is re-snapshotted and no
+     * state from the aborted attempt leaks in; the `ABORTED` record
+     * itself is preserved until the retry starts (row 5 stays a
+     * legal, observable state per §8.4). The drain itself starts
+     * only with [commitDraining], which requires the awaited set
+     * resolved.
      */
     suspend fun requestDrain(nowMs: Long): CutoverCommit {
         return transactions.run {
             val mode = getMode()
             val intent = getDrainIntent()
-            if (mode != CutoverMode.LEGACY_ONLY || intent != DrainIntent.NONE) {
+            if (mode != CutoverMode.LEGACY_ONLY ||
+                (intent != DrainIntent.NONE && intent != DrainIntent.ABORTED)
+            ) {
                 return@run CutoverCommit.Rejected(
                     "cannot request drain from mode=$mode intent=$intent",
                 )
@@ -513,7 +660,10 @@ class CutoverCoordinator(
      * → idempotent import → verify → sweep-remove each imported
      * item. Requires `DRAINING` mode. The import is idempotent and
      * the sweep is resumable (sweep records), so a crashed drain can
-     * be re-run safely (T10).
+     * be re-run safely (T10). P2: each quarantined item also gets a
+     * durable per-item record ([QuarantineRecord]) in the same
+     * transaction as the phase marker, and items imported by this
+     * run resolve any earlier quarantine record for their key.
      */
     suspend fun drain(inspector: LegacyQueueInspector, nowMs: Long): DrainResult {
         val mode = getMode()
@@ -542,21 +692,47 @@ class CutoverCoordinator(
                 error = verification.detail,
             )
         }
-        if (marker.phase == "draining") {
-            val drained = marker.copy(
-                phase = "drained",
-                snapshotCount = snapshot.items.size,
-                snapshotChecksum = snapshot.checksum,
-                importableCount = partitioned.importable.size,
-                importableChecksum = partitioned.importableChecksum,
-                quarantinedCount = partitioned.quarantined.size,
-                quarantineChecksum = partitioned.quarantineChecksum,
-                importedCount = report.deliveriesImported,
-                verified = true,
-            )
-            transactions.run {
+        val quarantinedItems = partitioned.quarantined.map {
+            QuarantinedItemInfo(it.qkey, it.dedupeKey, LegacyQueueMigration.quarantineReasonFor(it))
+        }
+        transactions.run {
+            if (marker.phase == "draining") {
+                val drained = marker.copy(
+                    phase = "drained",
+                    snapshotCount = snapshot.items.size,
+                    snapshotChecksum = snapshot.checksum,
+                    importableCount = partitioned.importable.size,
+                    importableChecksum = partitioned.importableChecksum,
+                    quarantinedCount = partitioned.quarantined.size,
+                    quarantineChecksum = partitioned.quarantineChecksum,
+                    importedCount = report.deliveriesImported,
+                    verified = true,
+                )
                 stateDao.put(state(CollectorStateKeys.CUTOVER_IMPORT, drained.toJson().toString(), nowMs))
             }
+            // P2: the per-item quarantine records are written in the
+            // same transaction as the marker, so the aggregate and
+            // the per-item accounting commit or roll back together.
+            // A re-run drain (phase "drained") names a FRESH fence
+            // for any NEW records: the marker still describes the
+            // first run, so a record written by the re-run (a capture
+            // that landed during DRAINING) must not join the
+            // marker's set — reconciliation would count it against
+            // the first run. Records from the first run are untouched
+            // (`putIfAbsent`) and keep the marker's fence.
+            val recordFenceId = if (marker.phase == "draining") {
+                marker.fenceId
+            } else {
+                UUID.randomUUID().toString()
+            }
+            writeQuarantineRecords(
+                partitioned.quarantined,
+                recordFenceId,
+                marker.drainGeneration,
+                QuarantineRecord.SOURCE_DRAIN,
+                nowMs,
+            )
+            resolveQuarantineRecords(partitioned.importable, nowMs)
         }
         var removed = 0
         var skippedHeld = 0
@@ -574,6 +750,7 @@ class CutoverCoordinator(
                     corrupt = report.corruptCount,
                     verified = true,
                     error = step.reason,
+                    quarantinedItems = quarantinedItems,
                 )
             }
         }
@@ -588,6 +765,7 @@ class CutoverCoordinator(
             corrupt = report.corruptCount,
             verified = true,
             error = null,
+            quarantinedItems = quarantinedItems,
         )
     }
 
@@ -619,6 +797,137 @@ class CutoverCoordinator(
             )
             stateDao.delete(CollectorStateKeys.SWEEP_FENCE_PREFIX + marker.fenceId)
             CutoverCommit.Success(CutoverMode.WORKER_ONLY, marker.drainGeneration)
+        }
+    }
+
+    /**
+     * Re-drains legacy-queue leftovers AFTER the `WORKER_ONLY` commit
+     * (R08, review 6011401446): captures that landed after the drain
+     * snapshot — or after `commitDraining`, unmarked by the preflight —
+     * sit in the legacy queue with the sender gated off and no Room
+     * delivery; without this they strand there forever. The re-drain
+     * reuses the drain's own path (snapshot → P9 partition →
+     * idempotent import → verify → sweep) under a FRESH sweep fence,
+     * so it is resumable and idempotent like the drain itself.
+     *
+     * Requires `WORKER_ONLY` mode and a verified `worker_only` phase
+     * marker. The marker is NOT touched: it stays the main drain's
+     * audit record (its snapshot/import counts describe the cutover
+     * drain, not this re-drain). The migration-clear record is
+     * likewise left alone; the per-item sweep records are the
+     * durable audit for re-drained removals.
+     *
+     * The caller MUST run the privacy preflight first (see
+     * [com.netter.paylist.privacy.CutoverPrivacyPreflight]): the
+     * fail-closed inspector quarantines never-preflighted items, so
+     * a re-drain without a preflight would leave exactly the items
+     * it is meant to rescue. Call under the sender lock, so no
+     * capture can land unmarked between the preflight and the
+     * re-drain snapshot.
+     *
+     * Safe to call repeatedly: a second run finds nothing importable
+     * and returns `ok` with zero counts. A failed run releases its
+     * fence; the next run installs a fresh one and resumes (sweep
+     * records make already-removed items a no-op).
+     */
+    suspend fun redrainLeftovers(inspector: LegacyQueueInspector, nowMs: Long): DrainResult {
+        val mode = getMode()
+        if (mode != CutoverMode.WORKER_ONLY) {
+            return DrainResult(false, 0, 0, 0, 0, 0, 0, false, "mode is $mode, expected WORKER_ONLY")
+        }
+        val marker = getPhaseMarker()
+        if (marker == null || marker.phase != "worker_only" || !marker.verified) {
+            return DrainResult(
+                false, 0, 0, 0, 0, 0, 0, false,
+                "no verified WORKER_ONLY cutover; run drain() + commitWorkerOnly first",
+            )
+        }
+        val fenceId = UUID.randomUUID().toString()
+        val generation = getDrainGeneration() ?: 0L
+        transactions.run {
+            stateDao.put(
+                state(
+                    CollectorStateKeys.SWEEP_FENCE_PREFIX + fenceId,
+                    SweepFence(fenceId, "legacy_queue_redrain", generation, nowMs)
+                        .toJson().toString(),
+                    nowMs,
+                ),
+            )
+        }
+        try {
+            val snapshot = migration.snapshot(queue.queueSnapshot(), nowMs)
+            val partitioned = migration.partition(snapshot, inspector)
+            val report = migration.import(partitioned, nowMs)
+            val verification = migration.verify(partitioned, queue.queueSnapshot(), nowMs)
+            if (!verification.ok) {
+                return DrainResult(
+                    ok = false,
+                    imported = report.deliveriesImported,
+                    removed = 0,
+                    skippedHeld = 0,
+                    quarantined = report.quarantinedExcluded,
+                    expiredSkipped = report.expiredSkipped,
+                    corrupt = report.corruptCount,
+                    verified = false,
+                    error = verification.detail,
+                )
+            }
+            val quarantinedItems = partitioned.quarantined.map {
+                QuarantinedItemInfo(it.qkey, it.dedupeKey, LegacyQueueMigration.quarantineReasonFor(it))
+            }
+            // P2: record this run's quarantined items (putIfAbsent —
+            // an item quarantined by the main drain keeps its
+            // original record and fence) and resolve the records of
+            // items this run imported (a never-preflighted item the
+            // main drain quarantined, rescued here after the
+            // preflight — its record stays as the audit trail, with
+            // resolution `imported`).
+            transactions.run {
+                writeQuarantineRecords(
+                    partitioned.quarantined,
+                    fenceId,
+                    generation,
+                    QuarantineRecord.SOURCE_REDRAIN,
+                    nowMs,
+                )
+                resolveQuarantineRecords(partitioned.importable, nowMs)
+            }
+            var removed = 0
+            var skippedHeld = 0
+            for (item in partitioned.importable) {
+                when (val step = sweepStep(item, fenceId, nowMs)) {
+                    SweepStepResult.Removed -> removed++
+                    SweepStepResult.SkippedHeld -> skippedHeld++
+                    is SweepStepResult.Failed -> return DrainResult(
+                        ok = false,
+                        imported = report.deliveriesImported,
+                        removed = removed,
+                        skippedHeld = skippedHeld,
+                        quarantined = report.quarantinedExcluded,
+                        expiredSkipped = report.expiredSkipped,
+                        corrupt = report.corruptCount,
+                        verified = true,
+                        error = step.reason,
+                        quarantinedItems = quarantinedItems,
+                    )
+                }
+            }
+            return DrainResult(
+                ok = true,
+                imported = report.deliveriesImported,
+                removed = removed,
+                skippedHeld = skippedHeld,
+                quarantined = report.quarantinedExcluded,
+                expiredSkipped = report.expiredSkipped,
+                corrupt = report.corruptCount,
+                verified = true,
+                error = null,
+                quarantinedItems = quarantinedItems,
+            )
+        } finally {
+            transactions.run {
+                stateDao.delete(CollectorStateKeys.SWEEP_FENCE_PREFIX + fenceId)
+            }
         }
     }
 
@@ -799,6 +1108,67 @@ class CutoverCoordinator(
             stateDao.delete(CollectorStateKeys.SWEEP_FENCE_PREFIX + item.dedupeKey)
         }
         return SweepStepResult.Removed
+    }
+
+    /**
+     * Writes durable per-item quarantine records for [quarantined]
+     * (P2), `putIfAbsent`: an existing record for the `dedupe_key`
+     * is never overwritten — the first quarantine event is the audit
+     * trail, and its fence still names the drain that quarantined
+     * the item. Call inside a Room transaction (the caller owns it).
+     */
+    private suspend fun writeQuarantineRecords(
+        quarantined: List<LegacyQueueItem>,
+        fenceId: String,
+        drainGeneration: Long,
+        source: String,
+        nowMs: Long,
+    ) {
+        for (item in quarantined) {
+            val key = CollectorStateKeys.QUARANTINE_RECORD_PREFIX + item.dedupeKey
+            if (readDoc(key) != null) continue
+            val record = QuarantineRecord(
+                dedupeKey = item.dedupeKey,
+                qkey = item.qkey,
+                reason = LegacyQueueMigration.quarantineReasonFor(item),
+                spanClasses = item.privacySpanClasses?.ifEmpty { null },
+                amount = if (item.payloadJson.has("amount")) item.payloadJson.optLong("amount") else null,
+                sourcePackage = item.payloadJson.optString("pkg").ifEmpty { null },
+                quarantinedAtMs = nowMs,
+                fenceId = fenceId,
+                drainGeneration = drainGeneration,
+                source = source,
+                resolution = null,
+                resolvedAtMs = null,
+            )
+            stateDao.put(state(key, record.toJson().toString(), nowMs))
+        }
+    }
+
+    /**
+     * Marks quarantine records resolved for items this run imported
+     * (P2): a never-preflighted item quarantined by the main drain
+     * and imported by a later re-drain keeps its record — with
+     * `resolution=imported` — as the audit trail of its recovery.
+     * Call inside a Room transaction (the caller owns it).
+     */
+    private suspend fun resolveQuarantineRecords(imported: List<LegacyQueueItem>, nowMs: Long) {
+        for (item in imported) {
+            val key = CollectorStateKeys.QUARANTINE_RECORD_PREFIX + item.dedupeKey
+            val doc = readDoc(key) ?: continue
+            val record = QuarantineRecord.fromJson(doc)
+            if (record.resolution != null) continue
+            stateDao.put(
+                state(
+                    key,
+                    record.copy(
+                        resolution = QuarantineRecord.RESOLUTION_IMPORTED,
+                        resolvedAtMs = nowMs,
+                    ).toJson().toString(),
+                    nowMs,
+                ),
+            )
+        }
     }
 
     /** Writes the step-(6) clear record from the durable sweep records (§8.2). */

@@ -456,3 +456,43 @@ object GateBackedInspector : LegacyQueueInspector {
             Inspection.IMPORTABLE
         }
 }
+
+/**
+ * Durable P9 gate: call under SenderLock before committing DRAINING —
+ * and again before a post-commit re-drain (R08): leftovers that
+ * arrived after the first preflight carry no markers, and the
+ * fail-closed inspector would quarantine them instead of importing.
+ */
+class CutoverPrivacyPreflight(
+    private val gate: LegacyQueuePrivacyGate = LegacyQueuePrivacyGate(),
+) {
+    data class Result(val ok: Boolean, val reason: String)
+
+    fun run(source: LegacyQueueSnapshotSource, nowMs: Long): Result {
+        val before = try {
+            source.queueSnapshot().map { it.optString("qkey") }
+        } catch (e: Exception) {
+            return Result(false, "queue_read_failed")
+        }
+        val report = try {
+            gate.reprocess(source, nowMs)
+        } catch (e: Exception) {
+            return Result(false, "inspection_exception")
+        }
+        if (!report.writeOk) return Result(false, "privacy_write_failed")
+        if (report.corrupt > 0) return Result(false, "corrupt_queue_items")
+        val after = try {
+            source.queueSnapshot()
+        } catch (e: Exception) {
+            return Result(false, "privacy_readback_failed")
+        }
+        if (after.map { it.optString("qkey") } != before) {
+            return Result(false, "queue_identity_changed")
+        }
+        if (after.any { !it.optBoolean(LegacyQueuePrivacyGate.KEY_REPROCESSED, false) &&
+                !it.optBoolean(LegacyQueuePrivacyGate.KEY_QUARANTINE, false) }) {
+            return Result(false, "privacy_marker_missing")
+        }
+        return Result(true, "verified")
+    }
+}
