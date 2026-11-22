@@ -129,6 +129,16 @@ jobs:
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
+      # KVM (2026-11-22): without this, the runner user cannot open
+      # /dev/kvm, the emulator falls back to "-accel off" and boot exceeds
+      # the 600s timeout (runs #17/#18, attempt 4). Documented
+      # android-emulator-runner prerequisite on Linux runners.
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
       - name: Run instrumented tests on emulator (API 28)
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -186,6 +196,16 @@ jobs:
       # `am instrument` invocations per phase through
       # scripts/process_death_tests.sh; the script exits non-zero
       # unless every PhaseB passes.
+      # KVM (2026-11-22): without this, the runner user cannot open
+      # /dev/kvm, the emulator falls back to "-accel off" and boot exceeds
+      # the 600s timeout (runs #17/#18, attempt 4). Documented
+      # android-emulator-runner prerequisite on Linux runners.
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
       - name: Run process-death tests on emulator (API 28)
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -226,6 +246,16 @@ jobs:
       # means the harness correctly FAILED the run (the control
       # works), non-zero means the run passed (the false-positive is
       # still open). This job is green only when the control works.
+      # KVM (2026-11-22): without this, the runner user cannot open
+      # /dev/kvm, the emulator falls back to "-accel off" and boot exceeds
+      # the 600s timeout (runs #17/#18, attempt 4). Documented
+      # android-emulator-runner prerequisite on Linux runners.
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
       - name: Run process-death negative control on emulator (API 28)
         uses: reactivecircus/android-emulator-runner@v2
         with:
