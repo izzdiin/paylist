@@ -139,6 +139,18 @@ data class LegacyQueueItem(
      */
     val privacyReprocessed: Boolean = false,
     val privacyQuarantined: Boolean = false,
+    /**
+     * The gate's quarantine reason code (P2: `ambiguous_span` /
+     * `pure_auth_no_financial_record`), set alongside
+     * `privacyQuarantined`. Null when the item was never quarantined
+     * by the gate. A stable code, never content.
+     */
+    val privacyQuarantineReason: String? = null,
+    /**
+     * The gate's span classes, comma-joined (audit, never content).
+     * Null when the item was never inspected.
+     */
+    val privacySpanClasses: String? = null,
 ) {
     companion object {
         /**
@@ -184,6 +196,8 @@ data class LegacyQueueItem(
                 hopOutcomesJson = hopOutcomes,
                 privacyReprocessed = o.optBoolean("privacy_reprocessed", false),
                 privacyQuarantined = o.optBoolean("privacy_quarantine", false),
+                privacyQuarantineReason = o.optString("privacy_quarantine_reason").ifEmpty { null },
+                privacySpanClasses = o.optString("privacy_span_classes").ifEmpty { null },
             )
         }
     }
@@ -272,7 +286,11 @@ data class VerifyResult(
  * `INSERT OR IGNORE` (idempotent by `qkey`), and verifies count +
  * `qkey` set + checksum. Quarantined legacy entries remain outside
  * Room and outside the worker, with a separately verified holding-pen
- * count.
+ * count — the quarantined PAYLOAD never enters Room. (P2: the
+ * coordinator additionally writes a durable per-item quarantine
+ * RECORD — identity + reason + financial metadata, never content —
+ * to `collector_state`, so each quarantined item stays individually
+ * visible and reconcilable after `WORKER_ONLY`.)
  */
 class LegacyQueueMigration(
     private val eventDao: EventDao,
@@ -313,9 +331,36 @@ class LegacyQueueMigration(
             return CanonicalJson.sha256Hex(serialised)
         }
 
+        /** Quarantine reason for an item that never went through the P9 gate (fail-closed, §7.7). */
+        const val REASON_NOT_PREFLIGHTED: String = "not_preflighted"
+
+        /** Quarantine reason when no gate verdict is recorded for the item. */
+        const val REASON_UNKNOWN: String = "unknown"
+
+        /**
+         * The durable quarantine reason for one quarantined item
+         * (P2): the gate's recorded reason when present,
+         * `not_preflighted` for an item that never went through the
+         * gate, `unknown` otherwise. The reason is part of the
+         * per-item quarantine record and of the quarantine checksum,
+         * so a reason change is a checksum change.
+         */
+        fun quarantineReasonFor(item: LegacyQueueItem): String =
+            item.privacyQuarantineReason?.ifEmpty { null }
+                ?: if (!item.privacyReprocessed) REASON_NOT_PREFLIGHTED else REASON_UNKNOWN
+
         /** Checksum over quarantine metadata: `qkey` + reason, sorted by `qkey`. */
-        fun quarantineChecksum(quarantined: List<LegacyQueueItem>): String {
-            val serialised = quarantined.sortedBy { it.qkey }.joinToString("\n") { it.qkey }
+        fun quarantineChecksum(quarantined: List<LegacyQueueItem>): String =
+            quarantineChecksumOf(quarantined.map { it.qkey to quarantineReasonFor(it) })
+
+        /**
+         * Checksum over (`qkey`, reason) pairs, sorted by `qkey` —
+         * the form the reconciliation reads back from the durable
+         * per-item records ([CutoverCoordinator.reconcileQuarantine]).
+         */
+        fun quarantineChecksumOf(entries: List<Pair<String, String>>): String {
+            val serialised = entries.sortedBy { it.first }
+                .joinToString("\n") { (qkey, reason) -> "$qkey|$reason" }
             return CanonicalJson.sha256Hex(serialised)
         }
 

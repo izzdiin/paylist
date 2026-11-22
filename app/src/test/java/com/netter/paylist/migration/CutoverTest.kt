@@ -1519,6 +1519,175 @@ class CutoverTest {
         )
     }
 
+    // =====================================================================
+    // P2 — quarantine reconciliation (review 6011401446): per-item
+    // durable records + marker reconciliation. The androidTest suite
+    // (QuarantineReconciliationTest) proves the same behaviour
+    // end-to-end over file-backed Room; these unit tests pin the
+    // mechanism on the JVM fakes.
+    // =====================================================================
+
+    @Test
+    fun p2_drainWritesPerItemQuarantineRecords_reconcileOk() = runBlocking {
+        val clean = queueItem(dedupeKey("p2a"))
+        val held = queueItem(dedupeKey("p2b"))
+        val heldQkey = held.optString("qkey")
+        val h = newHarness(listOf(clean, held))
+        val drain = h.fullCutover(inspectorFor(setOf(heldQkey)))
+        assertEquals(1, drain.imported)
+        assertEquals(1, drain.quarantined)
+        assertEquals(1, drain.quarantinedItems.size)
+        assertEquals(heldQkey, drain.quarantinedItems.single().qkey)
+        assertEquals(dedupeKey("p2b"), drain.quarantinedItems.single().dedupeKey)
+        // No gate markers on the fixture: the reason is fail-closed.
+        assertEquals(
+            LegacyQueueMigration.REASON_NOT_PREFLIGHTED,
+            drain.quarantinedItems.single().reason,
+        )
+
+        val marker = h.coordinator.getPhaseMarker()
+        assertNotNull(marker)
+        assertEquals(1, marker!!.quarantinedCount)
+        val records = h.coordinator.getQuarantineRecords()
+        assertEquals(1, records.size)
+        val record = records.single()
+        assertEquals(dedupeKey("p2b"), record.dedupeKey)
+        assertEquals(heldQkey, record.qkey)
+        assertEquals(LegacyQueueMigration.REASON_NOT_PREFLIGHTED, record.reason)
+        assertNull(record.spanClasses)
+        assertEquals(100_800L, record.amount)
+        assertEquals("com.gojek.gopaymerchant", record.sourcePackage)
+        assertEquals(QuarantineRecord.SOURCE_DRAIN, record.source)
+        assertEquals(marker.fenceId, record.fenceId)
+        assertEquals(marker.drainGeneration, record.drainGeneration)
+        assertNull(record.resolution)
+
+        val reconciliation = h.coordinator.reconcileQuarantine()
+        assertNotNull(reconciliation)
+        assertTrue("marker and records must reconcile", reconciliation!!.ok)
+        assertEquals(1, reconciliation.markerQuarantinedCount)
+        assertEquals(1, reconciliation.recordCount)
+        assertEquals(1, reconciliation.unresolvedCount)
+        assertEquals(0, reconciliation.resolvedCount)
+        assertTrue(reconciliation.countsMatch)
+        assertTrue(reconciliation.checksumMatches)
+    }
+
+    @Test
+    fun p2_redrainResolvesQuarantineRecord_markerStillReconciles() = runBlocking {
+        val dedupe = dedupeKey("p2res")
+        val item = queueItem(dedupe)
+        val qkey = item.optString("qkey")
+        val h = newHarness(listOf(item))
+        h.fullCutover(inspectorFor(setOf(qkey)))
+        val before = h.coordinator.getQuarantineRecords()
+        assertEquals(1, before.size)
+        assertNull(before.single().resolution)
+
+        // The preflight marks the item; the re-drain imports it.
+        val marked = queueItem(dedupe).apply {
+            put(LegacyQueuePrivacyGate.KEY_REPROCESSED, true)
+            put(LegacyQueuePrivacyGate.KEY_REPROCESSED_AT_MS, NOW)
+        }
+        assertTrue(h.queue.saveQueueSync(listOf(marked)))
+        val redrained = h.coordinator.redrainLeftovers(GateBackedInspector, NOW)
+        assertTrue("redrain must succeed: ${redrained.error}", redrained.ok)
+        assertEquals(1, redrained.imported)
+        assertEquals(1, redrained.removed)
+
+        // The record stays as the audit trail — resolved, not deleted —
+        // and the marker still reconciles against it.
+        val after = h.coordinator.getQuarantineRecords()
+        assertEquals(1, after.size)
+        assertEquals(QuarantineRecord.RESOLUTION_IMPORTED, after.single().resolution)
+        assertNotNull(after.single().resolvedAtMs)
+        val reconciliation = h.coordinator.reconcileQuarantine()
+        assertNotNull(reconciliation)
+        assertTrue("marker and records must still reconcile", reconciliation!!.ok)
+        assertEquals(1, reconciliation.recordCount)
+        assertEquals(0, reconciliation.unresolvedCount)
+        assertEquals(1, reconciliation.resolvedCount)
+    }
+
+    @Test
+    fun p2_quarantineChecksumCoversReason() {
+        fun quarantinedItem(reason: String): LegacyQueueItem {
+            val json = queueItem(dedupeKey("p2cs")).apply {
+                put("privacy_quarantine", true)
+                put("privacy_quarantine_reason", reason)
+            }
+            return LegacyQueueItem.fromJson(json)!!
+        }
+        val ambiguous = quarantinedItem(LegacyQueuePrivacyGate.REASON_AMBIGUOUS)
+        val pureAuth = quarantinedItem(LegacyQueuePrivacyGate.REASON_PURE_AUTH)
+        val ambiguousAgain = quarantinedItem(LegacyQueuePrivacyGate.REASON_AMBIGUOUS)
+        // Same qkey, different reason: a different checksum — the
+        // reason is part of the quarantined-set identity.
+        assertNotEquals(
+            LegacyQueueMigration.quarantineChecksum(listOf(ambiguous)),
+            LegacyQueueMigration.quarantineChecksum(listOf(pureAuth)),
+        )
+        assertEquals(
+            LegacyQueueMigration.quarantineChecksum(listOf(ambiguous)),
+            LegacyQueueMigration.quarantineChecksum(listOf(ambiguousAgain)),
+        )
+        // Reason derivation: the stored gate reason wins; an
+        // uninspected item is `not_preflighted`; a marked item with
+        // no recorded reason is `unknown`.
+        assertEquals(
+            LegacyQueuePrivacyGate.REASON_AMBIGUOUS,
+            LegacyQueueMigration.quarantineReasonFor(ambiguous),
+        )
+        val uninspected = LegacyQueueItem.fromJson(queueItem(dedupeKey("p2cs2")))!!
+        assertEquals(
+            LegacyQueueMigration.REASON_NOT_PREFLIGHTED,
+            LegacyQueueMigration.quarantineReasonFor(uninspected),
+        )
+        val markedNoReason = LegacyQueueItem.fromJson(
+            queueItem(dedupeKey("p2cs3")).apply {
+                put(LegacyQueuePrivacyGate.KEY_REPROCESSED, true)
+            },
+        )!!
+        assertEquals(
+            LegacyQueueMigration.REASON_UNKNOWN,
+            LegacyQueueMigration.quarantineReasonFor(markedNoReason),
+        )
+    }
+
+    @Test
+    fun p2_quarantineRecordJsonRoundTrip() {
+        val full = QuarantineRecord(
+            dedupeKey = dedupeKey("p2rt"),
+            qkey = "qkey-p2rt",
+            reason = LegacyQueuePrivacyGate.REASON_AMBIGUOUS,
+            spanClasses = "AMBIGUOUS_CODE",
+            amount = 100_800L,
+            sourcePackage = "com.gojek.gopaymerchant",
+            quarantinedAtMs = NOW,
+            fenceId = "fence-1",
+            drainGeneration = 2L,
+            source = QuarantineRecord.SOURCE_DRAIN,
+            resolution = QuarantineRecord.RESOLUTION_IMPORTED,
+            resolvedAtMs = NOW + 1_000L,
+        )
+        assertEquals(full, QuarantineRecord.fromJson(full.toJson()))
+        val minimal = QuarantineRecord(
+            dedupeKey = dedupeKey("p2rt2"),
+            qkey = "qkey-p2rt2",
+            reason = LegacyQueueMigration.REASON_NOT_PREFLIGHTED,
+            spanClasses = null,
+            amount = null,
+            sourcePackage = null,
+            quarantinedAtMs = NOW,
+            fenceId = "fence-2",
+            drainGeneration = 1L,
+            source = QuarantineRecord.SOURCE_REDRAIN,
+            resolution = null,
+            resolvedAtMs = null,
+        )
+        assertEquals(minimal, QuarantineRecord.fromJson(minimal.toJson()))
+    }
+
     /**
      * Locates `src/main/java` for the static checks (F27/F54).
      * Tries the module dir, then the project root, then walks up

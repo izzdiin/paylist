@@ -15,6 +15,7 @@ import com.netter.paylist.migration.CutoverMode
 import com.netter.paylist.migration.FlushResult
 import com.netter.paylist.migration.LegacyQueueMigration
 import com.netter.paylist.migration.LegacyQueueSnapshotSource
+import com.netter.paylist.migration.QuarantinedItemInfo
 import com.netter.paylist.privacy.GateBackedInspector
 import com.netter.paylist.privacy.CutoverPrivacyPreflight
 import com.netter.paylist.security.SecretVault
@@ -299,6 +300,7 @@ class PaylistApplication : Application(), Configuration.Provider {
         val summary = "Pengiriman baru aktif: ${drained.imported} item dimigrasikan, " +
             "${drained.quarantined} dikarantina (privasi), ${drained.corrupt} rusak dilewati."
         store.logLocal("cutover selesai: $summary")
+        logQuarantinedItems(drained.quarantinedItems)
         if (leftover > 0) {
             // R08: captures that landed after the drain snapshot (or
             // after commitDraining, unmarked by the preflight) would
@@ -308,6 +310,23 @@ class PaylistApplication : Application(), Configuration.Provider {
             store.logLocal(redrainLeftoversAfterCommit(queueSource))
         }
         return summary
+    }
+
+    /**
+     * Logs one line per quarantined item (P2): the aggregate count
+     * in the summary cannot be acted on — the operator needs the
+     * `dedupe_key` + reason per item. Capped at 10 lines; the
+     * durable per-item records in Room hold the full set.
+     */
+    private fun logQuarantinedItems(items: List<QuarantinedItemInfo>) {
+        if (items.isEmpty()) return
+        val shown = items.take(10)
+        for (item in shown) {
+            store.logLocal("cutover karantina: ${item.dedupeKey} (${item.reason})")
+        }
+        if (items.size > shown.size) {
+            store.logLocal("cutover karantina: dan ${items.size - shown.size} item lain")
+        }
     }
 
     /**
@@ -353,6 +372,7 @@ class PaylistApplication : Application(), Configuration.Provider {
                 return "PERHATIAN $msg"
             }
             if (redrained.imported > 0) SyncScheduler.requestSync(this)
+            logQuarantinedItems(redrained.quarantinedItems)
             val remaining = store.queueSnapshot().size
             return "cutover redrain: ${redrained.imported} item tersisa dimigrasikan " +
                 "(${redrained.removed} dihapus dari antrean, " +
