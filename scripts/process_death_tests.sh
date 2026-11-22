@@ -36,8 +36,17 @@
 #   2. the durable r06 marker exists and is well-formed
 #      ("a-complete pid=<pid> start=<startTicks>") — PhaseA's setUp
 #      clears the prefs, so a marker found after the run was written
-#      by THIS PhaseA run; when a process is still alive its PID (and
-#      start time, when readable) must match the marker;
+#      by THIS PhaseA run. For a PROCESS STILL ALIVE verdict the
+#      marker is additionally cross-checked against the live process
+#      (PID + start time, when readable); for RETURNED NORMALLY it
+#      is NOT — after `am instrument` returns, the test process may
+#      exit normally and the app may restart under a new PID, so a
+#      live cross-check there is timing-dependent (CI run #22 failed
+#      exactly this way: marker pid 3079 vs live 3109 on a
+#      legitimate no-kill run; re-run #23 passed the same code).
+#      This deviates from the literal wording of re-review #4, which
+#      asked for a PID/start-time match for RETURNED NORMALLY too;
+#      the reason is recorded here and in the commit message.
 #   3. a PhaseB failure counts as the second catch ONLY when it is the
 #      expected fresh-process assertion; a missing-marker, recovery
 #      assertion, or infrastructure failure makes the run INVALID.
@@ -234,42 +243,58 @@ proc_start_ticks() {
   printf '%s' "$rest" | awk '{print $20}'
 }
 
-# Verifies the control marker for scenario $1. Exits 1 (INVALID) when
-# the marker is missing/malformed, or when a still-alive process does
-# not match the recorded identity. When no process is alive the
-# existence + well-formedness of the marker is the evidence (PhaseA's
-# setUp cleared the prefs, so it can only be this run's marker).
-# Must run BEFORE PhaseB: PhaseB's tearDown clears the marker.
+# Verifies the control marker for scenario $1: it must exist and be
+# well-formed. Must run BEFORE PhaseB: PhaseB's tearDown clears the
+# marker. This is the WHOLE check for a RETURNED NORMALLY verdict:
+# after `am instrument` returns, the test process may exit normally
+# and the app may restart under a new PID, so a live-process
+# cross-check would be timing-dependent (CI run #22: marker pid 3079
+# vs live 3109 — a legitimate no-kill run failed as INVALID; re-run
+# #23 passed the same code). PhaseA's setUp clears the prefs, so a
+# well-formed marker found after the run was written by THIS PhaseA
+# run — that is the evidence for a normal return.
 verify_control_marker() {
   local scenario="$1"
   if ! read_control_marker "$scenario"; then
     echo "NEGATIVE CONTROL: INVALID — no well-formed PhaseA marker found for $scenario (PhaseA did not reach its marker; a no-kill verdict without a marker cannot demonstrate no-kill detection)."
     exit 1
   fi
+  echo "MARKER VERIFIED: $scenario marker pid=$MARKER_PID start=$MARKER_START"
+}
+
+# Cross-checks the marker identity (read by verify_control_marker)
+# against the live process. Only meaningful for a PROCESS STILL ALIVE
+# verdict, where the process is by definition still running: its PID
+# must be among the live PIDs and its start time must match the
+# marker (PID-reuse guard). When the process has exited between the
+# verdict and this check, the marker evidence above stands.
+verify_marker_live_identity() {
   local alive
   alive=$(adb shell pidof "$APP_PKG" 2>/dev/null || true)
-  if [ -n "$alive" ]; then
-    case " $alive " in
-      *" $MARKER_PID "*)
-        ;;
-      *)
-        echo "NEGATIVE CONTROL: INVALID — marker pid ($MARKER_PID) is not among the live $APP_PKG processes ($alive); the marker is stale or belongs to another process."
-        exit 1
-        ;;
-    esac
-    # Start-time cross-check (PID reuse guard), mirroring the test's
-    # own fallback: when the live start time cannot be read, the PID
-    # match above is the evidence.
-    if [ "$MARKER_START" != "-1" ]; then
-      local live_start
-      live_start=$(proc_start_ticks "$MARKER_PID")
-      if [ -n "$live_start" ] && [ "$live_start" != "$MARKER_START" ]; then
-        echo "NEGATIVE CONTROL: INVALID — marker start time ($MARKER_START) does not match the live process start time ($live_start); PID reuse suspected."
-        exit 1
-      fi
+  if [ -z "$alive" ]; then
+    echo "MARKER LIVE CHECK SKIPPED: no live $APP_PKG process (exited after the verdict); marker evidence stands"
+    return 0
+  fi
+  case " $alive " in
+    *" $MARKER_PID "*)
+      ;;
+    *)
+      echo "NEGATIVE CONTROL: INVALID — marker pid ($MARKER_PID) is not among the live $APP_PKG processes ($alive); the marker is stale or belongs to another process."
+      exit 1
+      ;;
+  esac
+  # Start-time cross-check (PID reuse guard), mirroring the test's
+  # own fallback: when the live start time cannot be read, the PID
+  # match above is the evidence.
+  if [ "$MARKER_START" != "-1" ]; then
+    local live_start
+    live_start=$(proc_start_ticks "$MARKER_PID")
+    if [ -n "$live_start" ] && [ "$live_start" != "$MARKER_START" ]; then
+      echo "NEGATIVE CONTROL: INVALID — marker start time ($MARKER_START) does not match the live process start time ($live_start); PID reuse suspected."
+      exit 1
     fi
   fi
-  echo "MARKER VERIFIED: $scenario marker pid=$MARKER_PID start=$MARKER_START"
+  echo "MARKER LIVE IDENTITY VERIFIED: pid=$MARKER_PID start=$MARKER_START among live ($alive)"
 }
 
 if [ "$negative_control" -eq 1 ]; then
@@ -281,7 +306,12 @@ if [ "$negative_control" -eq 1 ]; then
   # re-review #4): the control passes only when the runner classifies
   # PhaseA as a no-kill — RETURNED NORMALLY (rc == 0, exactly
   # "OK (1 test)") or PROCESS STILL ALIVE — AND the durable r06
-  # marker exists, is well-formed, and matches the PhaseA process.
+  # marker exists and is well-formed. A PROCESS STILL ALIVE verdict
+  # additionally requires the marker identity to match the live
+  # process; a RETURNED NORMALLY verdict does not (the test process
+  # may exit normally and the app may restart under a new PID —
+  # CI run #22 vs re-run #23 proved a live cross-check there is
+  # timing-dependent).
   # Any other PhaseA failure (TIMEOUT, ASSERTION FAILURE,
   # INCONSISTENT RUN, NO SINGLE-TEST PASS) means the control
   # scenario itself did not run as designed, so the job is INVALID,
@@ -292,10 +322,17 @@ if [ "$negative_control" -eq 1 ]; then
   control_caught=""
   if ! run_phase_a "$method_a"; then
     case "$PHASE_A_VERDICT" in
-      "RETURNED NORMALLY"*|"PROCESS STILL ALIVE"*)
-        # The no-kill verdict is only valid with marker evidence —
-        # verified BEFORE PhaseB runs (its tearDown clears the marker).
+      "RETURNED NORMALLY"*)
+        # Marker existence + well-formedness only — verified BEFORE
+        # PhaseB runs (its tearDown clears the marker).
         verify_control_marker "r06"
+        control_caught="runner: $PHASE_A_VERDICT (marker pid=$MARKER_PID start=$MARKER_START)"
+        ;;
+      "PROCESS STILL ALIVE"*)
+        # The process is still running by definition: the marker
+        # must also match the live process identity.
+        verify_control_marker "r06"
+        verify_marker_live_identity
         control_caught="runner: $PHASE_A_VERDICT (marker pid=$MARKER_PID start=$MARKER_START)"
         ;;
       *)
