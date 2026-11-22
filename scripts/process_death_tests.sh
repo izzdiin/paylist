@@ -147,9 +147,27 @@ if [ "$negative_control" -eq 1 ]; then
   method_b="${NEGATIVE_CONTROL##*:}"
   echo "== NEGATIVE CONTROL: PhaseA writes the marker but does NOT kill =="
   echo "== (the harness must FAIL this run; a pass means the false-positive is still open) =="
+  # The pass predicate is SPECIFIC (re-review #3): the control passes only
+  # when the runner classifies PhaseA as a no-kill — RETURNED NORMALLY
+  # (clean OK, method completed, marker written) or PROCESS STILL ALIVE
+  # (abnormal exit but the process never died). Any other PhaseA failure
+  # (TIMEOUT, ASSERTION FAILURE) means the control scenario itself did not
+  # run as designed, so the job is INVALID, not passed. A PhaseB failure
+  # alone likewise cannot pass the control: it proves nothing about
+  # no-kill detection. PhaseB still runs as a second, independent catch
+  # (fresh-PID check) and its failure is reported when PhaseA already
+  # caught the no-kill.
   control_caught=""
   if ! run_phase_a "$method_a"; then
-    control_caught="runner: $PHASE_A_VERDICT"
+    case "$PHASE_A_VERDICT" in
+      "RETURNED NORMALLY"*|"PROCESS STILL ALIVE"*)
+        control_caught="runner: $PHASE_A_VERDICT"
+        ;;
+      *)
+        echo "NEGATIVE CONTROL: INVALID — PhaseA failed for an unrelated reason ($PHASE_A_VERDICT); the no-kill scenario did not run as designed, so this run cannot demonstrate no-kill detection."
+        exit 1
+        ;;
+    esac
   fi
   # Run PhaseB anyway: if the system reused PhaseA's still-alive
   # process, the fresh-PID check is a second, independent catch.
@@ -157,7 +175,8 @@ if [ "$negative_control" -eq 1 ]; then
     if [ -n "$control_caught" ]; then
       control_caught="$control_caught; PhaseB: $PHASE_B_VERDICT"
     else
-      control_caught="PhaseB: $PHASE_B_VERDICT"
+      echo "NEGATIVE CONTROL: INVALID — PhaseB failed ($PHASE_B_VERDICT) but PhaseA did not catch a no-kill (runner: $PHASE_A_VERDICT); a PhaseB failure alone cannot demonstrate no-kill detection."
+      exit 1
     fi
   fi
   if [ -n "$control_caught" ]; then
