@@ -50,6 +50,29 @@ class PaylistApplication : Application(), Configuration.Provider {
          * new payments from delivering at all.
          */
         const val CAPTURE_TO_ROOM_READY: Boolean = false
+
+        /**
+         * The production mode gate over [coordinator]: the legacy
+         * sender may start a POST only while the coordinator's mode
+         * is `LEGACY_ONLY`, read fresh on every check. Fail-closed:
+         * any read failure denies the POST (a post during `DRAINING`
+         * would race the drain); the next flush retries the read.
+         *
+         * The R06 contention tests build their gate with this same
+         * factory over their file-backed coordinator, so the gate
+         * under test is the production gate, not a copy of it.
+         */
+        fun productionModeGate(coordinator: CutoverCoordinator): ModeGate =
+            ModeGate {
+                try {
+                    runBlocking { coordinator.getMode() } == CutoverMode.LEGACY_ONLY
+                } catch (e: Exception) {
+                    // Fail closed: without a mode read, the legacy sender
+                    // must not post (a post during DRAINING would race
+                    // the drain). The next flush retries the read.
+                    false
+                }
+            }
     }
 
     /** This process's boot identity (fresh UUID per process start). */
@@ -59,18 +82,7 @@ class PaylistApplication : Application(), Configuration.Provider {
 
     val store: Store by lazy { Store(this) }
 
-    val modeGate: ModeGate by lazy {
-        ModeGate {
-            try {
-                runBlocking { coordinator.getMode() } == CutoverMode.LEGACY_ONLY
-            } catch (e: Exception) {
-                // Fail closed: without a mode read, the legacy sender
-                // must not post (a post during DRAINING would race
-                // the drain). The next flush retries the read.
-                false
-            }
-        }
-    }
+    val modeGate: ModeGate by lazy { productionModeGate(coordinator) }
 
     val coordinator: CutoverCoordinator by lazy {
         val transactions = db.transactionRunner()

@@ -506,10 +506,11 @@ class CutoverEndToEndTest {
         seedQueue(listOf(chainQueueItem(payload, ROUTES)))
         val coordinator = newCoordinator(storeQueueSource())
         val transport = FakeTransport()
-        // The production mode gate: the sender reads the coordinator's mode.
+        // The production mode gate (via the shared factory), over the
+        // test's file-backed coordinator.
         val sender = Sender(
             ctx,
-            ModeGate { runBlocking { coordinator.getMode() } == CutoverMode.LEGACY_ONLY },
+            PaylistApplication.productionModeGate(coordinator),
             ToggleSecrets(SecretResult.Present("s3cr3t")),
             transport,
         )
