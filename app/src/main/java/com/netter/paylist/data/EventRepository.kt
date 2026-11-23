@@ -162,10 +162,22 @@ class EventRepository(
     suspend fun getEventByDedupeKey(dedupeKey: String): EventEntity? =
         eventDao.getByDedupeKey(dedupeKey)
 
+    /**
+     * Deletes one staging row (Stage D capture path): called after
+     * the legacy enqueue proves the item durable (`saveQueueSync` +
+     * readback), and by the staging sweep for already-promoted
+     * rows. Returns true when a row was deleted.
+     */
+    suspend fun deleteStagingRow(qkey: String): Boolean =
+        captureStagingDao.deleteByLegacyQkey(qkey) == 1
+
     suspend fun getEventById(eventId: String): EventEntity? = eventDao.getById(eventId)
 
     suspend fun getDeliveryByQkey(qkey: String): DeliveryEntity? =
         deliveryDao.getByLegacyQkey(qkey)
+
+    suspend fun getDeliveriesByEventId(eventId: String): List<DeliveryEntity> =
+        deliveryDao.getByEventId(eventId)
 
     suspend fun getStagingRows(dedupeKey: String): List<CaptureStagingEntity> =
         captureStagingDao.getByDedupeKey(dedupeKey)
