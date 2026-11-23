@@ -442,4 +442,86 @@ class CaptureCoordinatorTest {
         assertEquals(100800L, tokens.getJSONObject(0).optLong("value"))
         assertEquals(50000L, tokens.getJSONObject(1).optLong("value"))
     }
+
+    // --- D→E gate acceptance (design §10.1): T13 / T23 / T24 ---
+
+    /**
+     * T23: the same notification through live + rescan with the
+     * PrivacyGate active yields an identical `dedupe_key`. The
+     * notification carries an OTP the gate redacts — if dedupe
+     * ran on redacted text, the key would differ from the key
+     * computed from the original text.
+     */
+    @Test
+    fun t23_dedupeKey_liveVsRescan_identicalWithPrivacyGate() = runBlocking {
+        mode = CutoverMode.WORKER_ONLY
+        val otpText = "Pembayaran Rp100.800 berhasil. Kode OTP 482913 untuk verifikasi"
+        // Live capture, then the rescan path re-captures the same
+        // notification (both funnel into coordinator.capture()).
+        captureAndWait(snapshot(text = otpText))
+        captureAndWait(snapshot(text = otpText))
+
+        assertEquals(1, eventDao.count())
+        assertEquals(1, coordinator.counters().duplicates)
+        val expected = CaptureCoordinator.legacyDedupeKey(
+            PKG, POST_TIME, 100800L, snapshot(text = otpText).combined,
+        )
+        val event = eventDao.getByDedupeKey(expected)
+        assertNotNull("dedupe_key must be computed from the original text", event)
+        assertEquals(expected, event!!.dedupeKey)
+        // And the OTP never reached the stored payload.
+        assertFalse(event.legacyPayloadJson!!.contains("482913"))
+    }
+
+    /**
+     * T24: direction is classified correctly after PrivacyGate
+     * redaction. The direction cue ("Pembayaran" → OUT) is read
+     * from the pre-gate text and stored alongside the redacted
+     * text, so a recorder route's direction heuristic keeps
+     * working on the §7.2 constructed text.
+     */
+    @Test
+    fun t24_direction_classifiedCorrectlyAfterRedaction() = runBlocking {
+        mode = CutoverMode.WORKER_ONLY
+        captureAndWait(
+            snapshot(text = "Pembayaran Rp100.800 berhasil. Kode OTP 482913 untuk verifikasi"),
+        )
+
+        val dedupe = CaptureCoordinator.legacyDedupeKey(
+            PKG, POST_TIME, 100800L,
+            snapshot(text = "Pembayaran Rp100.800 berhasil. Kode OTP 482913 untuk verifikasi").combined,
+        )
+        val event = eventDao.getByDedupeKey(dedupe)
+        assertNotNull(event)
+        val payload = JSONObject(event!!.legacyPayloadJson!!)
+        assertEquals("out", payload.optString("direction"))
+        assertFalse(payload.optString("text").contains("482913"))
+        assertTrue(payload.optString("text").contains("[REDACTED]"))
+    }
+
+    /**
+     * T13 (notification update): the same notification key, edited
+     * text (same amount, same postTime, trailing change past
+     * char 40) — defined behaviour is the §3 R11 collision: the
+     * first event is kept, no second payment is claimed.
+     */
+    @Test
+    fun t13_notificationUpdate_sameKeyEditedText_noSecondClaim() = runBlocking {
+        mode = CutoverMode.WORKER_ONLY
+        captureAndWait(snapshot())
+        // Same key ("key-$POST_TIME"), same first-40-chars prefix,
+        // different trailing text: an edited re-post of the same
+        // notification, not a new payment.
+        val updated = snapshot(
+            text = "Pembayaran Rp100.800 berhasil. Catatan lain yang berbeda total",
+        )
+        val dedupe1 = CaptureCoordinator.legacyDedupeKey(PKG, POST_TIME, 100800L, snapshot().combined)
+        val dedupe2 = CaptureCoordinator.legacyDedupeKey(PKG, POST_TIME, 100800L, updated.combined)
+        assertEquals("test setup must produce the same dedupe_key", dedupe1, dedupe2)
+        captureAndWait(updated)
+
+        assertEquals(1, eventDao.count())
+        assertEquals(1, store.deliveries.size)
+        assertEquals(1, coordinator.counters().identityCollision)
+    }
 }
