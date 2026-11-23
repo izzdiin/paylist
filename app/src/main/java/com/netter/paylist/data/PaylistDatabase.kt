@@ -10,6 +10,7 @@ import androidx.room.withTransaction
 import com.netter.paylist.core.model.DeliveryKind
 import com.netter.paylist.core.model.DeliveryState
 import com.netter.paylist.data.dao.AttemptDao
+import com.netter.paylist.data.dao.CaptureLogDao
 import com.netter.paylist.data.dao.CollectorStateDao
 import com.netter.paylist.data.dao.DeliveryDao
 import com.netter.paylist.data.dao.EventDao
@@ -18,6 +19,7 @@ import com.netter.paylist.data.dao.MatchResultDao
 import com.netter.paylist.data.dao.OrderRegistryDao
 import com.netter.paylist.data.dao.RegistryImportMetadataDao
 import com.netter.paylist.data.entity.AttemptState
+import com.netter.paylist.data.entity.CaptureLogEntity
 import com.netter.paylist.data.entity.CaptureStagingDao
 import com.netter.paylist.data.entity.CaptureStagingEntity
 import com.netter.paylist.data.entity.ClassificationDao
@@ -73,17 +75,21 @@ object PaylistConverters {
 }
 
 /**
- * The Room database (design §4, schema v1): `paylist-outbox`.
+ * The Room database (design §4, schema v2): `paylist-outbox`.
  *
  * Schema v1 is a fresh database — there is no Room-to-Room migration
  * in v1.1. `fallbackToDestructiveMigration()` is FORBIDDEN (design
  * §4): future migrations must be explicit (`Migration(1, 2)` …) so
  * the outbox is never lost on upgrade.
  *
+ * v2 (Stage D D4, addendum 06 LH-04) adds the `capture_log` table
+ * ([MIGRATION_1_2], purely additive — no existing table touched).
+ *
  * Schema export is disabled for now (`exportSchema = false`): the
- * schema JSON location is build configuration, and no migration
- * exists yet to need it. Enabling schema export is a pre-release
- * (Stage E) item, before the first `Migration(1, 2)` is written.
+ * schema JSON location is build configuration, and the first
+ * migration is additive-only, so no schema diff is needed to prove
+ * it. Enabling schema export is a pre-release (Stage E) item, before
+ * any migration that alters an existing table.
  */
 @Database(
     entities = [
@@ -98,8 +104,9 @@ object PaylistConverters {
         ClassificationEntity::class,
         RegistryImportMetadataEntity::class,
         ExportAuditEntity::class,
+        CaptureLogEntity::class,
     ],
-    version = 1,
+    version = 2,
     exportSchema = false,
 )
 @TypeConverters(PaylistConverters::class)
@@ -115,6 +122,7 @@ abstract class PaylistDatabase : RoomDatabase() {
     abstract fun classificationDao(): ClassificationDao
     abstract fun registryImportMetadataDao(): RegistryImportMetadataDao
     abstract fun exportAuditDao(): ExportAuditDao
+    abstract fun captureLogDao(): CaptureLogDao
 
     /** A [TransactionRunner] backed by this database's transactions. */
     fun transactionRunner(): TransactionRunner = object : TransactionRunner {
@@ -128,6 +136,7 @@ abstract class PaylistDatabase : RoomDatabase() {
         /** Opens (or creates) the production database. Never destructive. */
         fun create(context: Context): PaylistDatabase =
             Room.databaseBuilder(context, PaylistDatabase::class.java, DATABASE_NAME)
+                .addMigrations(MIGRATION_1_2)
                 .build()
 
         /** In-memory database for instrumented tests. */

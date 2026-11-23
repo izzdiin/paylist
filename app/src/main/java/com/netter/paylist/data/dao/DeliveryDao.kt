@@ -82,6 +82,20 @@ interface DeliveryDao {
     @Query("SELECT * FROM deliveries WHERE state IN ('BLOCKED', 'RETRY_WAIT') ORDER BY updated_at_ms DESC LIMIT :limit")
     suspend fun getRecentProblematic(limit: Int): List<DeliveryEntity>
 
+    /**
+     * The §8.8 operator-reconciliation audit set (addendum 06
+     * LH-T07): deliveries whose server outcome needs operator
+     * attention — `last_apply_status` in {`skip`, `error`}, or
+     * ACKED with no apply status recorded (null-after-ACK, never
+     * assumed `'ok'`, §5.4).
+     */
+    @Query(
+        "SELECT * FROM deliveries WHERE last_apply_status IN ('skip', 'error') " +
+            "OR (state = 'ACKED' AND last_apply_status IS NULL) " +
+            "ORDER BY updated_at_ms DESC",
+    )
+    suspend fun getAuditSet(): List<DeliveryEntity>
+
     // --- Claim (one transaction: mode gate + consent join + lease) ---
 
     @Query("SELECT value_json FROM collector_state WHERE key = :key")

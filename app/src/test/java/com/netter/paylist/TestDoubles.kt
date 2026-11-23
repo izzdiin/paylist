@@ -4,6 +4,7 @@ import com.netter.paylist.core.model.DeliveryState
 import com.netter.paylist.data.TransactionRunner
 import com.netter.paylist.data.dao.AttemptDao
 import com.netter.paylist.data.dao.AttributionOutcome
+import com.netter.paylist.data.dao.CaptureLogDao
 import com.netter.paylist.data.dao.CollectorStateDao
 import com.netter.paylist.data.dao.DeliveryDao
 import com.netter.paylist.data.dao.DeliveryStateCount
@@ -12,6 +13,7 @@ import com.netter.paylist.data.dao.MatchResultDao
 import com.netter.paylist.data.dao.OrderRegistryDao
 import com.netter.paylist.data.dao.RegistryImportMetadataDao
 import com.netter.paylist.data.entity.AttemptState
+import com.netter.paylist.data.entity.CaptureLogEntity
 import com.netter.paylist.data.entity.CaptureStagingDao
 import com.netter.paylist.data.entity.CaptureStagingEntity
 import com.netter.paylist.data.entity.ClassificationDao
@@ -59,6 +61,8 @@ class FakeStore {
     val matchResults = LinkedHashMap<String, MatchResultEntity>()
     /** Keyed by `registry_version` (the PK). */
     val registryImports = LinkedHashMap<String, RegistryImportMetadataEntity>()
+    /** Durable capture log (LH-04), keyed by `capture_id`. */
+    val captureLog = LinkedHashMap<String, CaptureLogEntity>()
 
     data class Snapshot(
         val events: Map<String, EventEntity>,
@@ -74,6 +78,7 @@ class FakeStore {
         val registry: Map<String, OrderRegistryEntity>,
         val matchResults: Map<String, MatchResultEntity>,
         val registryImports: Map<String, RegistryImportMetadataEntity>,
+        val captureLog: Map<String, CaptureLogEntity>,
     )
 
     /** Entities are immutable data classes, so a shallow map copy is a full snapshot. */
@@ -91,6 +96,7 @@ class FakeStore {
         registry.toMap(),
         matchResults.toMap(),
         registryImports.toMap(),
+        captureLog.toMap(),
     )
 
     fun restore(s: Snapshot) {
@@ -107,6 +113,7 @@ class FakeStore {
         registry.clear(); registry.putAll(s.registry)
         matchResults.clear(); matchResults.putAll(s.matchResults)
         registryImports.clear(); registryImports.putAll(s.registryImports)
+        captureLog.clear(); captureLog.putAll(s.captureLog)
     }
 }
 
@@ -192,9 +199,39 @@ class FakeEventDao(private val store: FakeStore) : EventDao {
                 delivery.legacyQkey?.let { store.deliveriesByQkey.remove(it) }
                 store.attempts.entries.removeIf { it.value.deliveryId == delivery.deliveryId }
             }
+            // FK SET NULL on capture_log (mirrors the real schema).
+            for ((captureId, row) in store.captureLog.toMap()) {
+                if (row.eventId == event.eventId) {
+                    store.captureLog[captureId] = row.copy(eventId = null)
+                }
+            }
             deleted++
         }
         deleted
+    }
+
+    /**
+     * Per-record local deletion (LH-07(e)): cascades to deliveries
+     * + attempts (mirroring the FK CASCADE); linked capture-log
+     * rows are kept with `event_id` SET NULL (mirroring the FK
+     * SET NULL on `capture_log`).
+     */
+    override suspend fun deleteById(id: String): Int = store.lock.withLock {
+        val event = store.events.remove(id) ?: return@withLock 0
+        store.eventsByDedupe.remove(event.dedupeKey)
+        store.eventsByExportRef.remove(event.exportRef)
+        val eventDeliveries = store.deliveries.values.filter { it.eventId == id }
+        for (delivery in eventDeliveries) {
+            store.deliveries.remove(delivery.deliveryId)
+            delivery.legacyQkey?.let { store.deliveriesByQkey.remove(it) }
+            store.attempts.entries.removeIf { it.value.deliveryId == delivery.deliveryId }
+        }
+        for ((captureId, row) in store.captureLog.toMap()) {
+            if (row.eventId == id) {
+                store.captureLog[captureId] = row.copy(eventId = null)
+            }
+        }
+        1
     }
 }
 
@@ -236,6 +273,14 @@ class FakeDeliveryDao(private val store: FakeStore) : DeliveryDao {
             .filter { it.state == DeliveryState.BLOCKED || it.state == DeliveryState.RETRY_WAIT }
             .sortedByDescending { it.updatedAtMs }
             .take(limit)
+    }
+    override suspend fun getAuditSet(): List<DeliveryEntity> = store.lock.withLock {
+        store.deliveries.values
+            .filter {
+                it.lastApplyStatus == "skip" || it.lastApplyStatus == "error" ||
+                    (it.state == DeliveryState.ACKED && it.lastApplyStatus == null)
+            }
+            .sortedByDescending { it.updatedAtMs }
     }
 
     override suspend fun readCollectorValue(key: String): String? = store.lock.withLock { store.collector[key]?.valueJson }
@@ -808,5 +853,146 @@ class FakeRegistryImportMetadataDao(private val store: FakeStore) : RegistryImpo
         } finally {
             store.lock.unlock()
         }
+    }
+}
+
+/**
+ * Fake [CaptureLogDao] (Stage D D4): mirrors the real SQL filter
+ * semantics in Kotlin — date/amount ranges, package/outcome exact
+ * match, delivery-state + route via the current (non-superseded)
+ * deliveries, structured-field query (package substring or exact
+ * amount), `post_time_ms` DESC, LIMIT/OFFSET.
+ */
+class FakeCaptureLogDao(private val store: FakeStore) : CaptureLogDao {
+    override suspend fun insert(row: CaptureLogEntity): Long = store.lock.withLock {
+        if (store.captureLog.containsKey(row.captureId)) return@withLock -1L
+        store.captureLog[row.captureId] = row
+        1L
+    }
+
+    override suspend fun getById(id: String): CaptureLogEntity? =
+        store.lock.withLock { store.captureLog[id] }
+
+    override suspend fun listByEventId(eventId: String): List<CaptureLogEntity> =
+        store.lock.withLock {
+            store.captureLog.values
+                .filter { it.eventId == eventId }
+                .sortedByDescending { it.postTimeMs }
+        }
+
+    private fun currentDeliveries(eventId: String?): List<DeliveryEntity> {
+        if (eventId == null) return emptyList()
+        return store.deliveries.values.filter {
+            it.eventId == eventId &&
+                it.state != DeliveryState.DISCARDED && it.state != DeliveryState.EXPIRED
+        }
+    }
+
+    private fun matches(
+        row: CaptureLogEntity,
+        fromMs: Long?,
+        toMs: Long?,
+        minAmount: Long?,
+        maxAmount: Long?,
+        packageName: String?,
+        outcome: String?,
+        state: DeliveryState?,
+        routeId: String?,
+        query: String?,
+        matchStatus: String?,
+    ): Boolean {
+        if (fromMs != null && row.postTimeMs < fromMs) return false
+        if (toMs != null && row.postTimeMs > toMs) return false
+        if (minAmount != null && (row.amountMinor ?: Long.MIN_VALUE) < minAmount) return false
+        if (maxAmount != null && (row.amountMinor ?: Long.MAX_VALUE) > maxAmount) return false
+        if (packageName != null && row.sourcePackage != packageName) return false
+        if (outcome != null && row.outcome != outcome) return false
+        val joined = currentDeliveries(row.eventId)
+        if (state != null && joined.none { it.state == state }) return false
+        if (routeId != null && joined.none { it.routeIdsJson.contains("\"$routeId\"") }) return false
+        if (matchStatus != null && joined.none { it.lastMatchStatus == matchStatus }) return false
+        if (query != null) {
+            val packageHit = row.sourcePackage.contains(query, ignoreCase = true)
+            val amountHit = row.amountMinor?.toString() == query
+            if (!packageHit && !amountHit) return false
+        }
+        return true
+    }
+
+    override suspend fun listHistory(
+        fromMs: Long?,
+        toMs: Long?,
+        minAmount: Long?,
+        maxAmount: Long?,
+        packageName: String?,
+        outcome: String?,
+        state: DeliveryState?,
+        routeId: String?,
+        query: String?,
+        limit: Int,
+        offset: Int,
+        matchStatus: String?,
+    ): List<CaptureLogEntity> = store.lock.withLock {
+        store.captureLog.values
+            .filter {
+                matches(it, fromMs, toMs, minAmount, maxAmount, packageName, outcome, state, routeId, query, matchStatus)
+            }
+            .sortedByDescending { it.postTimeMs }
+            .drop(offset)
+            .take(limit)
+    }
+
+    override suspend fun countHistory(
+        fromMs: Long?,
+        toMs: Long?,
+        minAmount: Long?,
+        maxAmount: Long?,
+        packageName: String?,
+        outcome: String?,
+        state: DeliveryState?,
+        routeId: String?,
+        query: String?,
+        matchStatus: String?,
+    ): Int = store.lock.withLock {
+        store.captureLog.values.count {
+            matches(it, fromMs, toMs, minAmount, maxAmount, packageName, outcome, state, routeId, query, matchStatus)
+        }
+    }
+
+    override suspend fun distinctPackages(): List<String> = store.lock.withLock {
+        store.captureLog.values.map { it.sourcePackage }.distinct().sorted()
+    }
+
+    override suspend fun count(): Int = store.lock.withLock { store.captureLog.size }
+
+    override suspend fun countCollisionsFor(
+        packageName: String,
+        postTimeMs: Long,
+        amountMinor: Long?,
+    ): Int = store.lock.withLock {
+        store.captureLog.values.count {
+            it.outcome == "COLLISION" && it.sourcePackage == packageName &&
+                it.postTimeMs == postTimeMs && it.amountMinor == amountMinor
+        }
+    }
+
+    override suspend fun deleteById(id: String): Int = store.lock.withLock {
+        if (store.captureLog.remove(id) != null) 1 else 0
+    }
+
+    override suspend fun deleteUnlinkedOlderThan(cutoffMs: Long): Int = store.lock.withLock {
+        val doomed = store.captureLog.values.filter {
+            it.eventId == null && it.capturedAtMs < cutoffMs
+        }
+        doomed.forEach { store.captureLog.remove(it.captureId) }
+        doomed.size
+    }
+
+    override suspend fun deleteUnlinkedByOutcome(outcome: String): Int = store.lock.withLock {
+        val doomed = store.captureLog.values.filter {
+            it.eventId == null && it.outcome == outcome
+        }
+        doomed.forEach { store.captureLog.remove(it.captureId) }
+        doomed.size
     }
 }

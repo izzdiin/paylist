@@ -923,7 +923,8 @@ class SyncWorkerTest {
 
         val deleted = h.processor.runRetentionCleanup()
 
-        assertEquals(1, deleted)
+        assertEquals(1, deleted.heartbeatDeleted)
+        assertEquals(0, deleted.captureLogDeleted)
         assertNull(h.eventDao.getById(hb.eventId))
         assertNotNull(h.eventDao.getById(pay.eventId))
     }

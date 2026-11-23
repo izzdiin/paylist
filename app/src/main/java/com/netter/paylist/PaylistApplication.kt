@@ -21,6 +21,7 @@ import com.netter.paylist.delivery.SyncWorkerFactory
 import com.netter.paylist.migration.CutoverCommit
 import com.netter.paylist.migration.CutoverCoordinator
 import com.netter.paylist.migration.CutoverMode
+import com.netter.paylist.history.HistoryRepository
 import com.netter.paylist.migration.LegacyEnqueue
 import com.netter.paylist.migration.LegacyQkey
 import com.netter.paylist.migration.LegacyQueueMigration
@@ -147,6 +148,21 @@ class PaylistApplication : Application(), Configuration.Provider {
             privacyGate = privacyGate,
             rawSnapshotStore = rawSnapshotStore,
             consentStore = consentStore,
+            captureLogDao = db.captureLogDao(),
+        )
+    }
+
+    /**
+     * The Stage D D4 history read model (addendum 06, LH-01–LH-03):
+     * capture log + linked events/deliveries/attempts, in-app
+     * viewing only — no export capability (LH-07(c), F55).
+     */
+    val historyRepository: HistoryRepository by lazy {
+        HistoryRepository(
+            captureLogDao = db.captureLogDao(),
+            eventDao = db.eventDao(),
+            deliveryDao = db.deliveryDao(),
+            attemptDao = db.attemptDao(),
         )
     }
 

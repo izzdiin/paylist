@@ -7,6 +7,7 @@ import com.netter.paylist.core.model.DeliveryState
 import com.netter.paylist.core.model.RouteStamp
 import com.netter.paylist.data.TransactionRunner
 import com.netter.paylist.data.dao.AttemptDao
+import com.netter.paylist.data.dao.CaptureLogDao
 import com.netter.paylist.data.dao.DeliveryDao
 import com.netter.paylist.data.dao.EventDao
 import com.netter.paylist.data.entity.AttemptState
@@ -92,6 +93,12 @@ class DeliveryProcessor(
     private val recorderGatePassed: Boolean = false,
     /** Called when an authorised A′ fallback is dispatched (per-route counter). */
     private val onFallbackDispatched: (routeId: String) -> Unit = {},
+    /**
+     * Stage D D4: the durable capture log (LH-04/LH-06). Null skips
+     * capture-log cleanup (tests that predate D4); production
+     * always wires the real DAO.
+     */
+    private val captureLogDao: CaptureLogDao? = null,
 ) {
     companion object {
         /** Due deliveries per worker invocation (§5.4). */
@@ -105,6 +112,15 @@ class DeliveryProcessor(
 
         /** Heartbeat/test retention after terminal state (§4.2 C11). */
         const val RETENTION_MS = 30L * 24 * 60 * 60 * 1000
+
+        /**
+         * Unlinked capture-log retention (addendum 06 LH-06,
+         * LH-D1 = 90 days, owner decision 2026-11-23): unlinked
+         * rows (`event_id` NULL) are auto-deleted 90 days after
+         * `captured_at_ms`. Linked rows live with their event;
+         * payment events are never auto-deleted (C11).
+         */
+        const val UNLINKED_CAPTURE_LOG_RETENTION_MS = 90L * 24 * 60 * 60 * 1000
 
         /**
          * Retry-exhaustion policy (Stage C; the design pins the rule
@@ -174,9 +190,27 @@ class DeliveryProcessor(
         return deliveryDao.countDue(clock()) > 0
     }
 
-    /** Retention cleanup (periodic reconciliation only, §4.2 C11). */
-    suspend fun runRetentionCleanup(): Int =
-        eventDao.deleteExpiredHeartbeatTest(clock() - RETENTION_MS)
+    /** Result of one retention-cleanup run (C11 + LH-06). */
+    data class RetentionCleanupResult(
+        /** Heartbeat/test events deleted (30 days after terminal). */
+        val heartbeatDeleted: Int,
+        /** Unlinked capture-log rows deleted (90 days, LH-D1). */
+        val captureLogDeleted: Int,
+    )
+
+    /**
+     * Retention cleanup (periodic reconciliation only, §4.2 C11 +
+     * LH-06): expired heartbeat/test events (30 days after
+     * terminal) plus unlinked capture-log rows (90 days after
+     * capture). Payment events are never auto-deleted.
+     */
+    suspend fun runRetentionCleanup(): RetentionCleanupResult {
+        val heartbeatDeleted = eventDao.deleteExpiredHeartbeatTest(clock() - RETENTION_MS)
+        val captureLogDeleted = captureLogDao?.deleteUnlinkedOlderThan(
+            clock() - UNLINKED_CAPTURE_LOG_RETENTION_MS,
+        ) ?: 0
+        return RetentionCleanupResult(heartbeatDeleted, captureLogDeleted)
+    }
 
     // --- Per-delivery processing ---
 

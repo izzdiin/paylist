@@ -12,6 +12,9 @@ import com.netter.paylist.core.model.EventSource
 import com.netter.paylist.core.model.RouteStamp
 import com.netter.paylist.data.EventInsertOutcome
 import com.netter.paylist.data.EventRepository
+import com.netter.paylist.data.dao.CaptureLogDao
+import com.netter.paylist.data.entity.CaptureLogEntity
+import com.netter.paylist.data.entity.CaptureOutcome
 import com.netter.paylist.data.entity.CaptureStagingEntity
 import com.netter.paylist.migration.CutoverMode
 import com.netter.paylist.migration.LegacyEnqueue
@@ -19,6 +22,7 @@ import com.netter.paylist.migration.LegacyQkey
 import com.netter.paylist.parser.ParserInput
 import com.netter.paylist.parser.ParserRegistry
 import com.netter.paylist.parser.PaymentParser
+import com.netter.paylist.security.SensitiveDataRedactor
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
@@ -64,6 +68,8 @@ data class CaptureCounters(
     val pureAuth: Long = 0,
     /** Raw snapshots evicted from the store (overflow; §7.3B at claim). */
     val rawSnapshotsEvicted: Long = 0,
+    /** Capture-log inserts that failed (LH-04(d) — surfaced, never silent). */
+    val captureLogFailures: Long = 0,
 )
 
 /**
@@ -120,6 +126,13 @@ class CaptureCoordinator(
     private val rawSnapshotStore: RawSnapshotStore? = null,
     /** Stage D D2: per-route consent records (null = no consent evidence). */
     private val consentStore: ConsentStore? = null,
+    /**
+     * Stage D D4: the durable capture log (LH-04). Null disables
+     * capture-log writes (tests that predate D4); production always
+     * wires the real DAO. A failed insert is counted + logged, never
+     * silent (LH-04(d)) — the capture itself continues.
+     */
+    private val captureLogDao: CaptureLogDao? = null,
 ) {
     companion object {
         /** Executor work-queue capacity (design §8.3 (6′), proposed value). */
@@ -155,6 +168,7 @@ class CaptureCoordinator(
     private val stagingMismatch = AtomicLong()
     private val pureAuth = AtomicLong()
     private val rawSnapshotsEvicted = AtomicLong()
+    private val captureLogFailures = AtomicLong()
 
     private fun daemonFactory(name: String): ThreadFactory = ThreadFactory { r ->
         Thread(r, name).apply { isDaemon = true }
@@ -206,6 +220,7 @@ class CaptureCoordinator(
         stagingMismatch = stagingMismatch.get(),
         pureAuth = pureAuth.get(),
         rawSnapshotsEvicted = rawSnapshotsEvicted.get(),
+        captureLogFailures = captureLogFailures.get(),
     )
 
     /**
@@ -250,12 +265,25 @@ class CaptureCoordinator(
         if (routes.isEmpty()) {
             unlistedPackage.incrementAndGet()
             logger.logEvent(pkg, "paket-terlihat: $pkg (belum di daftar rute)")
+            // LH-04(b): package + time + outcome only — no text, no amount.
+            writeCaptureLog(
+                snapshot, CaptureOutcome.UNLISTED_PACKAGE,
+                titleSnippet = null, amountMinor = null,
+                eventId = null, contentSha256 = null,
+            )
             return
         }
         val matched = SourcePolicy.keywordMatchedRoutes(routes, snapshot.combined)
         if (matched.isEmpty()) {
             noKeyword.incrementAndGet()
             logger.logEvent(pkg, "target-lain: $pkg - ${snapshot.title.take(40)}")
+            // LH-04(a): the gate never ran here, so the snippet is
+            // scanned directly (confirmed + ambiguous spans redacted).
+            writeCaptureLog(
+                snapshot, CaptureOutcome.NO_KEYWORD,
+                titleSnippet = snippet(snapshot.title),
+                amountMinor = null, eventId = null, contentSha256 = null,
+            )
             return
         }
         val input = ParserInput(pkg, snapshot.title, snapshot.text, snapshot.bigText, snapshot.postTimeMs)
@@ -270,9 +298,23 @@ class CaptureCoordinator(
             if (gate.decision == PrivacyGate.Decision.DROP_PURE_AUTH) {
                 pureAuth.incrementAndGet()
                 logger.logEvent(pkg, "pure-auth: $pkg (kode autentikasi, tanpa nominal)")
+                // LH-07(b) + LH-D2 (accepted): metadata-only row —
+                // package, time, outcome. No snippet, no amount, no
+                // hash: a hash of an OTP notification would still be
+                // a hash of secret content.
+                writeCaptureLog(
+                    snapshot, CaptureOutcome.PURE_AUTH,
+                    titleSnippet = null, amountMinor = null,
+                    eventId = null, contentSha256 = null,
+                )
             } else {
                 noAmount.incrementAndGet()
                 logger.logEvent(pkg, "target-tanpa-nominal: $pkg - ${snapshot.title.take(40)}")
+                writeCaptureLog(
+                    snapshot, CaptureOutcome.NO_AMOUNT,
+                    titleSnippet = gate.redactedTitle.take(40),
+                    amountMinor = null, eventId = null, contentSha256 = null,
+                )
             }
             return
         }
@@ -415,6 +457,13 @@ class CaptureCoordinator(
                 // is kept, no delivery is created (§3 R11).
                 identityCollision.incrementAndGet()
                 logger.logLocal("capture collision (dedupe sama, isi beda): $pkg @${snapshot.postTimeMs}")
+                // LH-04(c): unlinked row (LH-06) — the colliding
+                // observation is not the kept event.
+                writeCaptureLog(
+                    snapshot, CaptureOutcome.COLLISION,
+                    titleSnippet = gate.redactedTitle.take(40),
+                    amountMinor = amount, eventId = null, contentSha256 = contentSha,
+                )
                 return
             }
             EventInsertOutcome.DUPLICATE -> {
@@ -435,10 +484,20 @@ class CaptureCoordinator(
                     }
                 ) {
                     repository.deleteStagingRow(qkey)
+                    writeCaptureLog(
+                        snapshot, CaptureOutcome.DUPLICATE,
+                        titleSnippet = gate.redactedTitle.take(40),
+                        amountMinor = amount, eventId = null, contentSha256 = contentSha,
+                    )
                     return
                 }
                 if (repository.getDeliveryByQkey(qkey) != null) {
                     repository.deleteStagingRow(qkey)
+                    writeCaptureLog(
+                        snapshot, CaptureOutcome.DUPLICATE,
+                        titleSnippet = gate.redactedTitle.take(40),
+                        amountMinor = amount, eventId = null, contentSha256 = contentSha,
+                    )
                     return
                 }
                 // Event exists but no live delivery (a partial
@@ -447,8 +506,70 @@ class CaptureCoordinator(
             }
             EventInsertOutcome.INSERTED -> Unit
         }
+        // The insert outcome, recorded durably (LH-04(c)): INSERTED
+        // links to the new event; the DUPLICATE fall-through (a
+        // partial earlier capture now promoted) stays unlinked.
+        writeCaptureLog(
+            snapshot,
+            if (stagedResult.eventOutcome == EventInsertOutcome.INSERTED) {
+                CaptureOutcome.CAPTURED
+            } else {
+                CaptureOutcome.DUPLICATE
+            },
+            titleSnippet = gate.redactedTitle.take(40),
+            amountMinor = amount,
+            eventId = if (stagedResult.eventOutcome == EventInsertOutcome.INSERTED) {
+                event.eventId
+            } else {
+                null
+            },
+            contentSha256 = contentSha,
+        )
         enqueueStaged(stagingRow, delivery, payload, snapshot, routeIds)
     }
+
+    /**
+     * One durable capture-log row (LH-04), on the capture executor
+     * thread — a single-row insert, never holding a DB transaction
+     * during network I/O (LH-04(d)). A failed insert is counted and
+     * logged explicitly, never silently skipped; the capture itself
+     * continues (the event row is already durable).
+     */
+    private suspend fun writeCaptureLog(
+        snapshot: NotificationSnapshot,
+        outcome: String,
+        titleSnippet: String?,
+        amountMinor: Long?,
+        eventId: String?,
+        contentSha256: String?,
+    ) {
+        val dao = captureLogDao ?: return
+        try {
+            dao.insert(
+                CaptureLogEntity(
+                    captureId = UUID.randomUUID().toString(),
+                    sourcePackage = snapshot.packageName,
+                    postTimeMs = snapshot.postTimeMs,
+                    capturedAtMs = clock(),
+                    outcome = outcome,
+                    titleSnippet = titleSnippet?.take(40),
+                    amountMinor = amountMinor,
+                    eventId = eventId,
+                    contentSha256 = contentSha256,
+                ),
+            )
+        } catch (e: Exception) {
+            captureLogFailures.incrementAndGet()
+            logger.logLocal(
+                "capture-log gagal ditulis ($outcome ${snapshot.packageName}): " +
+                    e.message?.take(120),
+            )
+        }
+    }
+
+    /** A PrivacyGate-scanned title snippet (≤40 chars, LH-04). */
+    private fun snippet(title: String): String =
+        SensitiveDataRedactor.redact(title).take(40)
 
     /**
      * Mode-gated enqueue of one staged capture (§8.3 (2′)/(4)):

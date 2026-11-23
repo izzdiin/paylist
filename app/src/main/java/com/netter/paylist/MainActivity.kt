@@ -162,6 +162,20 @@ class MainActivity : Activity() {
             setPadding(0, dp(2), 0, dp(14))
         })
 
+        // --- Riwayat (Stage D D4, LH-D3 Opsi A: Activity khusus) ---
+        // Navigasi bawah permanen menyusul di D5 (perombakan
+        // MainActivity); untuk D4, tombol tingkat atas ini adalah
+        // pintu masuk riwayat.
+        val historyBtn = primaryButton("Lihat Riwayat")
+        historyBtn.setOnClickListener {
+            startActivity(Intent(this, HistoryActivity::class.java))
+        }
+        root.addView(historyBtn)
+        root.addView(TextView(this).apply {
+            text = " "
+            textSize = 6f
+        })
+
         // --- Kartu status ---
         val statusCard = cardLayout()
         statusCard.addView(TextView(this).apply {

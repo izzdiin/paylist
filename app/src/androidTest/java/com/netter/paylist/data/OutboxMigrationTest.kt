@@ -58,7 +58,7 @@ class OutboxMigrationTest {
     }
 
     @Test
-    fun schemaHasAllElevenTables() {
+    fun schemaHasAllTwelveTables() {
         val cursor = db.openHelper.readableDatabase.query(
             SimpleSQLiteQuery("SELECT name FROM sqlite_master WHERE type = 'table'"),
         )
@@ -80,6 +80,8 @@ class OutboxMigrationTest {
             "classification_results",
             "registry_imports",
             "export_audit",
+            // Stage D D4 (Room v2, addendum 06 LH-04).
+            "capture_log",
         )
         assertTrue("missing tables: ${expected - tables}", tables.containsAll(expected))
     }

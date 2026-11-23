@@ -39,6 +39,16 @@ interface EventDao {
     suspend fun count(): Int
 
     /**
+     * Per-record local deletion (addendum 06 LH-07(e)): explicit
+     * operator policy only, never automatic, never bulk (R29).
+     * Deleting an event cascades to its deliveries and attempts;
+     * linked capture-log rows are kept with `event_id` SET NULL
+     * (they survive as unlinked diagnostic rows, LH-06 90-day rule).
+     */
+    @Query("DELETE FROM events WHERE event_id = :id")
+    suspend fun deleteById(id: String): Int
+
+    /**
      * Key-loss fail-closed (R35): if the Keystore export key is lost or
      * invalidated, all existing `source_account_key` values are set to
      * NULL in one pass. The nulling completes before any new-key

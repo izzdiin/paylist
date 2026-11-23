@@ -55,6 +55,7 @@ class SyncWorkerFactory(
                     consentStore = consentStore,
                     recorderGatePassed = recorderGatePassed,
                     onFallbackDispatched = onFallbackDispatched,
+                    captureLogDao = db.captureLogDao(),
                 ),
                 onWorkRemaining = { SyncScheduler.requestSync(appContext) },
             )
