@@ -26,6 +26,45 @@ object AttributionStatus {
 }
 
 /**
+ * Match rule ids (design §3.1.4 decision table + §3.1.2): the
+ * rule that fired, recorded on every `match_results` row so a
+ * reviewer can replay the decision. Shared by the DAO's atomic
+ * attribution (which sets the conflict-branch rules) and the
+ * matcher.
+ */
+object MatchRuleId {
+    /** Full agreement: order + amount + currency + direction. */
+    const val MATCH: String = "P3-MATCH"
+
+    /** Case B: verified same bank transaction ⇒ duplicate evidence. */
+    const val DUPLICATE_EVIDENCE: String = "P3-B"
+
+    /** Case C: already attributed, identity unverified ⇒ ambiguous. */
+    const val AMBIGUOUS: String = "P3-C"
+
+    /** Case D: concurrent loser ⇒ ambiguous. */
+    const val CONCURRENT_LOSER: String = "P3-D"
+
+    /** Case E: amount/currency/direction mismatch ⇒ manual review. */
+    const val MISMATCH: String = "P3-E"
+
+    /** No order number extracted. */
+    const val NO_ORDER: String = "P3-NO-ORDER"
+
+    /** No registered merchant shape matches. */
+    const val NO_MERCHANT: String = "P3-NO-MERCHANT"
+
+    /** Cross-merchant shape collision. */
+    const val MULTI_MERCHANT: String = "P3-MULTI-MERCHANT"
+
+    /** Order absent from the imported registry. */
+    const val UNMATCHED: String = "P3-UNMATCHED"
+
+    /** Registry snapshot missing, expired, or unverified. */
+    const val REGISTRY_UNUSABLE: String = "P3-REGISTRY-UNUSABLE"
+}
+
+/**
  * The `match_results` table (design §4.6, P3): advisory transaction
  * matching results. Advisory only: a `matched` result never settles
  * anything, never marks an invoice paid, never triggers a

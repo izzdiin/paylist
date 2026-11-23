@@ -75,6 +75,10 @@ class Sender(
     private val modeGate: ModeGate,
     private val secrets: SecretProvider = SecretVault(ctx),
     private val transport: TransportClient = HttpTransportClient(),
+    /** Stage D §7.3A: the raw-snapshot store (null = B disabled, stored payload only). */
+    private val rawSnapshotStore: com.netter.paylist.collector.RawSnapshotStore? = null,
+    /** Stage D §7.3: per-route consent records (null = B unverifiable). */
+    private val consentStore: com.netter.paylist.collector.ConsentStore? = null,
 ) {
 
     fun enqueueToRoute(payload: JSONObject, routeId: String) {
@@ -94,6 +98,52 @@ class Sender(
             put("payload", payload)
         }
         enqueueItem(item, payload.optString("dedupe_key") + "|chain|" + routeIds.joinToString(","))
+    }
+
+    /**
+     * Synchronous chain enqueue (Stage D capture path, design §8.3
+     * (2′)): the item is added under the fair lock with a timed
+     * acquire (5 s — the commit hold contains no network and no
+     * import) and written via `saveQueueSync` (`commit()` +
+     * readback). Returns true only when the item is durably in the
+     * queue — either newly written (commit + readback agree) or
+     * already present (idempotent re-enqueue by `qkey`).
+     *
+     * A false return means the caller must NOT delete its staging
+     * row: the staging sweep retries the enqueue later. A flush is
+     * started (background thread) only on success.
+     */
+    fun enqueueChainSync(payload: JSONObject, routeIds: List<String>): Boolean {
+        val qkey = payload.optString("dedupe_key") + "|chain|" + routeIds.joinToString(",")
+        val locked = try {
+            SenderLock.lock.tryLock(5, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return false
+        }
+        if (!locked) return false
+        val written = try {
+            val store = Store(ctx)
+            val q = store.queue()
+            if (q.none { it.optString("qkey") == qkey }) {
+                val item = JSONObject().apply {
+                    put("kind", "chain")
+                    put("route_ids", org.json.JSONArray(routeIds))
+                    put("next", 0)
+                    put("payload", payload)
+                    put("qkey", qkey)
+                }
+                q.add(item)
+                if (!store.saveQueueSync(q)) return false
+                // Readback: the item must be present after the commit.
+                if (store.queue().none { it.optString("qkey") == qkey }) return false
+            }
+            true
+        } finally {
+            SenderLock.lock.unlock()
+        }
+        if (written) Thread { flush() }.start()
+        return written
     }
 
     private fun enqueueItem(item: JSONObject, qkey: String) {
@@ -188,7 +238,24 @@ class Sender(
                     item.put("next", next)
                     return false
                 }
-                val res = post(route, payload, secret)
+                // §7.3A(d): the legacy flush takes the raw snapshot
+                // at its per-hop claim step for B items. A null
+                // resolution means the item is HELD — never POSTed
+                // (raw or redacted) until the operator clears it.
+                val hop = resolveHopBody(item, payload, route, store)
+                if (hop == null) {
+                    item.put("next", next)
+                    return false
+                }
+                val res = post(route, hop.payload, secret) { hop.checkpoint() }
+                if (hop.fenceAborted) {
+                    // B3: revoke observed at the final admission
+                    // read — raw dropped unsent, the item is held
+                    // at this hop, no further raw POST follows.
+                    holdRawBlocked(item, store, route, "route_revoked")
+                    item.put("next", next)
+                    return false
+                }
                 if (res.retryable) {
                     // Simpan posisi; item tertahan, item LAIN tetap diproses.
                     item.put("next", next)
@@ -252,18 +319,148 @@ class Sender(
     private class Outcome(val matched: Boolean, val retryable: Boolean, val error: String?)
 
     /**
+     * The resolved body for one legacy hop (§7.3A/§7.3B). Either
+     * the stored (redacted) payload or the raw payload built from
+     * a taken snapshot, plus the admission fence for the final
+     * re-read before the first write.
+     */
+    private class HopResolution(
+        val payload: JSONObject,
+        private val fenceGeneration: Long?,
+        private val routeId: String,
+        private val rawSnapshotStore: com.netter.paylist.collector.RawSnapshotStore?,
+    ) {
+        /** True when the fence check observed a revocation. */
+        @Volatile
+        var fenceAborted: Boolean = false
+            private set
+
+        /**
+         * §7.3A(e): the generation recorded at the pre-send gate
+         * is re-read immediately before the first write, as the
+         * LAST step of the checkpoint callback — a plain volatile
+         * read, no lock held, no I/O, no suspension point between
+         * the read and the write. A mismatch aborts before any
+         * byte is written.
+         */
+        fun checkpoint(): Boolean {
+            val fence = fenceGeneration ?: return true
+            if (rawSnapshotStore?.fence(routeId) != fence) {
+                fenceAborted = true
+                return false
+            }
+            return true
+        }
+    }
+
+    /**
+     * Resolves the body for one legacy chain hop (§7.3A(d)).
+     * Returns null when the item must be HELD (never POSTed):
+     * the raw opt-in is invalid at claim time (B16), or the item
+     * was already held by an earlier fence abort (B3).
+     *
+     * Non-B items post the stored payload unchanged. A B item
+     * whose snapshot is lost posts the stored redacted payload —
+     * the legacy-path A′; the full §7.3B gate runs on the Room
+     * worker only (Stage D boundary: the legacy queue carries no
+     * reconciliation evidence and no attempt rows).
+     */
+    private fun resolveHopBody(
+        item: JSONObject,
+        payload: JSONObject,
+        route: Route,
+        store: Store,
+    ): HopResolution? {
+        if (!payload.optBoolean("raw_ephemeral", false)) {
+            return HopResolution(payload, null, route.id, rawSnapshotStore)
+        }
+        // A held item stays held until the operator clears it (D3/D5).
+        if (item.optBoolean("raw_blocked", false)) return null
+        val consent = consentStore
+        val snapshots = rawSnapshotStore
+        if (consent == null || snapshots == null) {
+            // B unverifiable without the stores: post the stored
+            // (redacted) payload — no raw is ever transmitted.
+            return HopResolution(payload, null, route.id, rawSnapshotStore)
+        }
+        // Pre-send consent re-check (§7.3): the raw opt-in must be
+        // valid NOW, not just at capture. The legacy flush runs on
+        // its own thread (not a coroutine), so the suspend consent
+        // reads run under runBlocking — the same pattern `post()`
+        // already uses for the suspend transport call.
+        val (optInValid, currentEpoch) = runBlocking {
+            consent.isRawOptInValid(route.id, System.currentTimeMillis()) to consent.epoch(route.id)
+        }
+        if (!optInValid) {
+            holdRawBlocked(item, store, route, "consent_expired")
+            return null
+        }
+        // Take the snapshot (take-don't-copy) with the CURRENT
+        // epoch: a revoked-and-regranted route has a new epoch and
+        // the old snapshot is unclaimable.
+        val snapshot = snapshots.take(
+            payload.optString("dedupe_key"), route.id, currentEpoch,
+        ) ?: return HopResolution(payload, null, route.id, rawSnapshotStore)
+        val raw = JSONObject(payload.toString())
+        raw.put("title", snapshot.title.take(500))
+        raw.put("text", snapshot.text.take(500))
+        raw.remove("redacted")
+        raw.remove("inseparable")
+        return HopResolution(raw, snapshots.fence(route.id), route.id, rawSnapshotStore)
+    }
+
+    /** Holds a B item at its current hop: never POSTed until the operator clears it. */
+    private fun holdRawBlocked(item: JSONObject, store: Store, route: Route, reason: String) {
+        item.put("raw_blocked", true)
+        item.put("last_error", reason)
+        store.setLastFailure(
+            "pengiriman raw ke rute ${route.name} ditahan ($reason); perlu keputusan operator",
+        )
+        store.logLocal("item ditahan (raw_blocked, $reason) rute ${route.name}")
+    }
+
+    /**
+     * Clears the `raw_blocked` hold on one legacy queue item
+     * (operator action, D3/D5 review surface). The item resumes
+     * flushing with the stored (redacted) payload — the B flag is
+     * cleared too, so a held item never posts raw again.
+     */
+    fun clearRawBlocked(qkey: String): Boolean {
+        var cleared = false
+        SenderLock.lock.withLock {
+            val store = Store(ctx)
+            val q = store.queue()
+            for (item in q) {
+                if (item.optString("qkey") == qkey && item.optBoolean("raw_blocked", false)) {
+                    item.remove("raw_blocked")
+                    item.optJSONObject("payload")?.remove("raw_ephemeral")
+                    cleared = true
+                }
+            }
+            if (cleared) store.saveQueue(q)
+        }
+        if (cleared) Thread { flush() }.start()
+        return cleared
+    }
+
+    /**
      * POST satu payload ke satu rute via [TransportClient], classified
      * with the shared §5.4 taxonomy ([LegacyResponseClassifier]).
-     * The checkpoint callback is trivially true: the legacy flush has
-     * no attempt row to checkpoint (see the class KDoc).
+     * The checkpoint callback is trivially true for non-raw hops;
+     * for raw hops it re-reads the §7.3A(e) admission fence.
      */
-    private fun post(route: Route, payload: JSONObject, secret: String): Outcome {
+    private fun post(
+        route: Route,
+        payload: JSONObject,
+        secret: String,
+        onCheckpoint: (suspend () -> Boolean)? = null,
+    ): Outcome {
         val eventType = payload.optString("type").ifEmpty { "payment" }
         val result = try {
             runBlocking {
                 transport.post(
                     TransportRequest(route.url, secret, payload.toString())
-                ) { true }
+                ) { onCheckpoint?.invoke() ?: true }
             }
         } catch (e: Exception) {
             val msg = e.message?.take(90)?.replace('\n', ' ').orEmpty()

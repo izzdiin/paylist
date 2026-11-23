@@ -27,8 +27,8 @@ interface RegistryImportMetadataDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(metadata: RegistryImportMetadataEntity)
 
-    @Query("SELECT * FROM registry_imports WHERE registry_version = :version")
-    suspend fun getByVersion(version: String): RegistryImportMetadataEntity?
+    @Query("SELECT * FROM registry_imports WHERE merchant_id = :merchantId AND registry_version = :version")
+    suspend fun getByVersion(merchantId: String, version: String): RegistryImportMetadataEntity?
 
     @Query("SELECT * FROM registry_imports WHERE merchant_id = :merchantId AND status = 'ACTIVE'")
     suspend fun getActive(merchantId: String): RegistryImportMetadataEntity?

@@ -2,6 +2,12 @@ package com.netter.paylist
 
 import android.app.Application
 import androidx.work.Configuration
+import com.netter.paylist.collector.CaptureCoordinator
+import com.netter.paylist.collector.CaptureLogSink
+import com.netter.paylist.collector.ConsentStore
+import com.netter.paylist.collector.PrivacyGate
+import com.netter.paylist.collector.RawSnapshotStore
+import com.netter.paylist.data.EventRepository
 import com.netter.paylist.data.PaylistDatabase
 import com.netter.paylist.data.entity.CollectorStateEntity
 import com.netter.paylist.data.entity.CollectorStateKeys
@@ -11,6 +17,8 @@ import com.netter.paylist.delivery.SyncWorkerFactory
 import com.netter.paylist.migration.CutoverCommit
 import com.netter.paylist.migration.CutoverCoordinator
 import com.netter.paylist.migration.CutoverMode
+import com.netter.paylist.migration.LegacyEnqueue
+import com.netter.paylist.migration.LegacyQkey
 import com.netter.paylist.migration.LegacyQueueMigration
 import com.netter.paylist.migration.LegacyQueueSnapshotSource
 import com.netter.paylist.privacy.GateBackedInspector
@@ -99,7 +107,62 @@ class PaylistApplication : Application(), Configuration.Provider {
 
     /** The single legacy sender (mode-gated, vault-backed secrets). */
     val sender: Sender by lazy {
-        Sender(this, modeGate, SecretVault(this))
+        Sender(
+            this, modeGate, SecretVault(this),
+            rawSnapshotStore = rawSnapshotStore,
+            consentStore = consentStore,
+        )
+    }
+
+    /** The capture coordinator (Stage D, design §8.3): listener → Room/legacy. */
+    val captureCoordinator: CaptureCoordinator by lazy {
+        val transactions = db.transactionRunner()
+        val repository = EventRepository(
+            db.eventDao(),
+            db.deliveryDao(),
+            db.captureStagingDao(),
+            db.classificationDao(),
+            transactions,
+        )
+        val legacyEnqueue = LegacyEnqueue { payload, kind, routeIds ->
+            if (kind != LegacyQkey.KIND_CHAIN) return@LegacyEnqueue false
+            sender.enqueueChainSync(payload, routeIds)
+        }
+        val logSink = object : CaptureLogSink {
+            override fun logEvent(pkg: String, text: String) = store.logEvent(pkg, text)
+            override fun logLocal(text: String) = store.logLocal(text)
+        }
+        CaptureCoordinator(
+            repository = repository,
+            modeReader = { coordinator.getMode() },
+            legacyEnqueue = legacyEnqueue,
+            routesProvider = { store.routes() },
+            deviceIdProvider = { store.deviceLabel() },
+            logger = logSink,
+            onRoomEnqueued = { SyncScheduler.requestSync(this) },
+            privacyGate = privacyGate,
+            rawSnapshotStore = rawSnapshotStore,
+            consentStore = consentStore,
+        )
+    }
+
+    /** Per-route consent records (§7.5 C22(l), §7.3 P6 opt-in). */
+    val consentStore: ConsentStore by lazy {
+        ConsentStore(db.collectorStateDao())
+    }
+
+    /** The Stage D PrivacyGate, bound to the consent store (B-eligibility). */
+    val privacyGate: PrivacyGate by lazy {
+        PrivacyGate(consentStore)
+    }
+
+    /**
+     * The single §7.3A raw-snapshot store, shared by the capture
+     * executor (put) and the claim paths (take). One instance for
+     * the whole process.
+     */
+    val rawSnapshotStore: RawSnapshotStore by lazy {
+        RawSnapshotStore()
     }
 
     override fun onCreate() {
@@ -107,10 +170,36 @@ class PaylistApplication : Application(), Configuration.Provider {
         Thread { startup() }.start()
     }
 
+    /**
+     * Per-route `raw_lost_fallback_total` counters (§7.3B
+     * visibility): how many authorised A′ fallbacks were actually
+     * dispatched per route in this process. Surfaced in
+     * diagnostics (D5); the durable per-delivery record is the
+     * `raw_lost` flag on the delivery + attempt rows.
+     */
+    val rawLostFallbackTotals: MutableMap<String, java.util.concurrent.atomic.AtomicLong> =
+        java.util.concurrent.ConcurrentHashMap()
+
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder()
             .setWorkerFactory(
-                SyncWorkerFactory(db, StoreRouteSource(store), SecretVault(this))
+                SyncWorkerFactory(
+                    db, StoreRouteSource(store), SecretVault(this),
+                    rawSnapshotStore = rawSnapshotStore,
+                    consentStore = consentStore,
+                    // F43 B14: fail-closed — automatic A′ fallback
+                    // on recorder routes is NOT permitted until B14
+                    // passes against live catat.php semantics.
+                    recorderGatePassed = false,
+                    onFallbackDispatched = { routeId ->
+                        rawLostFallbackTotals
+                            .computeIfAbsent(routeId) {
+                                java.util.concurrent.atomic.AtomicLong()
+                            }
+                            .incrementAndGet()
+                        store.logLocal("fallback A′ terkirim (raw hilang) rute $routeId")
+                    },
+                )
             )
             .build()
 
@@ -168,6 +257,15 @@ class PaylistApplication : Application(), Configuration.Provider {
             SyncScheduler.scheduleHeartbeat(this)
         } catch (e: Exception) {
             store.logLocal("jadwal WorkManager gagal: ${e.message?.take(120)}")
+        }
+        try {
+            // Stage D: re-promote staging rows orphaned by a process
+            // death between staging and enqueue, then sweep
+            // periodically on the capture executor.
+            runBlocking { captureCoordinator.sweepOrphanedStaging() }
+            captureCoordinator.startPeriodicSweep()
+        } catch (e: Exception) {
+            store.logLocal("sweep staging gagal: ${e.message?.take(120)}")
         }
     }
 

@@ -7,6 +7,7 @@ import androidx.room.Transaction
 import com.netter.paylist.data.entity.AdvisoryMatchStatus
 import com.netter.paylist.data.entity.AttributionStatus
 import com.netter.paylist.data.entity.MatchResultEntity
+import com.netter.paylist.data.entity.MatchRuleId
 
 /** Outcome of an atomic attribution attempt (design §3.1.4 case D). */
 enum class AttributionOutcome {
@@ -99,6 +100,7 @@ interface MatchResultDao {
                     attributionStatus = AttributionStatus.DUPLICATE_EVIDENCE,
                     attributedToMatchId = existing.matchId,
                     attributedOrderKey = null,
+                    ruleId = MatchRuleId.DUPLICATE_EVIDENCE,
                 ),
             )
             return AttributionOutcome.DUPLICATE_EVIDENCE
@@ -109,6 +111,12 @@ interface MatchResultDao {
                 attributionStatus = AttributionStatus.NONE,
                 attributedToMatchId = null,
                 attributedOrderKey = null,
+                // The conflict branch of this transaction is the
+                // concurrent-loser case (D): the matcher handles
+                // the pre-existing-attribution case (C) directly,
+                // so reaching here means the attribution appeared
+                // between the matcher's pre-read and this call.
+                ruleId = MatchRuleId.CONCURRENT_LOSER,
                 reviewReason = "order already attributed; identity unverified (case C/D)",
             ),
         )

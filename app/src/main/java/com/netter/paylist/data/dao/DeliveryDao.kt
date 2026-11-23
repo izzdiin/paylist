@@ -221,6 +221,49 @@ interface DeliveryDao {
     ): Int
 
     /**
+     * `IN_FLIGHT →` a held state (`RAW_UNAVAILABLE` / `NEEDS_REVIEW`
+     * / `BLOCKED`), only while the caller's lease is held and
+     * unexpired (Stage D §7.3B: the FallbackGate hold). Sets the
+     * `raw_lost` flag when the hold follows a lost raw snapshot.
+     * The caller validates the transition against
+     * `DeliveryStateMachine` before calling.
+     */
+    @Query(
+        "UPDATE deliveries SET state = :to, last_error_code = :errorCode, " +
+            "last_error_summary = :errorSummary, raw_lost = :rawLost, " +
+            "next_route_index = :nextRouteIndex, hop_outcomes_json = :hopOutcomesJson, " +
+            "updated_at_ms = :now WHERE delivery_id = :id AND state = 'IN_FLIGHT' " +
+            "AND lease_owner = :leaseOwner AND lease_until_ms > :now",
+    )
+    suspend fun holdIfLeaseHeld(
+        id: String,
+        leaseOwner: String,
+        now: Long,
+        to: DeliveryState,
+        errorCode: String?,
+        errorSummary: String?,
+        rawLost: Boolean,
+        nextRouteIndex: Int,
+        hopOutcomesJson: String,
+    ): Int
+
+    /**
+     * Sets `raw_lost = 1` on a delivery whose raw snapshot was
+     * lost but whose fallback dispatch was authorised (§7.3B),
+     * only while the caller's lease is held and unexpired.
+     */
+    @Query(
+        "UPDATE deliveries SET raw_lost = 1, updated_at_ms = :now " +
+            "WHERE delivery_id = :id AND state = 'IN_FLIGHT' " +
+            "AND lease_owner = :leaseOwner AND lease_until_ms > :now",
+    )
+    suspend fun markRawLostIfLeaseHeld(
+        id: String,
+        leaseOwner: String,
+        now: Long,
+    ): Int
+
+    /**
      * `IN_FLIGHT → HELD_AWAITING_RECONCILIATION`, only while the
      * caller's lease is held and unexpired (§5.5 rows 4/8b/9/10:
      * unknown hop, reconciliation only). Persists the hop checkpoint

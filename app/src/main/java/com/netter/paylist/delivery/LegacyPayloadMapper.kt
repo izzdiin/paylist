@@ -1,5 +1,7 @@
 package com.netter.paylist.delivery
 
+import com.netter.paylist.parser.Direction
+import com.netter.paylist.parser.DirectionHeuristic
 import org.json.JSONObject
 import java.time.Instant
 
@@ -93,4 +95,116 @@ object LegacyPayloadMapper {
      */
     fun mapImported(legacyPayloadJson: String): JSONObject =
         JSONObject(legacyPayloadJson)
+
+    /** Result of building a §7.2 constructed recorder text. */
+    data class ConstructedText(
+        /** The constructed text (never a raw substring). */
+        val text: String,
+        /** True when the self-check fell back to the no-cue form. */
+        val needsReview: Boolean,
+    )
+
+    /**
+     * Builds the §7.2 constructed recorder text purely from
+     * structured fields, never from any substring of raw text:
+     * - `out` → `Transfer ke {masked_account} Rp{amount} Ref {reference}`
+     * - `in` → `Diterima Rp{amount} dari {masked_account} Ref {reference}`
+     * - `unknown` → `Rp{amount} {masked_account} Ref {reference}`
+     *
+     * The `Ref` token appears only when a labelled, non-secret
+     * reference exists; `{masked_account}` is omitted when absent;
+     * `title` is sent empty.
+     *
+     * Self-check (F49, §7.1 gating): the same two-list heuristic
+     * runs over the constructed text including inserted tokens.
+     * - A token containing any direction-list word as a substring
+     *   is OMITTED (never inserted) and the form falls back to
+     *   no-cue + review flag.
+     * - A bare-digit reference is rejected (never inserted): OTP
+     *   digits are never reused as a reference.
+     * - Any direction mismatch falls back to the no-cue form +
+     *   review flag.
+     */
+    fun buildConstructedText(
+        direction: Direction,
+        amountMinor: Long,
+        maskedAccount: String?,
+        reference: String?,
+    ): ConstructedText {
+        var needsReview = false
+        // Sanitize inserted tokens: a token containing a
+        // direction-list word as a substring is omitted (F49).
+        // A direction-word sanitisation forces the NO-CUE form
+        // (F49, normative): the inserted token carried a cue
+        // that conflicts with the intended direction, so the
+        // constructed text must not carry any cue at all.
+        // A bare-digit rejection does NOT force no-cue — the
+        // directional template still classifies correctly.
+        var directionWordSanitised = false
+        var safeAccount = maskedAccount
+        if (safeAccount != null && DirectionHeuristic.containsDirectionWord(safeAccount)) {
+            safeAccount = null
+            needsReview = true
+            directionWordSanitised = true
+        }
+        var safeReference = reference
+        if (safeReference != null &&
+            (safeReference.all { it.isDigit() } || DirectionHeuristic.containsDirectionWord(safeReference))
+        ) {
+            // Bare-digit reference rejected: OTP digits are never
+            // reused as a reference.
+            if (DirectionHeuristic.containsDirectionWord(safeReference)) {
+                directionWordSanitised = true
+            }
+            safeReference = null
+            needsReview = true
+        }
+
+        val amountText = "Rp" + formatMinor(amountMinor)
+        val refToken = safeReference?.let { " Ref $it" }.orEmpty()
+        if (directionWordSanitised) {
+            val account = safeAccount?.let { " $it" }.orEmpty()
+            return ConstructedText("$amountText$account$refToken".trim(), true)
+        }
+        val directional = when (direction) {
+            Direction.OUT -> {
+                val account = safeAccount?.let { " $it" }.orEmpty()
+                "Transfer ke$account $amountText$refToken"
+            }
+            Direction.IN -> {
+                val account = safeAccount?.let { " dari $it" }.orEmpty()
+                "Diterima $amountText$account$refToken"
+            }
+            Direction.UNKNOWN -> {
+                val account = safeAccount?.let { " $it" }.orEmpty()
+                "$amountText$account$refToken"
+            }
+        }
+        // Self-check: the constructed text must classify to the
+        // intended direction (or UNKNOWN for the no-cue form).
+        val classified = DirectionHeuristic.classify(directional)
+        if (classified == direction) {
+            return ConstructedText(directional.trim(), needsReview)
+        }
+        // Mismatch ⇒ no-cue form + review flag.
+        val account = safeAccount?.let { " $it" }.orEmpty()
+        val noCue = "$amountText$account$refToken".trim()
+        return ConstructedText(noCue, true)
+    }
+
+    /** Formats minor units with Indonesian thousands separators (100800 → "100.800"). */
+    private fun formatMinor(amountMinor: Long): String {
+        val s = amountMinor.toString()
+        val out = StringBuilder()
+        var count = 0
+        for (i in s.length - 1 downTo 0) {
+            out.append(s[i])
+            count++
+            if (count == 3 && i > 0) {
+                out.append('.')
+                count = 0
+            }
+        }
+        return out.reverse().toString()
+    }
 }
