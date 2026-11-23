@@ -56,7 +56,7 @@ class PaylistApplication : Application(), Configuration.Provider {
          * while capture still targets the legacy queue would stop
          * new payments from delivering at all.
          */
-        const val CAPTURE_TO_ROOM_READY: Boolean = false
+        const val CAPTURE_TO_ROOM_READY: Boolean = true
     }
 
     /** This process's boot identity (fresh UUID per process start). */
