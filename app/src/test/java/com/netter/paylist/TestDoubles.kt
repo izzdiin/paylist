@@ -9,6 +9,7 @@ import com.netter.paylist.data.dao.CollectorStateDao
 import com.netter.paylist.data.dao.DeliveryDao
 import com.netter.paylist.data.dao.DeliveryStateCount
 import com.netter.paylist.data.dao.EventDao
+import com.netter.paylist.data.dao.ExportAuditDao
 import com.netter.paylist.data.dao.MatchResultDao
 import com.netter.paylist.data.dao.OrderRegistryDao
 import com.netter.paylist.data.dao.RegistryImportMetadataDao
@@ -22,6 +23,7 @@ import com.netter.paylist.data.entity.CollectorStateEntity
 import com.netter.paylist.data.entity.DeliveryAttemptEntity
 import com.netter.paylist.data.entity.DeliveryEntity
 import com.netter.paylist.data.entity.EventEntity
+import com.netter.paylist.data.entity.ExportAuditEntity
 import com.netter.paylist.data.entity.MatchResultEntity
 import com.netter.paylist.data.entity.OrderRegistryEntity
 import com.netter.paylist.data.entity.PromotionReceiptEntity
@@ -64,6 +66,9 @@ class FakeStore {
     /** Durable capture log (LH-04), keyed by `capture_id`. */
     val captureLog = LinkedHashMap<String, CaptureLogEntity>()
 
+    /** Export audit rows, keyed by `export_id` (D5 reconciliation export). */
+    val exportAudit = LinkedHashMap<String, ExportAuditEntity>()
+
     data class Snapshot(
         val events: Map<String, EventEntity>,
         val eventsByDedupe: Map<String, EventEntity>,
@@ -79,6 +84,7 @@ class FakeStore {
         val matchResults: Map<String, MatchResultEntity>,
         val registryImports: Map<String, RegistryImportMetadataEntity>,
         val captureLog: Map<String, CaptureLogEntity>,
+        val exportAudit: Map<String, ExportAuditEntity>,
     )
 
     /** Entities are immutable data classes, so a shallow map copy is a full snapshot. */
@@ -97,6 +103,7 @@ class FakeStore {
         matchResults.toMap(),
         registryImports.toMap(),
         captureLog.toMap(),
+        exportAudit.toMap(),
     )
 
     fun restore(s: Snapshot) {
@@ -114,6 +121,7 @@ class FakeStore {
         matchResults.clear(); matchResults.putAll(s.matchResults)
         registryImports.clear(); registryImports.putAll(s.registryImports)
         captureLog.clear(); captureLog.putAll(s.captureLog)
+        exportAudit.clear(); exportAudit.putAll(s.exportAudit)
     }
 }
 
@@ -167,6 +175,14 @@ class FakeEventDao(private val store: FakeStore) : EventDao {
     override suspend fun getBySourceAccountKey(key: String): List<EventEntity> = store.lock.withLock {
         store.events.values.filter { it.sourceAccountKey == key }
     }
+    override suspend fun listPaymentEvents(fromMs: Long?, toMs: Long?): List<EventEntity> =
+        store.lock.withLock {
+            store.events.values
+                .filter { it.category == "payment" }
+                .filter { fromMs == null || it.occurredAtMs >= fromMs }
+                .filter { toMs == null || it.occurredAtMs <= toMs }
+                .sortedWith(compareBy({ it.occurredAtMs }, { it.eventId }))
+        }
     override suspend fun count(): Int = store.lock.withLock { store.events.size }
 
     override suspend fun nullAllSourceAccountKeys(): Int = store.lock.withLock {
@@ -499,6 +515,32 @@ class FakeDeliveryDao(private val store: FakeStore) : DeliveryDao {
         1
     }
 
+    override suspend fun blockPending(
+        id: String,
+        errorCode: String,
+        errorSummary: String,
+        now: Long,
+    ): Int = store.lock.withLock {
+        val row = store.deliveries[id] ?: return@withLock 0
+        if (row.state != DeliveryState.PENDING) return@withLock 0
+        val blocked = row.copy(
+            state = DeliveryState.BLOCKED, lastErrorCode = errorCode,
+            lastErrorSummary = errorSummary, updatedAtMs = now,
+        )
+        store.deliveries[id] = blocked
+        blocked.legacyQkey?.let { store.deliveriesByQkey[it] = blocked }
+        1
+    }
+
+    override suspend fun updateRouteStamps(id: String, routeStampsJson: String, now: Long): Int =
+        store.lock.withLock {
+            val row = store.deliveries[id] ?: return@withLock 0
+            val updated = row.copy(routeStampsJson = routeStampsJson, updatedAtMs = now)
+            store.deliveries[id] = updated
+            updated.legacyQkey?.let { store.deliveriesByQkey[it] = updated }
+            1
+        }
+
     override suspend fun deleteById(id: String): Int = store.lock.withLock {
         val row = store.deliveries.remove(id) ?: return@withLock 0
         row.legacyQkey?.let { store.deliveriesByQkey.remove(it) }
@@ -737,6 +779,28 @@ class FakeMatchResultDao(private val store: FakeStore) : MatchResultDao {
         store.matchResults[result.matchId] = result
     }
 
+    // Room @Update silently no-ops when the row is missing.
+    override suspend fun update(result: MatchResultEntity): Unit = store.lock.withLock {
+        if (store.matchResults.containsKey(result.matchId)) {
+            store.matchResults[result.matchId] = result
+        }
+    }
+
+    override suspend fun updateAdvisory(
+        matchId: String,
+        status: String,
+        ruleId: String,
+        reviewReason: String?,
+    ): Int = store.lock.withLock {
+        val row = store.matchResults[matchId] ?: return@withLock 0
+        store.matchResults[matchId] = row.copy(
+            advisoryMatchStatus = status,
+            ruleId = ruleId,
+            reviewReason = reviewReason,
+        )
+        1
+    }
+
     override suspend fun getById(id: String): MatchResultEntity? =
         store.lock.withLock { store.matchResults[id] }
 
@@ -779,6 +843,19 @@ class FakeMatchResultDao(private val store: FakeStore) : MatchResultDao {
         store.lock.lock()
         try {
             return super.attribute(candidate, verifiedSameBankTransaction)
+        } finally {
+            store.lock.unlock()
+        }
+    }
+
+    override suspend fun attributeExisting(
+        candidate: MatchResultEntity,
+        verifiedSameBankTransaction: Boolean,
+        reviewNote: String,
+    ): AttributionOutcome {
+        store.lock.lock()
+        try {
+            return super.attributeExisting(candidate, verifiedSameBankTransaction, reviewNote)
         } finally {
             store.lock.unlock()
         }
@@ -999,5 +1076,24 @@ class FakeCaptureLogDao(private val store: FakeStore) : CaptureLogDao {
         }
         doomed.forEach { store.captureLog.remove(it.captureId) }
         doomed.size
+    }
+}
+
+/** Fake [ExportAuditDao] (D5 reconciliation export audit). */
+class FakeExportAuditDao(private val store: FakeStore) : ExportAuditDao {
+    override suspend fun insert(audit: ExportAuditEntity) = store.lock.withLock {
+        store.exportAudit[audit.exportId] = audit
+    }
+
+    override suspend fun getById(id: String): ExportAuditEntity? = store.lock.withLock {
+        store.exportAudit[id]
+    }
+
+    override suspend fun getRecent(limit: Int): List<ExportAuditEntity> = store.lock.withLock {
+        store.exportAudit.values.sortedByDescending { it.exportedAtMs }.take(limit)
+    }
+
+    override suspend fun countByStatus(status: String): Int = store.lock.withLock {
+        store.exportAudit.values.count { it.status == status }
     }
 }

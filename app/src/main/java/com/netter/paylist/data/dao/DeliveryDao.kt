@@ -358,6 +358,32 @@ interface DeliveryDao {
     )
     suspend fun retryManual(id: String, now: Long): Int
 
+    /**
+     * `PENDING → BLOCKED` for the route-lifecycle sweep (D5, F16/F21):
+     * revocation, route delete/disable, or config change blocks
+     * pending deliveries outside the worker (no lease is held).
+     * The caller validates the transition against
+     * `DeliveryStateMachine` before calling.
+     */
+    @Query(
+        "UPDATE deliveries SET state = 'BLOCKED', last_error_code = :errorCode, " +
+            "last_error_summary = :errorSummary, updated_at_ms = :now " +
+            "WHERE delivery_id = :id AND state = 'PENDING'",
+    )
+    suspend fun blockPending(id: String, errorCode: String, errorSummary: String, now: Long): Int
+
+    /**
+     * Re-stamps a delivery's route stamps (D5, F21 re-approval):
+     * after re-grant or URL change, the operator's explicit
+     * reactivation refreshes the stamp so the claim-time check
+     * passes against current consent/config.
+     */
+    @Query(
+        "UPDATE deliveries SET route_stamps_json = :routeStampsJson, updated_at_ms = :now " +
+            "WHERE delivery_id = :id",
+    )
+    suspend fun updateRouteStamps(id: String, routeStampsJson: String, now: Long): Int
+
     /** Local-only deletion (Stage D UI). */
     @Query("DELETE FROM deliveries WHERE delivery_id = :id")
     suspend fun deleteById(id: String): Int

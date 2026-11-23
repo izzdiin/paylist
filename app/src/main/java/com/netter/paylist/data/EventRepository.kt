@@ -349,4 +349,7 @@ internal object RouteStampMap {
             emptyMap()
         }
     }
+
+    /** Serialises a stamp map (D5 re-approval re-stamping). */
+    fun toJsonString(stamps: Map<String, RouteStamp>): String = stamps.toJsonString()
 }

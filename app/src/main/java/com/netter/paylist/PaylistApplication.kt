@@ -8,9 +8,14 @@ import com.netter.paylist.collector.CaptureLogSink
 import com.netter.paylist.collector.ConsentStore
 import com.netter.paylist.collector.PrivacyGate
 import com.netter.paylist.collector.RawSnapshotStore
+import com.netter.paylist.collector.RouteLifecycle
 import com.netter.paylist.collector.StoreLegacySweep
 import com.netter.paylist.collector.StoreQuarantineQueue
 import com.netter.paylist.collector.StoreReviewRoutes
+import com.netter.paylist.collector.StoreRouteQueueStore
+import com.netter.paylist.export.ReconciliationExport
+import com.netter.paylist.export.ReconciliationExportRunner
+import com.netter.paylist.export.StoreConsentSnapshotSource
 import com.netter.paylist.data.EventRepository
 import com.netter.paylist.data.PaylistDatabase
 import com.netter.paylist.data.entity.CollectorStateEntity
@@ -248,6 +253,60 @@ class PaylistApplication : Application(), Configuration.Provider {
         )
     }
 
+    /**
+     * The Stage D route lifecycle (§7.5/F21): revoke/delete/
+     * disable/enable + the BLOCKED sweep and explicit reactivation.
+     */
+    val routeLifecycle: RouteLifecycle by lazy {
+        RouteLifecycle(
+            deliveryDao = db.deliveryDao(),
+            transactions = db.transactionRunner(),
+            consentStore = consentStore,
+            routes = StoreRouteSource(store),
+            queueStore = StoreRouteQueueStore(store),
+            rawSnapshotStore = rawSnapshotStore,
+        )
+    }
+
+    /**
+     * The §7.7A reconciliation export (Q1 REQUIRED) — the only
+     * export path in the app (F55). Quarantined dedupe keys come
+     * from the coordinator's quarantine records (unresolved only).
+     */
+    val reconciliationExport: ReconciliationExport by lazy {
+        val routeSource = StoreRouteSource(store)
+        ReconciliationExport(
+            eventDao = db.eventDao(),
+            deliveryDao = db.deliveryDao(),
+            matchResultDao = db.matchResultDao(),
+            classificationDao = db.classificationDao(),
+            routes = routeSource,
+            consentSource = StoreConsentSnapshotSource(consentStore, routeSource),
+            quarantinedDedupeKeys = {
+                runBlocking {
+                    coordinator.listAll()
+                        .filter { it.resolution == null }
+                        .map { it.dedupeKey }
+                        .toSet()
+                }
+            },
+        )
+    }
+
+    /** Streams a frozen export to SAF with per-row revalidation + audit. */
+    val exportRunner: ReconciliationExportRunner by lazy {
+        ReconciliationExportRunner(reconciliationExport, db.exportAuditDao())
+    }
+
+    /** Read-only held-count aggregates for the Diagnostics screen (D5). */
+    val diagnosticsRepository: DiagnosticsRepository by lazy {
+        DiagnosticsRepository(
+            deliveryDao = db.deliveryDao(),
+            queueSnapshot = { store.queue() },
+            ambiguousCount = { historyRepository.ambiguousCount() },
+        )
+    }
+
     override fun onCreate() {
         super.onCreate()
         Thread { startup() }.start()
@@ -335,6 +394,41 @@ class PaylistApplication : Application(), Configuration.Provider {
             }
         } catch (e: Exception) {
             store.logLocal("migrasi secret gagal: ${e.message?.take(120)}")
+        }
+        try {
+            // Stage D D5: one-time upgrade migration (§7.5) — routes
+            // that already exist from v2.3 carry their working
+            // consent forward (the operator already runs the
+            // listener; the upgrade must not silently stop billing
+            // capture). Guarded by the collector marker doc; never
+            // re-grants a revoked route. Fresh installs get no
+            // grant until the operator completes consent in
+            // RouteEditActivity.
+            val marker = runBlocking {
+                db.collectorStateDao().get(RouteLifecycle.UPGRADE_MIGRATION_KEY)
+            }
+            if (marker == null) {
+                val granted = runBlocking {
+                    routeLifecycle.migrateUpgradeConsent(store.routes().map { it.id })
+                }
+                runBlocking {
+                    db.collectorStateDao().put(
+                        CollectorStateEntity(
+                            RouteLifecycle.UPGRADE_MIGRATION_KEY,
+                            JSONObject().apply {
+                                put("granted", granted)
+                                put("at_ms", System.currentTimeMillis())
+                            }.toString(),
+                            System.currentTimeMillis(),
+                        )
+                    )
+                }
+                if (granted > 0) {
+                    store.logLocal("migrasi persetujuan: $granted rute lama diaktifkan")
+                }
+            }
+        } catch (e: Exception) {
+            store.logLocal("migrasi persetujuan gagal: ${e.message?.take(120)}")
         }
         try {
             SyncScheduler.schedulePeriodic(this)

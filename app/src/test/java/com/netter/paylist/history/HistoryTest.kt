@@ -539,6 +539,9 @@ class HistoryTest {
             "MigrationTest.kt", "OutboxMigrationTest.kt",
             // C1 badge tests build capture rows (AmbiguousAlertTest).
             "AmbiguousAlertTest.kt",
+            // D5 onboarding tests wire the capture-log DAO for the
+            // F16 local-delete fixture (OnboardingTest).
+            "OnboardingTest.kt",
         )
         val moduleDir = root.absoluteFile.parentFile?.parentFile?.parentFile
             ?: throw AssertionError("cannot derive the module dir for LH-T08")

@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.Query
 import androidx.room.Transaction
+import androidx.room.Update
 import com.netter.paylist.data.entity.AdvisoryMatchStatus
 import com.netter.paylist.data.entity.AttributionStatus
 import com.netter.paylist.data.entity.MatchResultEntity
@@ -41,6 +42,25 @@ enum class AttributionOutcome {
 interface MatchResultDao {
     @Insert
     suspend fun insert(result: MatchResultEntity)
+
+    @Update
+    suspend fun update(result: MatchResultEntity)
+
+    /**
+     * Operator decision on a review row (D5): marks the row with a
+     * new advisory status + review note. Returns the rows updated
+     * (0 when the row is gone).
+     */
+    @Query(
+        "UPDATE match_results SET advisory_match_status = :status, rule_id = :ruleId, " +
+            "review_reason = :reviewReason WHERE match_id = :matchId",
+    )
+    suspend fun updateAdvisory(
+        matchId: String,
+        status: String,
+        ruleId: String,
+        reviewReason: String?,
+    ): Int
 
     @Query("SELECT * FROM match_results WHERE match_id = :id")
     suspend fun getById(id: String): MatchResultEntity?
@@ -129,6 +149,64 @@ interface MatchResultDao {
                 // between the matcher's pre-read and this call.
                 ruleId = MatchRuleId.CONCURRENT_LOSER,
                 reviewReason = "order already attributed; identity unverified (case C/D)",
+            ),
+        )
+        return AttributionOutcome.AMBIGUOUS
+    }
+
+    /**
+     * Operator attribution of an EXISTING review row (Stage D D5).
+     * Same atomic decision table as [attribute], but UPDATES the
+     * stored row instead of inserting — the row is already in the
+     * table (ambiguous/manual_review), so an insert would conflict
+     * on the primary key. The operator examined the evidence, so
+     * the caller passes verified=true; the unverified branch is
+     * kept for symmetry with [attribute].
+     */
+    @Transaction
+    suspend fun attributeExisting(
+        candidate: MatchResultEntity,
+        verifiedSameBankTransaction: Boolean,
+        reviewNote: String,
+    ): AttributionOutcome {
+        val merchantId = candidate.merchantId
+        val orderNumber = candidate.orderNumber
+        require(!merchantId.isNullOrBlank() && !orderNumber.isNullOrBlank()) {
+            "attribution requires merchant_id and order_number"
+        }
+        val existing = getAttributed(merchantId, orderNumber)
+        if (existing == null) {
+            update(
+                candidate.copy(
+                    advisoryMatchStatus = AdvisoryMatchStatus.MATCHED,
+                    attributionStatus = AttributionStatus.ATTRIBUTED,
+                    attributedOrderKey = "$merchantId|$orderNumber",
+                    reviewReason = reviewNote,
+                ),
+            )
+            return AttributionOutcome.ATTRIBUTED
+        }
+        if (verifiedSameBankTransaction) {
+            update(
+                candidate.copy(
+                    advisoryMatchStatus = AdvisoryMatchStatus.MATCHED,
+                    attributionStatus = AttributionStatus.DUPLICATE_EVIDENCE,
+                    attributedToMatchId = existing.matchId,
+                    attributedOrderKey = null,
+                    ruleId = MatchRuleId.DUPLICATE_EVIDENCE,
+                    reviewReason = reviewNote,
+                ),
+            )
+            return AttributionOutcome.DUPLICATE_EVIDENCE
+        }
+        update(
+            candidate.copy(
+                advisoryMatchStatus = AdvisoryMatchStatus.AMBIGUOUS,
+                attributionStatus = AttributionStatus.NONE,
+                attributedToMatchId = null,
+                attributedOrderKey = null,
+                ruleId = MatchRuleId.CONCURRENT_LOSER,
+                reviewReason = reviewNote,
             ),
         )
         return AttributionOutcome.AMBIGUOUS

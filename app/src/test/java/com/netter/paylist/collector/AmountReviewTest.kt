@@ -780,4 +780,125 @@ class AmountReviewTest {
         val amount = queue[3] as ReviewItem.AmountQuestion
         assertEquals(listOf(500000L, 100000L), amount.tokens.map { it.value })
     }
+
+    // --- D5: P3 manual attribution pick ---
+
+    private fun Harness.matchRow(
+        matchId: String = UUID.randomUUID().toString(),
+        eventId: String = UUID.randomUUID().toString(),
+        merchantId: String? = "merchant-a",
+        orderNumber: String? = "INV-100",
+        status: String = AdvisoryMatchStatus.AMBIGUOUS,
+        attribution: String = AttributionStatus.NONE,
+    ) = MatchResultEntity(
+        matchId = matchId,
+        eventId = eventId,
+        merchantId = merchantId,
+        orderNumber = orderNumber,
+        bankReference = "TRX-555",
+        sourceAccountMasked = "****1234",
+        advisoryMatchStatus = status,
+        confidence = 0.5,
+        ruleId = MatchRuleId.CONCURRENT_LOSER,
+        registryVersion = "v1",
+        attributionStatus = attribution,
+        auditJson = "{}",
+        evidenceIdentity = null,
+        reviewReason = "ambiguous",
+        createdAtMs = now,
+    )
+
+    @Test
+    fun resolveMatch_attribute_becomesTheAttribution() = runBlocking {
+        val h = Harness()
+        val row = h.matchRow()
+        h.matchDao.insert(row)
+
+        val outcome = h.review.resolveMatch(row.matchId, attribute = true, OPERATOR)
+
+        assertTrue(outcome is MatchResolveOutcome.Attributed)
+        val updated = h.matchDao.getById(row.matchId)!!
+        assertEquals(AttributionStatus.ATTRIBUTED, updated.attributionStatus)
+        assertEquals(AdvisoryMatchStatus.MATCHED, updated.advisoryMatchStatus)
+        assertEquals("merchant-a|INV-100", updated.attributedOrderKey)
+        // The row leaves the review queue.
+        assertTrue(h.review.listReviewQueue().none { it is ReviewItem.MatchQuestion })
+        // The decision is audited.
+        val audits = h.collectorDao.getAll().filter {
+            it.key.startsWith(CollectorStateKeys.REVIEW_AUDIT_PREFIX)
+        }
+        assertEquals(1, audits.size)
+        assertTrue(audits[0].valueJson.contains("match_attribute"))
+        assertTrue(audits[0].valueJson.contains(OPERATOR))
+    }
+
+    @Test
+    fun resolveMatch_attribute_existingAttribution_becomesDuplicateEvidence() = runBlocking {
+        val h = Harness()
+        val first = h.matchRow(matchId = "m-first")
+        h.matchDao.insert(first)
+        assertTrue(
+            h.review.resolveMatch(first.matchId, attribute = true, OPERATOR)
+                is MatchResolveOutcome.Attributed
+        )
+        val second = h.matchRow(matchId = "m-second")
+        h.matchDao.insert(second)
+
+        val outcome = h.review.resolveMatch(second.matchId, attribute = true, OPERATOR)
+
+        assertTrue(outcome is MatchResolveOutcome.DuplicateEvidence)
+        val updated = h.matchDao.getById(second.matchId)!!
+        assertEquals(AttributionStatus.DUPLICATE_EVIDENCE, updated.attributionStatus)
+        assertEquals("m-first", updated.attributedToMatchId)
+        // Still exactly one attributed row for the order.
+        assertEquals(
+            "m-first",
+            h.matchDao.getAttributed("merchant-a", "INV-100")!!.matchId,
+        )
+    }
+
+    @Test
+    fun resolveMatch_attribute_noOrder_refused() = runBlocking {
+        val h = Harness()
+        val row = h.matchRow(orderNumber = null, status = AdvisoryMatchStatus.MANUAL_REVIEW)
+        h.matchDao.insert(row)
+
+        val outcome = h.review.resolveMatch(row.matchId, attribute = true, OPERATOR)
+
+        assertTrue(outcome is MatchResolveOutcome.Refused)
+        assertEquals(
+            AdvisoryMatchStatus.MANUAL_REVIEW,
+            h.matchDao.getById(row.matchId)!!.advisoryMatchStatus,
+        )
+    }
+
+    @Test
+    fun resolveMatch_unmatched_marksRowAndLeavesQueue() = runBlocking {
+        val h = Harness()
+        val row = h.matchRow()
+        h.matchDao.insert(row)
+
+        val outcome = h.review.resolveMatch(row.matchId, attribute = false, OPERATOR)
+
+        assertTrue(outcome is MatchResolveOutcome.MarkedUnmatched)
+        val updated = h.matchDao.getById(row.matchId)!!
+        assertEquals(AdvisoryMatchStatus.UNMATCHED, updated.advisoryMatchStatus)
+        assertTrue(updated.reviewReason!!.contains(OPERATOR))
+        assertTrue(h.review.listReviewQueue().none { it is ReviewItem.MatchQuestion })
+    }
+
+    @Test
+    fun resolveMatch_alreadyDecided_refused() = runBlocking {
+        val h = Harness()
+        val row = h.matchRow()
+        h.matchDao.insert(row)
+        assertTrue(
+            h.review.resolveMatch(row.matchId, attribute = false, OPERATOR)
+                is MatchResolveOutcome.MarkedUnmatched
+        )
+
+        val outcome = h.review.resolveMatch(row.matchId, attribute = true, OPERATOR)
+
+        assertTrue(outcome is MatchResolveOutcome.Refused)
+    }
 }

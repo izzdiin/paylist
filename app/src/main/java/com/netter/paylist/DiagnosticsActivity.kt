@@ -15,6 +15,7 @@ import android.widget.Toast
 import com.netter.paylist.collector.AmountReview
 import com.netter.paylist.collector.AuthorizeOutcome
 import com.netter.paylist.collector.DiscardOutcome
+import com.netter.paylist.collector.MatchResolveOutcome
 import com.netter.paylist.collector.PickOutcome
 import com.netter.paylist.collector.QuarantineOutcome
 import com.netter.paylist.collector.ReviewItem
@@ -167,11 +168,24 @@ class DiagnosticsActivity : Activity() {
             } catch (e: Exception) {
                 emptyList()
             }
-            runOnUiThread { renderList(root, items, mode) }
+            val held = try {
+                runBlocking { app.diagnosticsRepository.heldCounts() }
+            } catch (e: Exception) {
+                null
+            }
+            val routeNames = Store(this@DiagnosticsActivity).routes()
+                .associate { it.id to it.name }
+            runOnUiThread { renderList(root, items, mode, held, routeNames) }
         }.start()
     }
 
-    private fun renderList(root: LinearLayout, items: List<ReviewItem>, mode: CutoverMode?) {
+    private fun renderList(
+        root: LinearLayout,
+        items: List<ReviewItem>,
+        mode: CutoverMode?,
+        held: DiagnosticsRepository.HeldCounts?,
+        routeNames: Map<String, String>,
+    ) {
         root.removeAllViews()
         root.addView(TextView(this).apply {
             text = "Review & Diagnostik"
@@ -205,6 +219,39 @@ class DiagnosticsActivity : Activity() {
             })
         }
         root.addView(disclosure)
+        // D5 status card: HELD counts per state and per route.
+        if (held != null) {
+            val status = cardLayout()
+            status.addView(TextView(this).apply {
+                text = "Status pengiriman tertahan"
+                textSize = 16f
+                setTextColor(DARK)
+                setTypeface(typeface, Typeface.BOLD)
+            })
+            val lines = mutableListOf<String>()
+            lines += "Jumlah ambigu (NEEDS_REVIEW): ${held.needsReview}"
+            lines += "Teks asli hilang (RAW_UNAVAILABLE): ${held.rawUnavailable}"
+            lines += "Menunggu sapuan legacy: ${held.heldAwaitingLegacySweep}"
+            lines += "Menunggu rekonsiliasi: ${held.heldAwaitingReconciliation}"
+            lines += "Diblokir (persetujuan/konfigurasi): ${held.blocked}"
+            lines += "Antrean legacy tertahan: ${held.legacyQueueHeld}"
+            lines += "Kasus ambigu belum ditindaklanjuti: ${held.ambiguousUnreviewed}"
+            for (line in lines) status.addView(small(line))
+            if (held.perRoute.isNotEmpty()) {
+                status.addView(TextView(this).apply {
+                    text = "Per rute:"
+                    textSize = 13f
+                    setTextColor(DARK)
+                    setTypeface(typeface, Typeface.BOLD)
+                    setPadding(0, dp(8), 0, dp(2))
+                })
+                for ((routeId, count) in held.perRoute.entries.sortedByDescending { it.value }) {
+                    val name = routeNames[routeId] ?: routeId
+                    status.addView(small("$name: $count tertahan"))
+                }
+            }
+            root.addView(status)
+        }
         root.addView(TextView(this).apply {
             text = if (items.isEmpty()) {
                 "Tidak ada yang perlu direview."
@@ -374,7 +421,36 @@ class DiagnosticsActivity : Activity() {
         card.addView(label("Merchant: ${row.merchantId} · Order: ${row.orderNumber ?: "-"}"))
         card.addView(label("Status: ${row.advisoryMatchStatus} · Keyakinan: ${row.confidence}"))
         row.reviewReason?.let { card.addView(small(it)) }
-        card.addView(small("Tindakan manual (pilih order / perbaiki nomor / buang atribusi) menyusul di D5. Tidak ada atribusi otomatis."))
+        card.addView(small("Keputusan ini hanya advisory (dicatat lokal, tidak dikirim ke server)."))
+        val attribute = primaryButton("Cocok — atributkan ke pesanan ini")
+        attribute.setOnClickListener {
+            confirm("Atribusikan transaksi ini ke pesanan ${row.orderNumber ?: "-"}?") {
+                runReviewAction("Mengatribusikan…") {
+                    when (val r = review().resolveMatch(row.matchId, attribute = true, operator())) {
+                        is MatchResolveOutcome.Attributed -> "Diatribusikan ke pesanan ini."
+                        is MatchResolveOutcome.DuplicateEvidence ->
+                            "Pesanan sudah diatribusikan; transaksi ini dicatat sebagai bukti duplikat."
+                        is MatchResolveOutcome.StillAmbiguous -> "Masih ambigu — lihat log audit."
+                        is MatchResolveOutcome.MarkedUnmatched -> "Ditandai bukan transaksi ini."
+                        is MatchResolveOutcome.Refused -> "Ditolak: ${r.reason}"
+                    }
+                }
+            }
+        }
+        card.addView(attribute)
+        val unmatched = ghostButton("Bukan transaksi ini")
+        unmatched.setOnClickListener {
+            confirm("Tandai sebagai bukan transaksi pesanan ini?") {
+                runReviewAction("Menandai…") {
+                    when (val r = review().resolveMatch(row.matchId, attribute = false, operator())) {
+                        is MatchResolveOutcome.MarkedUnmatched -> "Ditandai bukan transaksi ini."
+                        is MatchResolveOutcome.Refused -> "Ditolak: ${r.reason}"
+                        else -> "Keputusan tidak terduga: $r"
+                    }
+                }
+            }
+        }
+        card.addView(unmatched)
         return card
     }
 

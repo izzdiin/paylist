@@ -70,6 +70,8 @@ data class CaptureCounters(
     val rawSnapshotsEvicted: Long = 0,
     /** Capture-log inserts that failed (LH-04(d) — surfaced, never silent). */
     val captureLogFailures: Long = 0,
+    /** Notifications dropped: no consenting route (D5, F15). */
+    val noConsent: Long = 0,
 )
 
 /**
@@ -169,6 +171,7 @@ class CaptureCoordinator(
     private val pureAuth = AtomicLong()
     private val rawSnapshotsEvicted = AtomicLong()
     private val captureLogFailures = AtomicLong()
+    private val noConsent = AtomicLong()
 
     private fun daemonFactory(name: String): ThreadFactory = ThreadFactory { r ->
         Thread(r, name).apply { isDaemon = true }
@@ -221,6 +224,7 @@ class CaptureCoordinator(
         pureAuth = pureAuth.get(),
         rawSnapshotsEvicted = rawSnapshotsEvicted.get(),
         captureLogFailures = captureLogFailures.get(),
+        noConsent = noConsent.get(),
     )
 
     /**
@@ -286,6 +290,23 @@ class CaptureCoordinator(
             )
             return
         }
+        // D5 consent gate (F15): no capture before the onboarding
+        // opt-in completes. Only routes with a granted consent
+        // record proceed; a notification matching no consenting
+        // route is dropped before any parse, gate, or durable
+        // write. A null consent store (bare coordinator in tests)
+        // cannot verify consent, so the gate is skipped there;
+        // production always wires the store.
+        val consented = consentStore?.let { store ->
+            matched.filter { route ->
+                runCatching { store.get(route.id)?.granted == true }.getOrDefault(false)
+            }
+        } ?: matched
+        if (consented.isEmpty()) {
+            noConsent.incrementAndGet()
+            logger.logEvent(pkg, "tanpa-persetujuan: $pkg (tidak ada rute yang disetujui)")
+            return
+        }
         val input = ParserInput(pkg, snapshot.title, snapshot.text, snapshot.bigText, snapshot.postTimeMs)
         val parsed = parser.parse(input)
         val now = clock()
@@ -327,14 +348,14 @@ class CaptureCoordinator(
         // before ANY durable write. The gate result's redacted
         // fields are the only text that ever reaches storage.
         val gate = privacyGate.gate(snapshot, amount)
-        val routeIds = matched.map { it.id }
+        val routeIds = consented.map { it.id }
         // §7.3A: the B-eligible routes for this capture (mixed
         // financial+OTP event + valid P6 opt-in). Computed before
         // the payload so the legacy queue item carries the
         // `raw_ephemeral` flag the flush needs to take the snapshot
         // at its per-hop claim step (§7.3A(d)).
         val bRoutes = if (rawSnapshotStore != null && gate.hasConfirmedSecret) {
-            matched.filter { privacyGate.isBEligible(it.id, snapshot, amount, now) }
+            consented.filter { privacyGate.isBEligible(it.id, snapshot, amount, now) }
         } else {
             emptyList()
         }
@@ -376,7 +397,7 @@ class CaptureCoordinator(
         // capture + the URL hash. Config epoch has no live source
         // in Stage D (route config lives in SharedPreferences) —
         // stamped 0 until the D5 route editor tracks it.
-        val stamps = matched.associate { route ->
+        val stamps = consented.associate { route ->
             val epoch = consentStore?.epoch(route.id) ?: -1L
             route.id to RouteStamp(
                 consentEpoch = epoch,
@@ -418,9 +439,10 @@ class CaptureCoordinator(
             dedupeKey = dedupeKey,
             contentSha256 = contentSha,
             payloadSha256 = sha256Hex(payload.toString()),
-            // The staging row carries one epoch: the first matched
-            // route's (per-route epochs live on the delivery's
-            // routeStampsJson; the sweep's gate reads those).
+            // The staging row carries one epoch: the first
+            // consenting route's (per-route epochs live on the
+            // delivery's routeStampsJson; the sweep's gate reads
+            // those).
             consentEpoch = stamps.values.firstOrNull()?.consentEpoch ?: -1L,
             configEpoch = 0,
             createdAtMs = now,

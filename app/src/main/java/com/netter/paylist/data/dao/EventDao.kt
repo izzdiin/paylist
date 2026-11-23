@@ -35,6 +35,21 @@ interface EventDao {
     @Query("SELECT * FROM events WHERE source_account_key = :key")
     suspend fun getBySourceAccountKey(key: String): List<EventEntity>
 
+    /**
+     * Payment events in a date range for the reconciliation export
+     * (§7.7A): heartbeat/test events are excluded by the category
+     * filter at the Room read, never by post-filtering a dump.
+     * Ordered by occurrence time; the exporter applies the
+     * `row_id` tie-break after building rows.
+     */
+    @Query(
+        "SELECT * FROM events WHERE category = 'payment' " +
+            "AND (:fromMs IS NULL OR occurred_at_ms >= :fromMs) " +
+            "AND (:toMs IS NULL OR occurred_at_ms <= :toMs) " +
+            "ORDER BY occurred_at_ms ASC, event_id ASC",
+    )
+    suspend fun listPaymentEvents(fromMs: Long?, toMs: Long?): List<EventEntity>
+
     @Query("SELECT COUNT(*) FROM events")
     suspend fun count(): Int
 

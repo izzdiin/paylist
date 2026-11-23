@@ -1,6 +1,7 @@
 package com.netter.paylist
 
 import android.content.Context
+import com.netter.paylist.collector.RouteLifecycle
 import com.netter.paylist.delivery.HttpTransportClient
 import com.netter.paylist.delivery.LegacyResponseClassifier
 import com.netter.paylist.delivery.ResponseClassification
@@ -213,6 +214,14 @@ class Sender(
 
     /** @return true bila item selesai dan boleh dihapus dari antrean. */
     private fun processItem(store: Store, item: JSONObject): Boolean {
+        // D5 route lifecycle (F16/F21): an item held for a
+        // revoked/deleted/disabled route is never POSTed — it
+        // stays queued until the operator reactivates the route.
+        // The hold is silent per flush (the reason is on the
+        // item); Diagnostics surfaces the held count.
+        if (item.optJSONArray(RouteLifecycle.HELD_ROUTES_KEY)?.length() ?: 0 > 0) {
+            return false
+        }
         val payload = item.getJSONObject("payload")
         if (item.optString("kind") == "chain") {
             val ids = Route.jsonStrings(item.optJSONArray("route_ids"))

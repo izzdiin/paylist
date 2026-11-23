@@ -14,6 +14,9 @@ import com.netter.paylist.data.dao.CollectorStateDao
 import com.netter.paylist.data.dao.DeliveryDao
 import com.netter.paylist.data.dao.EventDao
 import com.netter.paylist.data.dao.MatchResultDao
+import com.netter.paylist.data.dao.AttributionOutcome
+import com.netter.paylist.data.entity.AdvisoryMatchStatus
+import com.netter.paylist.data.entity.AttributionStatus
 import com.netter.paylist.data.entity.CollectorStateEntity
 import com.netter.paylist.data.entity.CollectorStateKeys
 import com.netter.paylist.data.entity.DeliveryEntity
@@ -226,6 +229,23 @@ sealed interface QuarantineOutcome {
     data class NotFound(val dedupeKey: String) : QuarantineOutcome
     data class AlreadyResolved(val resolution: String) : QuarantineOutcome
     data class Refused(val reason: String) : QuarantineOutcome
+}
+
+/** Outcome of the D5 manual P3 attribution pick. */
+sealed interface MatchResolveOutcome {
+    /** The row became the one `attributed` row for its order. */
+    data class Attributed(val matchId: String) : MatchResolveOutcome
+
+    /** An attribution already exists; this row is verified duplicate evidence. */
+    data class DuplicateEvidence(val matchId: String) : MatchResolveOutcome
+
+    /** Still ambiguous after the pick (unverified branch — defensive only). */
+    data class StillAmbiguous(val matchId: String) : MatchResolveOutcome
+
+    /** The operator marked the row as not this transaction. */
+    data class MarkedUnmatched(val matchId: String) : MatchResolveOutcome
+
+    data class Refused(val reason: String) : MatchResolveOutcome
 }
 
 /**
@@ -806,6 +826,95 @@ class AmountReview(
             return DiscardOutcome.Refused("delivery berubah bersamaan")
         }
         return DiscardOutcome.Discarded(legacyCopyExisted = false)
+    }
+
+    // --- P3 manual attribution pick (D5) ---
+
+    /**
+     * Resolves a P3 review row by operator decision.
+     *
+     * - `attribute = true`: the operator examined the evidence and
+     *   confirms the match, so the pick is verified same-bank
+     *   evidence (`attributeExisting(verified = true)`). Without a
+     *   merchant/order pair the pick is refused — attribution
+     *   requires both.
+     * - `attribute = false`: the row is marked `unmatched` with the
+     *   operator's note; the event itself is untouched.
+     *
+     * Advisory only: the decision is recorded in `match_results`
+     * + a review-audit document, never transmitted, never written
+     * to `deliveries.last_match_status` (§3.1).
+     */
+    suspend fun resolveMatch(
+        matchId: String,
+        attribute: Boolean,
+        operator: String,
+        nowMs: Long = clock(),
+    ): MatchResolveOutcome {
+        val dao = matchResultDao
+            ?: return MatchResolveOutcome.Refused("match store tidak tersedia")
+        val row = dao.getById(matchId)
+            ?: return MatchResolveOutcome.Refused("baris tidak ditemukan")
+        if (row.advisoryMatchStatus != AdvisoryMatchStatus.AMBIGUOUS &&
+            row.advisoryMatchStatus != AdvisoryMatchStatus.MANUAL_REVIEW
+        ) {
+            return MatchResolveOutcome.Refused(
+                "baris berstatus ${row.advisoryMatchStatus}, bukan menunggu review",
+            )
+        }
+        if (attribute) {
+            if (row.merchantId.isNullOrBlank() || row.orderNumber.isNullOrBlank()) {
+                return MatchResolveOutcome.Refused(
+                    "tidak ada nomor pesanan — tidak dapat diatribusikan",
+                )
+            }
+            if (row.attributionStatus == AttributionStatus.ATTRIBUTED) {
+                return MatchResolveOutcome.Refused("sudah diatribusikan")
+            }
+            val note = "operator $operator: diatribusikan manual"
+            val outcome = dao.attributeExisting(row, verifiedSameBankTransaction = true, note)
+            transactions.run {
+                writeAudit(
+                    "match_attribute", matchId, nowMs,
+                    JSONObject().apply {
+                        put("event_id", row.eventId)
+                        put("merchant_id", row.merchantId)
+                        put("order_number", row.orderNumber)
+                        put("outcome", outcome.name)
+                        put("operator", operator)
+                    },
+                )
+            }
+            return when (outcome) {
+                AttributionOutcome.ATTRIBUTED -> MatchResolveOutcome.Attributed(matchId)
+                AttributionOutcome.DUPLICATE_EVIDENCE ->
+                    MatchResolveOutcome.DuplicateEvidence(matchId)
+                AttributionOutcome.AMBIGUOUS -> MatchResolveOutcome.StillAmbiguous(matchId)
+            }
+        }
+        val updated = transactions.run {
+            val rows = dao.updateAdvisory(
+                matchId,
+                AdvisoryMatchStatus.UNMATCHED,
+                row.ruleId,
+                "operator $operator: bukan transaksi ini",
+            )
+            if (rows != 1) return@run 0
+            writeAudit(
+                "match_unmatched", matchId, nowMs,
+                JSONObject().apply {
+                    put("event_id", row.eventId)
+                    put("merchant_id", row.merchantId)
+                    put("order_number", row.orderNumber)
+                    put("operator", operator)
+                },
+            )
+            rows
+        }
+        if (updated != 1) {
+            return MatchResolveOutcome.Refused("baris berubah bersamaan")
+        }
+        return MatchResolveOutcome.MarkedUnmatched(matchId)
     }
 
     // --- Quarantine approve / discard (§7.7, blocker C) ---

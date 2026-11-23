@@ -23,6 +23,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.netter.paylist.migration.CutoverMode
 import com.netter.paylist.security.SecretResult
 import com.netter.paylist.security.SecretVault
 import org.json.JSONObject
@@ -107,6 +108,18 @@ class MainActivity : Activity() {
         layoutParams = lp
     }
 
+    /** Satu item navigasi bawah (D5): label teks, bobot sama. */
+    private fun navItem(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 13f
+        setTextColor(DARK)
+        gravity = android.view.Gravity.CENTER
+        setPadding(0, dp(12), dp(0), dp(12))
+        layoutParams = LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+        )
+    }
+
     /** Satu kartu log: judul + jumlah entri, isi 40 entri terakhir. */
     private fun logCardView(title: String, entries: List<LogEntry>): LinearLayout {
         val card = cardLayout()
@@ -178,34 +191,43 @@ class MainActivity : Activity() {
             setPadding(0, dp(2), 0, dp(14))
         })
 
-        // --- Riwayat (Stage D D4, LH-D3 Opsi A: Activity khusus) ---
-        // Navigasi bawah permanen menyusul di D5 (perombakan
-        // MainActivity); untuk D4, tombol tingkat atas ini adalah
-        // pintu masuk riwayat. Lencana C1 (kasus ambigu belum
-        // ditindaklanjuti) dimuat asinkron agar tidak memblokir UI.
-        val historyBtn = primaryButton("Lihat Riwayat")
-        historyBtn.setOnClickListener {
-            startActivity(Intent(this, HistoryActivity::class.java))
+        // --- Navigasi bawah permanen (D5, LH-D3) ---
+        // Riwayat / Diagnostik / Ekspor selalu terlihat; lencana C1
+        // (kasus ambigu belum ditindaklanjuti) dimuat asinkron.
+        // Tombol "Lihat Riwayat" tingkat atas (D4) digantikan nav ini.
+        val navHistory = navItem("Riwayat")
+        val modeText = TextView(this).apply {
+            text = "Mode: memuat…"
+            textSize = 13f
+            setTextColor(GRAY)
+            setPadding(0, dp(4), 0, 0)
         }
-        root.addView(historyBtn)
+        // Kartu peringatan DRAINING (dibuat di bawah, ditampilkan bila
+        // mode terbaca DRAINING). Runnable UI di-posting ke looper
+        // utama, jadi tidak bisa menyela buildUi yang sedang jalan —
+        // kartu sudah terpasang saat runnable dieksekusi.
+        var drainingCard: LinearLayout? = null
         Thread {
+            val app = application as PaylistApplication
             val count = try {
-                kotlinx.coroutines.runBlocking {
-                    (application as PaylistApplication).historyRepository.ambiguousCount()
-                }
+                kotlinx.coroutines.runBlocking { app.historyRepository.ambiguousCount() }
             } catch (e: Exception) {
                 0
             }
-            if (count > 0) {
-                runOnUiThread {
-                    historyBtn.text = "Lihat Riwayat ($count ambigu)"
+            val mode = try {
+                kotlinx.coroutines.runBlocking { app.coordinator.getMode() }
+            } catch (e: Exception) {
+                null
+            }
+            runOnUiThread {
+                if (count > 0) navHistory.text = "Riwayat ($count)"
+                modeText.text = "Mode: ${mode?.name ?: "tidak diketahui"}"
+                if (mode == CutoverMode.DRAINING) {
+                    drainingCard?.visibility = View.VISIBLE
                 }
             }
         }.start()
-        root.addView(TextView(this).apply {
-            text = " "
-            textSize = 6f
-        })
+
 
         // --- Kartu status ---
         val statusCard = cardLayout()
@@ -228,6 +250,7 @@ class MainActivity : Activity() {
             buildUi()
         }
         statusCard.addView(saveDeviceBtn)
+        statusCard.addView(modeText)
         val qSize = store.queue().size
         statusCard.addView(TextView(this).apply {
             text = if (qSize == 0) "Antrean pengiriman: bersih"
@@ -269,6 +292,31 @@ class MainActivity : Activity() {
             Handler(Looper.getMainLooper()).postDelayed({ buildUi() }, 2500)
         }
         statusCard.addView(rescanBtn)
+        val retryBtn = ghostButton("Coba Kirim Ulang Antrean")
+        retryBtn.setOnClickListener {
+            // Flush antrean legacy + minta sync Worker (jalur Room).
+            // Operator tidak perlu tahu jalur mana yang aktif.
+            Thread {
+                try {
+                    appSender().flush()
+                } catch (e: Exception) {
+                    // dicatat di log lokal oleh flush sendiri
+                }
+                try {
+                    com.netter.paylist.delivery.SyncScheduler.requestSync(this@MainActivity)
+                } catch (e: Exception) {
+                    // WorkManager tidak tersedia — flush legacy sudah jalan
+                }
+            }.start()
+            store.logLocal("coba kirim ulang diminta dari layar utama")
+            Handler(Looper.getMainLooper()).postDelayed({ buildUi() }, 2500)
+        }
+        statusCard.addView(retryBtn)
+        val deleteBtn = ghostButton("Kelola / Hapus Catatan Lokal (di Riwayat)")
+        deleteBtn.setOnClickListener {
+            startActivity(Intent(this, HistoryActivity::class.java))
+        }
+        statusCard.addView(deleteBtn)
         val notifBtn = primaryButton("Buka Pengaturan Akses Notifikasi")
         notifBtn.setOnClickListener {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
@@ -276,11 +324,41 @@ class MainActivity : Activity() {
         statusCard.addView(notifBtn)
         root.addView(statusCard)
 
-        // --- Pengiriman baru (Worker, Stage C; aktivasi menunggu Stage D) ---
+        // --- Peringatan kesenjangan heartbeat saat DRAINING (D5) ---
+        // Selama DRAINING, pengirim legacy dikarantina (tidak ada
+        // upaya baru) sementara antrean diimpor ke Room — heartbeat
+        // tidak terkirim sampai cutover selesai. Ini normal, bukan
+        // gangguan: server akan melihat jeda heartbeat.
+        drainingCard = cardLayout().apply {
+            visibility = View.GONE
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(255, 243, 205))
+                cornerRadius = dp(14).toFloat()
+                setStroke(dp(1), Color.rgb(214, 224, 221))
+            }
+            addView(TextView(this@MainActivity).apply {
+                text = "Mode DRAINING — heartbeat tertunda"
+                textSize = 15f
+                setTextColor(DARK)
+                setTypeface(typeface, Typeface.BOLD)
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = "Pengiriman sedang dipindahkan ke jalur baru. Heartbeat " +
+                    "tidak terkirim selama proses ini — server akan melihat " +
+                    "jeda heartbeat. Ini normal; heartbeat lanjut otomatis " +
+                    "setelah cutover selesai."
+                textSize = 13f
+                setTextColor(DARK)
+                setPadding(0, dp(4), 0, 0)
+            })
+        }
+        root.addView(drainingCard)
+
+        // --- Pengiriman baru (Worker, Stage C; aktivasi menunggu gerbang D→E) ---
         // Cutover memigrasikan antrean legacy ke Room lalu mengaktifkan
-        // SyncWorker. Di Stage C tombolnya nonaktif: jalur capture ke
-        // Room (Stage D) belum ada, dan mengaktifkan Worker sekarang
-        // akan menghentikan pengiriman pembayaran baru.
+        // SyncWorker. Jalur capture ke Room sudah terpasang (Stage D),
+        // tetapi aktivasi menunggu keputusan gerbang D→E (D6) —
+        // tombol tetap nonaktif sampai gerbang lolos.
         val cutoverCard = cardLayout()
         cutoverCard.addView(TextView(this).apply {
             text = "PENGIRIMAN BARU (WORKER)"
@@ -290,7 +368,7 @@ class MainActivity : Activity() {
         })
         cutoverCard.addView(TextView(this).apply {
             text = "Cutover memindahkan antrean ke pengiriman baru (WorkManager + Room). " +
-                "Aktivasi menunggu Stage D (jalur capture ke Room)."
+                "Aktivasi menunggu keputusan gerbang D→E (D6)."
             textSize = 13f
             setTextColor(GRAY)
             setPadding(0, dp(4), 0, dp(8))
@@ -413,10 +491,48 @@ class MainActivity : Activity() {
         root.addView(logCardView("LOG PAKET TERDAFTAR", regEntries))
         root.addView(logCardView("LOG PAKET BELUM TERDAFTAR", unregEntries))
 
-        setContentView(ScrollView(this).apply {
+        // Nav bawah permanen (D5): di luar ScrollView, selalu terlihat.
+        val navHome = navItem("Beranda").apply {
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(TEAL)
+        }
+        navHistory.setOnClickListener {
+            startActivity(Intent(this, HistoryActivity::class.java))
+        }
+        val navDiagnostics = navItem("Diagnostik").apply {
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, DiagnosticsActivity::class.java))
+            }
+        }
+        val navExport = navItem("Ekspor").apply {
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, ReconciliationExportActivity::class.java))
+            }
+        }
+        val navBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.WHITE)
+            setPadding(0, dp(2), 0, dp(2))
+            addView(navHome)
+            addView(navHistory)
+            addView(navDiagnostics)
+            addView(navExport)
+        }
+        val outer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             setBackgroundColor(BG)
-            addView(root)
-        })
+            addView(ScrollView(this@MainActivity).apply {
+                setBackgroundColor(BG)
+                addView(root)
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            ))
+            addView(navBar, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ))
+        }
+        setContentView(outer)
     }
 }
 
