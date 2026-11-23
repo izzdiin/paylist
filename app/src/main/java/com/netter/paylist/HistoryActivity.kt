@@ -51,6 +51,9 @@ class HistoryActivity : Activity() {
         private val LINE = Color.rgb(214, 224, 221)
         private val RED = Color.rgb(185, 28, 28)
 
+        /** Intent extra: pre-set the server match-status filter (C1 deep-link). */
+        const val EXTRA_MATCH_STATUS: String = "match_status"
+
         private val OUTCOMES = listOf(
             null to "Semua hasil",
             CaptureOutcome.CAPTURED to "Terekam",
@@ -137,6 +140,13 @@ class HistoryActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // C1 deep-link: the ambiguous-case notification opens the
+        // history pre-filtered to ambiguous cases.
+        intent.getStringExtra(EXTRA_MATCH_STATUS)?.let {
+            if (MATCH_STATUSES.any { status -> status.first == it }) {
+                matchStatusFilter = it
+            }
+        }
         showList()
     }
 
@@ -287,6 +297,35 @@ class HistoryActivity : Activity() {
             setTypeface(typeface, Typeface.BOLD)
         })
         root.addView(small("Semua notifikasi yang diamati, terbaru dulu. Ketuk satu baris untuk detail."))
+
+        // --- C1 badge: unacknowledged ambiguous cases ---
+        val badgeView = TextView(this).apply {
+            textSize = 14f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, dp(8), 0, dp(4))
+            visibility = View.GONE
+        }
+        root.addView(badgeView)
+        Thread {
+            val count = try {
+                runBlocking { repository().ambiguousCount() }
+            } catch (e: Exception) {
+                0
+            }
+            runOnUiThread {
+                if (count > 0) {
+                    badgeView.text = "$count kasus ambigu belum ditindaklanjuti — ketuk untuk melihat."
+                    badgeView.setTextColor(RED)
+                    badgeView.visibility = View.VISIBLE
+                    badgeView.isClickable = true
+                    badgeView.setOnClickListener {
+                        matchStatusFilter = "ambiguous"
+                        loadedItems.clear()
+                        showList()
+                    }
+                }
+            }
+        }.start()
 
         // --- Filter controls ---
         val filterCard = cardLayout()
@@ -457,6 +496,18 @@ class HistoryActivity : Activity() {
                     item.lastApplyStatus?.let { "apply: $it" },
                 ).joinToString(" · ")
                 if (business.isNotEmpty()) card.addView(small(business))
+                if (item.lastMatchStatus == "ambiguous") {
+                    card.addView(TextView(this).apply {
+                        text = if (item.ambiguousReviewed) {
+                            "Ambigu — sudah ditindaklanjuti"
+                        } else {
+                            "Ambigu — BELUM ditindaklanjuti"
+                        }
+                        textSize = 13f
+                        setTextColor(if (item.ambiguousReviewed) GRAY else RED)
+                        setTypeface(typeface, Typeface.BOLD)
+                    })
+                }
             }
             card.isClickable = true
             card.setOnClickListener { showDetail(item.captureId) }
@@ -596,6 +647,41 @@ class HistoryActivity : Activity() {
                 )
             }
             root.addView(aCard)
+        }
+
+        // --- C1: mark this ambiguous case handled ---
+        if (item.lastMatchStatus == "ambiguous" && !detail.ambiguousReviewed) {
+            val markBtn = primaryButton("Tandai Sudah Ditindaklanjuti")
+            markBtn.setOnClickListener {
+                Thread {
+                    val ok = try {
+                        runBlocking {
+                            repository().markAmbiguousReviewed(
+                                item.captureId,
+                                Store(this@HistoryActivity).deviceLabel(),
+                            )
+                        }
+                    } catch (e: Exception) {
+                        false
+                    }
+                    runOnUiThread {
+                        Toast.makeText(
+                            this@HistoryActivity,
+                            if (ok) "Ditandai sudah ditindaklanjuti." else "Gagal menandai.",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                        showList()
+                    }
+                }.start()
+            }
+            root.addView(markBtn)
+        } else if (item.lastMatchStatus == "ambiguous") {
+            root.addView(TextView(this).apply {
+                text = "Kasus ambigu ini sudah ditandai ditindaklanjuti."
+                textSize = 13f
+                setTextColor(GRAY)
+                setPadding(0, dp(6), 0, 0)
+            })
         }
 
         // --- Local deletion (LH-07(e)) ---

@@ -31,6 +31,12 @@ class SyncWorkerFactory(
     private val recorderGatePassed: Boolean = false,
     /** Called when an authorised A′ fallback is dispatched (per-route counter). */
     private val onFallbackDispatched: (routeId: String) -> Unit = {},
+    /**
+     * C1 ambiguous-case alert (user decision 2026-11-23): called
+     * with the delivery id when the server answers
+     * `match.status == 'ambiguous'`.
+     */
+    private val onAmbiguous: (deliveryId: String) -> Unit = {},
 ) : WorkerFactory() {
 
     override fun createWorker(
@@ -56,6 +62,7 @@ class SyncWorkerFactory(
                     recorderGatePassed = recorderGatePassed,
                     onFallbackDispatched = onFallbackDispatched,
                     captureLogDao = db.captureLogDao(),
+                    onAmbiguous = onAmbiguous,
                 ),
                 onWorkRemaining = { SyncScheduler.requestSync(appContext) },
             )

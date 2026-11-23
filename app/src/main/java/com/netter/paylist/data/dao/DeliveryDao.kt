@@ -96,6 +96,15 @@ interface DeliveryDao {
     )
     suspend fun getAuditSet(): List<DeliveryEntity>
 
+    /**
+     * Delivery ids whose server outcome was ambiguous (C1 badge,
+     * user decision 2026-11-23): `last_match_status = 'ambiguous'`.
+     * The badge counts these minus operator acknowledgements
+     * (`ambiguous_reviewed:<delivery_id>` collector docs).
+     */
+    @Query("SELECT delivery_id FROM deliveries WHERE last_match_status = 'ambiguous'")
+    suspend fun getAmbiguousDeliveryIds(): List<String>
+
     // --- Claim (one transaction: mode gate + consent join + lease) ---
 
     @Query("SELECT value_json FROM collector_state WHERE key = :key")

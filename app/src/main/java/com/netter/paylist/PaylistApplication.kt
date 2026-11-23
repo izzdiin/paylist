@@ -15,6 +15,7 @@ import com.netter.paylist.data.EventRepository
 import com.netter.paylist.data.PaylistDatabase
 import com.netter.paylist.data.entity.CollectorStateEntity
 import com.netter.paylist.data.entity.CollectorStateKeys
+import com.netter.paylist.delivery.ReviewNotifier
 import com.netter.paylist.delivery.StoreRouteSource
 import com.netter.paylist.delivery.SyncScheduler
 import com.netter.paylist.delivery.SyncWorkerFactory
@@ -116,6 +117,7 @@ class PaylistApplication : Application(), Configuration.Provider {
             this, modeGate, SecretVault(this),
             rawSnapshotStore = rawSnapshotStore,
             consentStore = consentStore,
+            onAmbiguous = onLegacyAmbiguous,
         )
     }
 
@@ -163,8 +165,44 @@ class PaylistApplication : Application(), Configuration.Provider {
             eventDao = db.eventDao(),
             deliveryDao = db.deliveryDao(),
             attemptDao = db.attemptDao(),
+            collectorStateDao = db.collectorStateDao(),
         )
     }
+
+    /**
+     * C1 ambiguous-case alert (user decision 2026-11-23): the Room
+     * worker path fires with a delivery id; the amount/package are
+     * resolved via the history repository on a fresh thread (the
+     * worker thread never blocks on the resolve). When the resolve
+     * fails, the alert still fires with generic text.
+     */
+    private val onRoomAmbiguous: (deliveryId: String) -> Unit = { deliveryId ->
+        Thread {
+            val info = try {
+                runBlocking { historyRepository.ambiguousCaseInfo(deliveryId) }
+            } catch (e: Exception) {
+                null
+            }
+            ReviewNotifier.notifyAmbiguous(this, deliveryId, info?.first, info?.second)
+        }.start()
+    }
+
+    /**
+     * C1 ambiguous-case alert, legacy sender path: the case is
+     * recorded durably (collector doc, for the badge) and the
+     * alert fires with the payload's amount/package.
+     */
+    private val onLegacyAmbiguous: (qkey: String, dedupeKey: String, amountMinor: Long?, sourcePackage: String?) -> Unit =
+        { qkey, dedupeKey, amount, pkg ->
+            try {
+                runBlocking {
+                    historyRepository.recordLegacyAmbiguous(qkey, dedupeKey, amount, pkg)
+                }
+            } catch (e: Exception) {
+                store.logLocal("gagal mencatat kasus ambigu legacy: ${e.message?.take(120)}")
+            }
+            ReviewNotifier.notifyAmbiguous(this, "legacy:$qkey", amount, pkg)
+        }
 
     /** Per-route consent records (§7.5 C22(l), §7.3 P6 opt-in). */
     val consentStore: ConsentStore by lazy {
@@ -244,6 +282,7 @@ class PaylistApplication : Application(), Configuration.Provider {
                             .incrementAndGet()
                         store.logLocal("fallback A′ terkirim (raw hilang) rute $routeId")
                     },
+                    onAmbiguous = onRoomAmbiguous,
                 )
             )
             .build()

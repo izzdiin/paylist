@@ -282,6 +282,11 @@ class FakeDeliveryDao(private val store: FakeStore) : DeliveryDao {
             }
             .sortedByDescending { it.updatedAtMs }
     }
+    override suspend fun getAmbiguousDeliveryIds(): List<String> = store.lock.withLock {
+        store.deliveries.values
+            .filter { it.lastMatchStatus == "ambiguous" }
+            .map { it.deliveryId }
+    }
 
     override suspend fun readCollectorValue(key: String): String? = store.lock.withLock { store.collector[key]?.valueJson }
 

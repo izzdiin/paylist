@@ -3,9 +3,12 @@ package com.netter.paylist.history
 import com.netter.paylist.core.model.DeliveryState
 import com.netter.paylist.data.dao.AttemptDao
 import com.netter.paylist.data.dao.CaptureLogDao
+import com.netter.paylist.data.dao.CollectorStateDao
 import com.netter.paylist.data.dao.DeliveryDao
 import com.netter.paylist.data.dao.EventDao
 import com.netter.paylist.data.entity.CaptureLogEntity
+import com.netter.paylist.data.entity.CollectorStateEntity
+import com.netter.paylist.data.entity.CollectorStateKeys
 import com.netter.paylist.data.entity.DeliveryEntity
 import com.netter.paylist.data.entity.HopOutcome
 import org.json.JSONObject
@@ -49,6 +52,8 @@ data class HistoryItem(
     val lastMatchStatus: String?,
     val lastApplyStatus: String?,
     val hasEvent: Boolean,
+    /** C1: the operator acknowledged this ambiguous case. */
+    val ambiguousReviewed: Boolean = false,
 )
 
 /** One delivery, summarised for the detail view (LH-03). */
@@ -85,6 +90,8 @@ data class HistoryDetail(
     val holdReason: String?,
     /** A COLLISION observation exists for this event (§3 R11). */
     val identityCollision: Boolean,
+    /** C1: the operator acknowledged this ambiguous case. */
+    val ambiguousReviewed: Boolean = false,
 )
 
 /**
@@ -105,10 +112,65 @@ class HistoryRepository(
     private val eventDao: EventDao,
     private val deliveryDao: DeliveryDao,
     private val attemptDao: AttemptDao,
+    /**
+     * C1 ambiguous-case accounting (null = no acknowledgement
+     * store: every ambiguous case counts as unreviewed).
+     */
+    private val collectorStateDao: CollectorStateDao? = null,
+    private val clock: () -> Long = { System.currentTimeMillis() },
 ) {
     companion object {
         /** Default page size (LH-08 suggests 50). */
         const val PAGE_SIZE: Int = 50
+    }
+
+    /** One legacy-path ambiguous case (collector doc). */
+    private data class LegacyAmbiguous(
+        val qkey: String,
+        val dedupeKey: String,
+        val amountMinor: Long?,
+        val sourcePackage: String?,
+    )
+
+    /** The acknowledgement sets, loaded once per read. */
+    private data class ReviewedSets(
+        val reviewedDeliveryIds: Set<String> = emptySet(),
+        val legacyByDedupe: Map<String, LegacyAmbiguous> = emptyMap(),
+        val reviewedLegacyQkeys: Set<String> = emptySet(),
+    )
+
+    private suspend fun reviewedSets(): ReviewedSets {
+        val dao = collectorStateDao ?: return ReviewedSets()
+        val docs = dao.getAll()
+        val reviewedDeliveries = mutableSetOf<String>()
+        val legacyByDedupe = mutableMapOf<String, LegacyAmbiguous>()
+        val reviewedLegacy = mutableSetOf<String>()
+        for (doc in docs) {
+            when {
+                doc.key.startsWith(CollectorStateKeys.AMBIGUOUS_REVIEWED_PREFIX) ->
+                    reviewedDeliveries += doc.key.removePrefix(CollectorStateKeys.AMBIGUOUS_REVIEWED_PREFIX)
+                doc.key.startsWith(CollectorStateKeys.AMBIGUOUS_LEGACY_REVIEWED_PREFIX) ->
+                    reviewedLegacy += doc.key.removePrefix(CollectorStateKeys.AMBIGUOUS_LEGACY_REVIEWED_PREFIX)
+                doc.key.startsWith(CollectorStateKeys.AMBIGUOUS_LEGACY_PREFIX) -> {
+                    val qkey = doc.key.removePrefix(CollectorStateKeys.AMBIGUOUS_LEGACY_PREFIX)
+                    val json = try {
+                        JSONObject(doc.valueJson)
+                    } catch (e: Exception) {
+                        JSONObject()
+                    }
+                    val dedupe = json.optString("dedupe_key")
+                    if (dedupe.isNotEmpty()) {
+                        legacyByDedupe[dedupe] = LegacyAmbiguous(
+                            qkey = qkey,
+                            dedupeKey = dedupe,
+                            amountMinor = json.optLong("amount").takeIf { json.has("amount") },
+                            sourcePackage = json.optString("package").takeIf { it.isNotEmpty() },
+                        )
+                    }
+                }
+            }
+        }
+        return ReviewedSets(reviewedDeliveries, legacyByDedupe, reviewedLegacy)
     }
 
     /** One page of history, most recent first (LH-01). */
@@ -131,7 +193,8 @@ class HistoryRepository(
             offset = offset,
             matchStatus = filter.matchStatus,
         )
-        return rows.map { toItem(it) }
+        val reviewed = reviewedSets()
+        return rows.map { toItem(it, reviewed = reviewed) }
     }
 
     /** Row count for the same filter set (paging). */
@@ -155,7 +218,8 @@ class HistoryRepository(
     /** Per-item detail (LH-03), or null when the row is gone. */
     suspend fun getDetail(captureId: String): HistoryDetail? {
         val row = captureLogDao.getById(captureId) ?: return null
-        val item = toItem(row)
+        val reviewed = reviewedSets()
+        val item = toItem(row, reviewed = reviewed)
         val eventId = row.eventId
         if (eventId == null) {
             return HistoryDetail(
@@ -168,6 +232,7 @@ class HistoryRepository(
                 attempts = emptyList(),
                 holdReason = null,
                 identityCollision = false,
+                ambiguousReviewed = item.ambiguousReviewed,
             )
         }
         val event = eventDao.getById(eventId)
@@ -181,6 +246,7 @@ class HistoryRepository(
                 attempts = emptyList(),
                 holdReason = null,
                 identityCollision = false,
+                ambiguousReviewed = item.ambiguousReviewed,
             )
         val deliveries = deliveryDao.getByEventId(eventId)
         val summaries = deliveries.map { d ->
@@ -231,6 +297,7 @@ class HistoryRepository(
             attempts = attempts,
             holdReason = holdReason,
             identityCollision = collision,
+            ambiguousReviewed = item.ambiguousReviewed,
         )
     }
 
@@ -243,11 +310,12 @@ class HistoryRepository(
      */
     suspend fun auditSet(): List<HistoryItem> {
         val deliveries = deliveryDao.getAuditSet()
+        val reviewed = reviewedSets()
         val items = mutableListOf<HistoryItem>()
         for (delivery in deliveries) {
             val rows = captureLogDao.listByEventId(delivery.eventId)
             val row = rows.firstOrNull() ?: continue
-            items += toItem(row, delivery)
+            items += toItem(row, delivery, reviewed)
         }
         return items.sortedByDescending { it.postTimeMs }
     }
@@ -273,11 +341,133 @@ class HistoryRepository(
     suspend fun deleteUnlinkedByOutcome(outcome: String): Int =
         captureLogDao.deleteUnlinkedByOutcome(outcome)
 
+    // --- C1 ambiguous-case accounting (user decision 2026-11-23) ---
+
+    /**
+     * The badge count: ambiguous cases the operator has not yet
+     * acknowledged — Room deliveries with
+     * `last_match_status = 'ambiguous'` plus legacy-path cases
+     * recorded in collector docs, each minus its acknowledgement.
+     *
+     * The badge clears on LOCAL acknowledgement (the operator marks
+     * the case handled after acting on it, e.g. via the server
+     * rematch). It does NOT clear automatically when the server
+     * rematch happens — there is no server-to-app push, and no
+     * endpoint exists to poll; that would be C2 server work.
+     */
+    suspend fun ambiguousCount(): Int {
+        val reviewed = reviewedSets()
+        val roomIds = deliveryDao.getAmbiguousDeliveryIds()
+        val roomUnreviewed = roomIds.count { it !in reviewed.reviewedDeliveryIds }
+        val legacyUnreviewed = reviewed.legacyByDedupe.values.count {
+            it.qkey !in reviewed.reviewedLegacyQkeys
+        }
+        return roomUnreviewed + legacyUnreviewed
+    }
+
+    /**
+     * Amount + package for one Room ambiguous case, for the alert
+     * text (resolved via the linked capture row). Null when the
+     * delivery or its capture row is gone.
+     */
+    suspend fun ambiguousCaseInfo(deliveryId: String): Pair<Long?, String?>? {
+        val delivery = deliveryDao.getById(deliveryId) ?: return null
+        val row = captureLogDao.listByEventId(delivery.eventId).firstOrNull() ?: return null
+        return row.amountMinor to row.sourcePackage
+    }
+
+    /**
+     * Records a legacy-path ambiguous case (called from the
+     * sender's `onAmbiguous` hook). First record wins — a re-POST
+     * of the same queue item does not overwrite the original time.
+     */
+    suspend fun recordLegacyAmbiguous(
+        qkey: String,
+        dedupeKey: String,
+        amountMinor: Long?,
+        sourcePackage: String?,
+    ) {
+        val dao = collectorStateDao ?: return
+        val key = CollectorStateKeys.AMBIGUOUS_LEGACY_PREFIX + qkey
+        if (dao.get(key) != null) return
+        val json = JSONObject().apply {
+            put("dedupe_key", dedupeKey)
+            if (amountMinor != null) put("amount", amountMinor)
+            if (sourcePackage != null) put("package", sourcePackage)
+            put("at_ms", clock())
+        }
+        dao.put(CollectorStateEntity(key, json.toString(), clock()))
+    }
+
+    /**
+     * Marks the ambiguous case behind a capture row as handled by
+     * the operator (C1 acknowledgement). Covers both paths: the
+     * current Room delivery (when ambiguous) and any legacy record
+     * for the same event. Returns true when anything was marked.
+     */
+    suspend fun markAmbiguousReviewed(captureId: String, operator: String): Boolean {
+        val dao = collectorStateDao ?: return false
+        val row = captureLogDao.getById(captureId) ?: return false
+        val eventId = row.eventId ?: return false
+        val event = eventDao.getById(eventId) ?: return false
+        val reviewed = reviewedSets()
+        var marked = false
+        val current = currentDelivery(eventId)
+        if (current != null && current.lastMatchStatus == "ambiguous" &&
+            current.deliveryId !in reviewed.reviewedDeliveryIds
+        ) {
+            val key = CollectorStateKeys.AMBIGUOUS_REVIEWED_PREFIX + current.deliveryId
+            dao.put(
+                CollectorStateEntity(
+                    key,
+                    JSONObject().apply {
+                        put("operator", operator)
+                        put("reviewed_at_ms", clock())
+                    }.toString(),
+                    clock(),
+                ),
+            )
+            marked = true
+        }
+        val legacy = reviewed.legacyByDedupe[event.dedupeKey]
+        if (legacy != null && legacy.qkey !in reviewed.reviewedLegacyQkeys) {
+            val key = CollectorStateKeys.AMBIGUOUS_LEGACY_REVIEWED_PREFIX + legacy.qkey
+            dao.put(
+                CollectorStateEntity(
+                    key,
+                    JSONObject().apply {
+                        put("operator", operator)
+                        put("reviewed_at_ms", clock())
+                    }.toString(),
+                    clock(),
+                ),
+            )
+            marked = true
+        }
+        return marked
+    }
+
     private suspend fun toItem(
         row: CaptureLogEntity,
         delivery: DeliveryEntity? = null,
+        reviewed: ReviewedSets = ReviewedSets(),
     ): HistoryItem {
         val current = delivery ?: row.eventId?.let { currentDelivery(it) }
+        var matchStatus = current?.lastMatchStatus
+        var applyStatus = current?.lastApplyStatus
+        var isReviewed = current != null && current.deliveryId in reviewed.reviewedDeliveryIds
+        if (current == null && row.eventId != null) {
+            // No Room delivery (legacy-path send): the ambiguous
+            // state comes from the legacy collector record, linked
+            // by the event's dedupe key.
+            val event = eventDao.getById(row.eventId)
+            val legacy = event?.let { reviewed.legacyByDedupe[it.dedupeKey] }
+            if (legacy != null) {
+                matchStatus = "ambiguous"
+                applyStatus = null
+                isReviewed = legacy.qkey in reviewed.reviewedLegacyQkeys
+            }
+        }
         return HistoryItem(
             captureId = row.captureId,
             postTimeMs = row.postTimeMs,
@@ -286,9 +476,10 @@ class HistoryRepository(
             titleSnippet = row.titleSnippet,
             amountMinor = row.amountMinor,
             deliveryState = current?.state,
-            lastMatchStatus = current?.lastMatchStatus,
-            lastApplyStatus = current?.lastApplyStatus,
+            lastMatchStatus = matchStatus,
+            lastApplyStatus = applyStatus,
             hasEvent = row.eventId != null,
+            ambiguousReviewed = isReviewed,
         )
     }
 

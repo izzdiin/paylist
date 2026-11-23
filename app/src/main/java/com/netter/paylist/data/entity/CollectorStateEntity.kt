@@ -84,6 +84,25 @@ object CollectorStateKeys {
      */
     const val PICKED_PAYLOAD_PREFIX: String = "picked_payload:"
 
+    /**
+     * Prefix for C1 ambiguous-case records from the LEGACY sender
+     * path: `ambiguous_legacy:<qkey>` (Stage D, user decision
+     * 2026-11-23). Value: `{dedupe_key, amount, package, at_ms}`.
+     * The Room worker path needs no record — its ambiguous cases
+     * are deliveries with `last_match_status = 'ambiguous'`.
+     */
+    const val AMBIGUOUS_LEGACY_PREFIX: String = "ambiguous_legacy:"
+
+    /**
+     * Prefix for operator acknowledgements of ambiguous cases:
+     * `ambiguous_reviewed:<delivery_id>` (Room path) and
+     * `ambiguous_legacy_reviewed:<qkey>` (legacy path). Value:
+     * `{operator, reviewed_at_ms}`. The C1 badge counts ambiguous
+     * cases without a matching acknowledgement.
+     */
+    const val AMBIGUOUS_REVIEWED_PREFIX: String = "ambiguous_reviewed:"
+    const val AMBIGUOUS_LEGACY_REVIEWED_PREFIX: String = "ambiguous_legacy_reviewed:"
+
     /** Diagnostic counters document (capture/staging/drain counters, §8.3). */
     const val DIAGNOSTICS: String = "diagnostics"
 }

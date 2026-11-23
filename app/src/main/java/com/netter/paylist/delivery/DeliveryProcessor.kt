@@ -99,6 +99,14 @@ class DeliveryProcessor(
      * always wires the real DAO.
      */
     private val captureLogDao: CaptureLogDao? = null,
+    /**
+     * C1 ambiguous-case alert (user decision 2026-11-23): called
+     * with the delivery id when the server answers
+     * `match.status == 'ambiguous'` — after the ACK is durable.
+     * Production wires the local high-priority notification
+     * (sound + vibration) + the badge count.
+     */
+    private val onAmbiguous: (deliveryId: String) -> Unit = {},
 ) {
     companion object {
         /** Due deliveries per worker invocation (§5.4). */
@@ -636,6 +644,14 @@ class DeliveryProcessor(
                     deliveryDao.ackIfLeaseHeld(
                         delivery.deliveryId, leaseOwner, finishedAt, "ambiguous", null
                     )
+                }
+                // C1: the ACK is durable — alert the operator (the
+                // callback must never throw into the worker path).
+                try {
+                    onAmbiguous(delivery.deliveryId)
+                } catch (e: Exception) {
+                    // The alert failed; the ambiguous outcome is
+                    // still durable and visible in history (LH-05).
                 }
                 return false
             }

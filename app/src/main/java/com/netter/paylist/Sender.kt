@@ -79,6 +79,16 @@ class Sender(
     private val rawSnapshotStore: com.netter.paylist.collector.RawSnapshotStore? = null,
     /** Stage D §7.3: per-route consent records (null = B unverifiable). */
     private val consentStore: com.netter.paylist.collector.ConsentStore? = null,
+    /**
+     * C1 ambiguous-case alert (user decision 2026-11-23): called
+     * with the queue key, dedupe key, amount and package when the
+     * server answers `match.status == 'ambiguous'` on the legacy
+     * path. Production records the case durably (collector doc)
+     * and fires the local high-priority notification. Must never
+     * throw into the flush path (guarded at the call site).
+     */
+    private val onAmbiguous: (qkey: String, dedupeKey: String, amountMinor: Long?, sourcePackage: String?) -> Unit =
+        { _, _, _, _ -> },
 ) {
 
     fun enqueueToRoute(payload: JSONObject, routeId: String) {
@@ -247,7 +257,7 @@ class Sender(
                     item.put("next", next)
                     return false
                 }
-                val res = post(route, hop.payload, secret) { hop.checkpoint() }
+                val res = post(route, hop.payload, secret, onCheckpoint = { hop.checkpoint() }, qkey = item.optString("qkey"))
                 if (hop.fenceAborted) {
                     // B3: revoke observed at the final admission
                     // read — raw dropped unsent, the item is held
@@ -302,7 +312,7 @@ class Sender(
             }
         }
         if (!modeGate.isLegacyOnly()) return false
-        val res = post(route, payload, secret)
+        val res = post(route, payload, secret, qkey = item.optString("qkey"))
         if (res.retryable) {
             markFail(store, item, describe(payload), route.name, res.error ?: "gagal jaringan")
             return false
@@ -454,6 +464,7 @@ class Sender(
         payload: JSONObject,
         secret: String,
         onCheckpoint: (suspend () -> Boolean)? = null,
+        qkey: String? = null,
     ): Outcome {
         val eventType = payload.optString("type").ifEmpty { "payment" }
         val result = try {
@@ -483,6 +494,22 @@ class Sender(
                             "hasil apply belum terkonfirmasi; periksa log server"
                         } else {
                             null
+                        }
+                        if (outcome.classification == ResponseClassification.AMBIGUOUS) {
+                            // C1: alert the operator (guarded — the
+                            // callback must never throw into the flush).
+                            try {
+                                onAmbiguous(
+                                    qkey ?: "",
+                                    payload.optString("dedupe_key"),
+                                    payload.optLong("amount").takeIf { payload.has("amount") },
+                                    payload.optString("pkg").takeIf { it.isNotEmpty() },
+                                )
+                            } catch (e: Exception) {
+                                // The alert failed; the ambiguous
+                                // outcome is still visible in history
+                                // (LH-05) via the capture-log row.
+                            }
                         }
                         Outcome(true, false, error)
                     }

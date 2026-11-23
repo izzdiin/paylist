@@ -44,6 +44,8 @@ class MainActivity : Activity() {
         private val BG = Color.rgb(244, 246, 245)
         private val LINE = Color.rgb(214, 224, 221)
         private val RED = Color.rgb(185, 28, 28)
+
+        private const val REQUEST_POST_NOTIFICATIONS: Int = 1001
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -134,6 +136,20 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         Store(this).seedIfFirstRun()
         HeartbeatReceiver.schedule(this)
+        // C1 ambiguous-case alerts need the runtime notification
+        // permission on Android 13+. Asked once here; if denied,
+        // the in-app badge remains the fallback (never re-asked
+        // in a loop).
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                requestPermissions(
+                    arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                    REQUEST_POST_NOTIFICATIONS,
+                )
+            }
+        }
     }
 
     override fun onResume() {
@@ -165,12 +181,27 @@ class MainActivity : Activity() {
         // --- Riwayat (Stage D D4, LH-D3 Opsi A: Activity khusus) ---
         // Navigasi bawah permanen menyusul di D5 (perombakan
         // MainActivity); untuk D4, tombol tingkat atas ini adalah
-        // pintu masuk riwayat.
+        // pintu masuk riwayat. Lencana C1 (kasus ambigu belum
+        // ditindaklanjuti) dimuat asinkron agar tidak memblokir UI.
         val historyBtn = primaryButton("Lihat Riwayat")
         historyBtn.setOnClickListener {
             startActivity(Intent(this, HistoryActivity::class.java))
         }
         root.addView(historyBtn)
+        Thread {
+            val count = try {
+                kotlinx.coroutines.runBlocking {
+                    (application as PaylistApplication).historyRepository.ambiguousCount()
+                }
+            } catch (e: Exception) {
+                0
+            }
+            if (count > 0) {
+                runOnUiThread {
+                    historyBtn.text = "Lihat Riwayat ($count ambigu)"
+                }
+            }
+        }.start()
         root.addView(TextView(this).apply {
             text = " "
             textSize = 6f

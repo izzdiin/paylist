@@ -537,6 +537,8 @@ class HistoryTest {
             "DeliveryProcessor.kt", "SyncWorkerFactory.kt", "PaylistApplication.kt",
             "TestDoubles.kt", "HistoryTest.kt", "CaptureLogDaoTest.kt",
             "MigrationTest.kt", "OutboxMigrationTest.kt",
+            // C1 badge tests build capture rows (AmbiguousAlertTest).
+            "AmbiguousAlertTest.kt",
         )
         val moduleDir = root.absoluteFile.parentFile?.parentFile?.parentFile
             ?: throw AssertionError("cannot derive the module dir for LH-T08")

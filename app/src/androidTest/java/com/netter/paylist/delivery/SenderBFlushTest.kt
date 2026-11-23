@@ -52,6 +52,12 @@ class SenderBFlushTest {
     }
 
     private data class PostedRequest(val url: String, val body: String)
+    private data class AmbiguousCall(
+        val qkey: String,
+        val dedupeKey: String,
+        val amount: Long?,
+        val pkg: String?,
+    )
 
     private class FakeTransport : TransportClient {
         val posted = mutableListOf<PostedRequest>()
@@ -235,9 +241,49 @@ class SenderBFlushTest {
         assertEquals("route_revoked", remaining[0].optString("last_error"))
     }
 
+    /**
+     * C1 (legacy path): a server answer `match.status ==
+     * 'ambiguous'` fires the sender's `onAmbiguous` hook with the
+     * queue key, dedupe key, amount and package — the app-level
+     * hook records the case and fires the alert.
+     */
     @Test
-    fun clearRawBlocked_resumesWithStoredPayload() = runBlocking {
+    fun flush_ambiguousResponse_firesOnAmbiguous() = runBlocking {
+        val fired = mutableListOf<AmbiguousCall>()
+        val ambSender = Sender(
+            app,
+            ModeGate.ALWAYS_LEGACY,
+            secrets = object : SecretProvider {
+                override fun secretFor(routeId: String): SecretResult =
+                    SecretResult.Present("s1")
+            },
+            transport = transport,
+            rawSnapshotStore = snapshots,
+            consentStore = consentStore,
+            onAmbiguous = { qkey, dedupeKey, amount, pkg ->
+                fired += AmbiguousCall(qkey, dedupeKey, amount, pkg)
+            },
+        )
+        transport.script = {
+            TransportResult.Http(200, emptyMap(), """{"ok":true,"match":{"status":"ambiguous"}}""")
+        }
         grantB()
+        enqueueBItem()
+
+        ambSender.flush()
+
+        assertEquals(1, fired.size)
+        val (qkey, dedupeKey, amount, pkg) = fired[0]
+        assertEquals("$DEDUPE|chain|$routeId", qkey)
+        assertEquals(DEDUPE, dedupeKey)
+        assertEquals(100800L, amount)
+        assertEquals(PKG, pkg)
+        // The ambiguous hop stops the chain (item gone, not retried).
+        assertTrue(app.store.queueSnapshot().isEmpty())
+    }
+
+    @Test
+    fun clearRawBlocked_resumesWithStoredPayload() = runBlocking {        grantB()
         enqueueBItem()
         putSnapshot()
         consentStore.setRawOptIn(routeId, false, null)
