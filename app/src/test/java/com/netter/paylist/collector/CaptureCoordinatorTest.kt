@@ -412,4 +412,34 @@ class CaptureCoordinatorTest {
         assertEquals(1, store.deliveries.size)
         assertEquals(0, stagingDao.count())
     }
+
+    // --- §7.6: amount-ambiguous is NEVER enqueued to the legacy sender ---
+
+    @Test
+    fun legacyOnly_ambiguousCapture_promotesToRoomNeedsReview_neverLegacy() = runBlocking {
+        // Two differing amounts → amount_ambiguous, in LEGACY_ONLY mode.
+        captureAndWait(snapshot(text = "Pembayaran Rp100.800 berhasil, saldo Rp50.000"))
+
+        val dedupe = CaptureCoordinator.legacyDedupeKey(
+            PKG, POST_TIME, 100800L,
+            snapshot(text = "Pembayaran Rp100.800 berhasil, saldo Rp50.000").combined,
+        )
+        val event = eventDao.getByDedupeKey(dedupe)
+        assertNotNull("event row must exist", event)
+        assertEquals(
+            "ambiguous event must never reach the legacy queue in any mode",
+            0, legacyQueue.size,
+        )
+        assertEquals(0, stagingDao.count())
+        val deliveries = deliveryDao.getByEventId(event!!.eventId)
+        assertEquals(1, deliveries.size)
+        assertEquals(DeliveryState.NEEDS_REVIEW, deliveries[0].state)
+        // The event carries the token list for the review surface.
+        val payload = JSONObject(event.legacyPayloadJson!!)
+        assertTrue(payload.optBoolean("amount_ambiguous"))
+        val tokens = payload.optJSONArray("amount_tokens")!!
+        assertEquals(2, tokens.length())
+        assertEquals(100800L, tokens.getJSONObject(0).optLong("value"))
+        assertEquals(50000L, tokens.getJSONObject(1).optLong("value"))
+    }
 }

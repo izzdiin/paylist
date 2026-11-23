@@ -51,6 +51,17 @@ interface MatchResultDao {
     @Query("SELECT * FROM match_results WHERE merchant_id = :merchantId AND order_number = :orderNumber")
     suspend fun getByOrder(merchantId: String, orderNumber: String): List<MatchResultEntity>
 
+    /**
+     * Rows needing operator review (Stage D review surface):
+     * `ambiguous` + `manual_review`, newest first. Read-only in D3 —
+     * the manual attribution pick is a D5 follow-up.
+     */
+    @Query(
+        "SELECT * FROM match_results WHERE advisory_match_status IN ('ambiguous', 'manual_review') " +
+            "ORDER BY created_at_ms DESC",
+    )
+    suspend fun getNeedingReview(): List<MatchResultEntity>
+
     @Query(
         "SELECT * FROM match_results WHERE merchant_id = :merchantId AND order_number = :orderNumber " +
             "AND attribution_status = 'attributed'",

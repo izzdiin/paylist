@@ -198,6 +198,127 @@ data class DrainResult(
     val error: String?,
 )
 
+/**
+ * A durable per-item quarantine record, stored at
+ * `quarantine_record:<dedupe_key>` (P2, review 6011401446). The phase
+ * marker only counts quarantined items; the per-item record is what
+ * makes each quarantined financial item individually reviewable and
+ * reconcilable: its identity (`qkey`/`dedupe_key`), the stable
+ * quarantine reason code, the span classes (never content), and the
+ * financial metadata the Stage D discard audit owes (amount, package
+ * — never raw spans).
+ *
+ * Written by [CutoverCoordinator.drain] when an item is quarantined,
+ * `putIfAbsent`: a later drain never overwrites the original record —
+ * its fence still names the drain that quarantined the item, so
+ * reconciliation against the phase marker stays exact. When a later
+ * re-drain recovers the item (a never-preflighted item imported after
+ * the preflight), `resolution` becomes `imported`; the record stays
+ * as the audit trail, it is never deleted.
+ *
+ * Stage D adds the operator resolutions `approved` / `discarded`
+ * (+ `operator` / `decision_note`): the review workflow in
+ * `AmountReview` resolves records; the record stays as the audit
+ * trail either way. MERGE NOTE: the audit branch (`audit/fix-stage-c-
+ * queue-safety`, PR #4) carries the same P2 record in this file
+ * without the Stage D fields — at merge, keep this superset version.
+ */
+data class QuarantineRecord(
+    val dedupeKey: String,
+    val qkey: String,
+    val reason: String,
+    val spanClasses: String?,
+    val amount: Long?,
+    val sourcePackage: String?,
+    val quarantinedAtMs: Long,
+    val fenceId: String,
+    val drainGeneration: Long,
+    val source: String,
+    val resolution: String?,
+    val resolvedAtMs: Long?,
+    /** Operator identity that resolved the record (Stage D review). */
+    val operator: String? = null,
+    /** Operator decision note (Stage D review; never raw spans). */
+    val decisionNote: String? = null,
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("dedupe_key", dedupeKey)
+        put("qkey", qkey)
+        put("reason", reason)
+        if (spanClasses != null) put("span_classes", spanClasses)
+        if (amount != null) put("amount", amount)
+        if (sourcePackage != null) put("source_package", sourcePackage)
+        put("quarantined_at_ms", quarantinedAtMs)
+        put("fence_id", fenceId)
+        put("drain_generation", drainGeneration)
+        put("source", source)
+        if (resolution != null) put("resolution", resolution)
+        if (resolvedAtMs != null) put("resolved_at_ms", resolvedAtMs)
+        if (operator != null) put("operator", operator)
+        if (decisionNote != null) put("decision_note", decisionNote)
+    }
+
+    companion object {
+        /** The record was written by the main drain. */
+        const val SOURCE_DRAIN: String = "drain"
+
+        /** The record was written by a post-commit re-drain. */
+        const val SOURCE_REDRAIN: String = "redrain"
+
+        /** Resolution: the item was later imported by a re-drain. */
+        const val RESOLUTION_IMPORTED: String = "imported"
+
+        /** Resolution: the operator approved the redacted form (Stage D). */
+        const val RESOLUTION_APPROVED: String = "approved"
+
+        /** Resolution: the operator discarded the item (Stage D, local disposition only). */
+        const val RESOLUTION_DISCARDED: String = "discarded"
+
+        fun fromJson(o: JSONObject): QuarantineRecord = QuarantineRecord(
+            dedupeKey = o.optString("dedupe_key"),
+            qkey = o.optString("qkey"),
+            reason = o.optString("reason"),
+            spanClasses = o.optString("span_classes").ifEmpty { null },
+            amount = if (o.has("amount")) o.optLong("amount") else null,
+            sourcePackage = o.optString("source_package").ifEmpty { null },
+            quarantinedAtMs = o.optLong("quarantined_at_ms"),
+            fenceId = o.optString("fence_id"),
+            drainGeneration = o.optLong("drain_generation"),
+            source = o.optString("source"),
+            resolution = o.optString("resolution").ifEmpty { null },
+            resolvedAtMs = if (o.has("resolved_at_ms")) o.optLong("resolved_at_ms") else null,
+            operator = o.optString("operator").ifEmpty { null },
+            decisionNote = o.optString("decision_note").ifEmpty { null },
+        )
+    }
+}
+
+/** Result of `reconcileQuarantine()`: unresolved records still count (Stage D). */
+data class QuarantineReconciliation(
+    val total: Int,
+    val unresolved: Int,
+    val resolved: Int,
+    val unresolvedRecords: List<QuarantineRecord>,
+)
+
+/**
+ * Narrow store for per-item quarantine records (Stage D review
+ * workflow). The coordinator implements it over `collector_state`;
+ * tests fake it. A record's resolution is final: resolving an
+ * already-resolved record with a different resolution is refused.
+ */
+interface QuarantineRecordStore {
+    suspend fun listAll(): List<QuarantineRecord>
+    suspend fun get(dedupeKey: String): QuarantineRecord?
+    suspend fun resolve(
+        dedupeKey: String,
+        resolution: String,
+        operator: String,
+        note: String?,
+        nowMs: Long,
+    ): Boolean
+}
+
 /** One admission request (§8.5(a)): the drain epoch a worker thread presents. */
 data class AdmissionRequest(
     val deliveryId: String,
@@ -302,7 +423,7 @@ class CutoverCoordinator(
      * true may recovery mark them `NEVER_SENT`. Default false.
      */
     private val neverSentGatePassed: Boolean = false,
-) {
+) : QuarantineRecordStore {
     companion object {
         /** Admission lease: only `ADMITTED` rows older than this may be abandoned (§8.5). */
         const val ADMISSION_LEASE_MS: Long = 60_000L
@@ -558,6 +679,10 @@ class CutoverCoordinator(
                 stateDao.put(state(CollectorStateKeys.CUTOVER_IMPORT, drained.toJson().toString(), nowMs))
             }
         }
+        // Stage D: one durable per-item quarantine record per
+        // quarantined item (`putIfAbsent` — a re-drain never
+        // overwrites the original record or its fence).
+        writeQuarantineRecords(partitioned.quarantined, marker, nowMs)
         var removed = 0
         var skippedHeld = 0
         for (item in partitioned.importable) {
@@ -588,6 +713,117 @@ class CutoverCoordinator(
             corrupt = report.corruptCount,
             verified = true,
             error = null,
+        )
+    }
+
+    // --- Quarantine records (P2 shape; Stage D review workflow) ---
+
+    /**
+     * Writes one per-item quarantine record per quarantined item,
+     * `putIfAbsent`: an existing record for the `dedupe_key` is
+     * never overwritten — its fence still names the drain that
+     * quarantined the item. Records carry identity + reason +
+     * span classes + financial metadata only, never raw spans.
+     */
+    private suspend fun writeQuarantineRecords(
+        quarantined: List<LegacyQueueItem>,
+        marker: CutoverPhaseMarker,
+        nowMs: Long,
+    ) {
+        if (quarantined.isEmpty()) return
+        transactions.run {
+            for (item in quarantined) {
+                val key = CollectorStateKeys.QUARANTINE_RECORD_PREFIX + item.dedupeKey
+                if (stateDao.get(key) != null) continue
+                val amount = item.payloadJson.let {
+                    if (it.has("amount")) it.optLong("amount") else null
+                }
+                val sourcePackage = item.dedupeKey.substringBefore("|")
+                    .takeIf { item.dedupeKey.contains("|") }
+                val record = QuarantineRecord(
+                    dedupeKey = item.dedupeKey,
+                    qkey = item.qkey,
+                    // Items quarantined by the §7.7 gate carry the
+                    // reason marker; an item quarantined by the
+                    // inspector without a reprocess run has none —
+                    // "unknown" is honest, never a guessed reason.
+                    reason = item.privacyQuarantineReason ?: "unknown",
+                    spanClasses = item.privacySpanClasses,
+                    amount = amount,
+                    sourcePackage = sourcePackage,
+                    quarantinedAtMs = nowMs,
+                    fenceId = marker.fenceId,
+                    drainGeneration = marker.drainGeneration,
+                    source = QuarantineRecord.SOURCE_DRAIN,
+                    resolution = null,
+                    resolvedAtMs = null,
+                )
+                stateDao.put(state(key, record.toJson().toString(), nowMs))
+            }
+        }
+    }
+
+    /** All durable per-item quarantine records, sorted by `qkey`. */
+    override suspend fun listAll(): List<QuarantineRecord> =
+        stateDao.getAll()
+            .filter { it.key.startsWith(CollectorStateKeys.QUARANTINE_RECORD_PREFIX) }
+            .mapNotNull { runCatching { QuarantineRecord.fromJson(JSONObject(it.valueJson)) }.getOrNull() }
+            .sortedBy { it.qkey }
+
+    override suspend fun get(dedupeKey: String): QuarantineRecord? {
+        val raw = stateDao.getValue(CollectorStateKeys.QUARANTINE_RECORD_PREFIX + dedupeKey)
+            ?: return null
+        return runCatching { QuarantineRecord.fromJson(JSONObject(raw)) }.getOrNull()
+    }
+
+    /**
+     * Resolves one quarantine record (Stage D operator decision).
+     * A record's resolution is final: resolving an already-resolved
+     * record with the SAME resolution is an idempotent no-op
+     * (true); with a DIFFERENT resolution it is refused (false).
+     * Returns false when no record exists for the key.
+     */
+    override suspend fun resolve(
+        dedupeKey: String,
+        resolution: String,
+        operator: String,
+        note: String?,
+        nowMs: Long,
+    ): Boolean {
+        val key = CollectorStateKeys.QUARANTINE_RECORD_PREFIX + dedupeKey
+        var ok = false
+        transactions.run {
+            val current = get(dedupeKey) ?: return@run
+            if (current.resolution != null) {
+                ok = current.resolution == resolution
+                return@run
+            }
+            val resolved = current.copy(
+                resolution = resolution,
+                resolvedAtMs = nowMs,
+                operator = operator,
+                decisionNote = note,
+            )
+            stateDao.put(state(key, resolved.toJson().toString(), nowMs))
+            ok = true
+        }
+        return ok
+    }
+
+    /**
+     * Quarantine reconciliation (Stage D): unresolved records
+     * still count — they report as `held/quarantined` in every
+     * user-facing surface until resolved, never
+     * `delivered`/`resolved`.
+     */
+    suspend fun reconcileQuarantine(): QuarantineReconciliation {
+        val all = listAll()
+        val unresolved = all.filter { it.resolution == null }
+        return QuarantineReconciliation(
+            total = all.size,
+            unresolved = unresolved.size,
+            resolved = all.size - unresolved.size,
+            unresolvedRecords = unresolved,
         )
     }
 

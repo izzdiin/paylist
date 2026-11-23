@@ -605,4 +605,79 @@ class ClaimBTest {
         assertTrue(JSONObject(h.transport.posted[0].body).getString("text").contains("482913"))
         assertEquals(DeliveryState.ACKED, h.deliveryState(delivery.deliveryId)!!.state)
     }
+
+    // --- §7.6: the picked-payload override ---
+
+    @Test
+    fun pickedPayloadOverride_chosenAmountAndKeyOnWire() = runBlocking {
+        val h = Harness()
+        val r1 = h.setupB()
+        val originalDedupe = "com.gojek.gopay|1794960000000|500000|t1"
+        val pickedDedupe = "com.gojek.gopay|1794960000000|100000|t1"
+        val ambiguousPayload = JSONObject().apply {
+            put("type", "payment")
+            put("device", "Moto g57")
+            put("pkg", "com.gojek.gopay")
+            put("amount", 500000L)
+            put("title", "GoPay")
+            put("text", "Rp500.000 diterima, saldo Rp100.000")
+            put("notif_time", "2026-11-18T00:00:00Z")
+            put("dedupe_key", originalDedupe)
+            put("direction", "in")
+            put("amount_ambiguous", true)
+            put("amount_tokens", JSONArray().apply {
+                put(JSONObject().apply { put("value", 500000L); put("start", 0); put("end", 8) })
+                put(JSONObject().apply { put("value", 100000L); put("start", 25); put("end", 33) })
+            })
+        }.toString()
+        val event = h.bEvent(originalDedupe, payloadJson = ambiguousPayload)
+        // Non-B delivery: the stored payload posts verbatim after the
+        // override is applied (the override runs before B/non-B
+        // branching, so it also feeds the raw and fallback bodies).
+        val delivery = h.bDelivery(
+            event, listOf("r1"), routeStampsJson = h.stampFor(r1), rawEphemeral = false,
+        )
+        // The pick wrote this override doc (AmountReview.pickAmount).
+        h.collectorDao.put(
+            CollectorStateEntity(
+                CollectorStateKeys.PICKED_PAYLOAD_PREFIX + delivery.deliveryId,
+                JSONObject().apply {
+                    put("amount", 100000L)
+                    put("dedupe_key", pickedDedupe)
+                    put("original_dedupe_key", originalDedupe)
+                }.toString(),
+                h.now,
+            ),
+        )
+
+        h.processor.processDueWork()
+
+        assertEquals(1, h.transport.posted.size)
+        val body = JSONObject(h.transport.posted[0].body)
+        assertEquals(100000L, body.optLong("amount"))
+        assertEquals(pickedDedupe, body.optString("dedupe_key"))
+        assertFalse("the token list must not reach the wire", body.has("amount_tokens"))
+        assertFalse(body.optBoolean("amount_ambiguous"))
+        assertEquals(DeliveryState.ACKED, h.deliveryState(delivery.deliveryId)!!.state)
+    }
+
+    @Test
+    fun pickedPayloadOverride_missingDoc_postsStoredPayload() = runBlocking {
+        val h = Harness()
+        val r1 = h.setupB()
+        // No override doc: the stored payload goes out untouched
+        // (fail-closed — a missing override never invents an amount).
+        val event = h.bEvent()
+        val delivery = h.bDelivery(
+            event, listOf("r1"), routeStampsJson = h.stampFor(r1), rawEphemeral = false,
+        )
+
+        h.processor.processDueWork()
+
+        assertEquals(1, h.transport.posted.size)
+        val body = JSONObject(h.transport.posted[0].body)
+        assertEquals(100800L, body.optLong("amount"))
+        assertEquals(event.dedupeKey, body.optString("dedupe_key"))
+        assertEquals(DeliveryState.ACKED, h.deliveryState(delivery.deliveryId)!!.state)
+    }
 }

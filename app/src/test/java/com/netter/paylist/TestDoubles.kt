@@ -700,6 +700,16 @@ class FakeMatchResultDao(private val store: FakeStore) : MatchResultDao {
             }
         }
 
+    override suspend fun getNeedingReview(): List<MatchResultEntity> =
+        store.lock.withLock {
+            store.matchResults.values.filter {
+                it.advisoryMatchStatus ==
+                    com.netter.paylist.data.entity.AdvisoryMatchStatus.AMBIGUOUS ||
+                    it.advisoryMatchStatus ==
+                    com.netter.paylist.data.entity.AdvisoryMatchStatus.MANUAL_REVIEW
+            }.sortedByDescending { it.createdAtMs }
+        }
+
     override suspend fun getAttributed(merchantId: String, orderNumber: String): MatchResultEntity? =
         store.lock.withLock {
             store.matchResults.values.firstOrNull {

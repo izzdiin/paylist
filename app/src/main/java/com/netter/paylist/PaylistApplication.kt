@@ -2,11 +2,15 @@ package com.netter.paylist
 
 import android.app.Application
 import androidx.work.Configuration
+import com.netter.paylist.collector.AmountReview
 import com.netter.paylist.collector.CaptureCoordinator
 import com.netter.paylist.collector.CaptureLogSink
 import com.netter.paylist.collector.ConsentStore
 import com.netter.paylist.collector.PrivacyGate
 import com.netter.paylist.collector.RawSnapshotStore
+import com.netter.paylist.collector.StoreLegacySweep
+import com.netter.paylist.collector.StoreQuarantineQueue
+import com.netter.paylist.collector.StoreReviewRoutes
 import com.netter.paylist.data.EventRepository
 import com.netter.paylist.data.PaylistDatabase
 import com.netter.paylist.data.entity.CollectorStateEntity
@@ -165,6 +169,31 @@ class PaylistApplication : Application(), Configuration.Provider {
         RawSnapshotStore()
     }
 
+    /**
+     * The Stage D operator review surface (§7.6/§7.3B/§7.7):
+     * amount picks, RAW_UNAVAILABLE authorise/discard, quarantine
+     * approve/discard. The coordinator is the quarantine record
+     * store; the legacy sweep/queue adapters hold SenderLock.
+     * `recorderGatePassed` stays false until B14 passes against
+     * live `catat.php` semantics (fail-closed).
+     */
+    val amountReview: AmountReview by lazy {
+        AmountReview(
+            deliveryDao = db.deliveryDao(),
+            eventDao = db.eventDao(),
+            collectorStateDao = db.collectorStateDao(),
+            matchResultDao = db.matchResultDao(),
+            transactions = db.transactionRunner(),
+            quarantineStore = coordinator,
+            legacySweep = StoreLegacySweep(store),
+            quarantineQueue = StoreQuarantineQueue(store),
+            routes = StoreReviewRoutes(store),
+            consentStore = consentStore,
+            privacyGate = privacyGate,
+            recorderGatePassed = false,
+        )
+    }
+
     override fun onCreate() {
         super.onCreate()
         Thread { startup() }.start()
@@ -266,6 +295,20 @@ class PaylistApplication : Application(), Configuration.Provider {
             captureCoordinator.startPeriodicSweep()
         } catch (e: Exception) {
             store.logLocal("sweep staging gagal: ${e.message?.take(120)}")
+        }
+        try {
+            // Stage D D3: recover amount picks interrupted by a
+            // crash between the Room hold and the legacy sweep —
+            // re-sweep and release/block each HELD delivery.
+            val (released, blocked, held) =
+                runBlocking { amountReview.recoverHeldPicks() }
+            if (released > 0 || blocked > 0 || held > 0) {
+                store.logLocal(
+                    "pemulihan pick review: $released dilepas, $blocked diblokir, $held masih ditahan"
+                )
+            }
+        } catch (e: Exception) {
+            store.logLocal("pemulihan pick review gagal: ${e.message?.take(120)}")
         }
     }
 

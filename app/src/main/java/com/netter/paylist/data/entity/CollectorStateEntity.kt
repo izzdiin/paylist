@@ -61,6 +61,29 @@ object CollectorStateKeys {
     /** Prefix for held-copy release records: `release_record:<dedupe_key>` (§8.7, F41). */
     const val RELEASE_RECORD_PREFIX: String = "release_record:"
 
+    /**
+     * Prefix for durable per-item quarantine records:
+     * `quarantine_record:<dedupe_key>` (P2 shape; Stage D review
+     * workflow resolves them — see `QuarantineRecord`).
+     */
+    const val QUARANTINE_RECORD_PREFIX: String = "quarantine_record:"
+
+    /**
+     * Prefix for operator review-audit documents:
+     * `review_audit:<kind>:<id>:<at_ms>` (Stage D, §7.6/§7.3B/§7.7).
+     * One document per decision; never deleted by retention.
+     */
+    const val REVIEW_AUDIT_PREFIX: String = "review_audit:"
+
+    /**
+     * Prefix for picked-payload overrides:
+     * `picked_payload:<delivery_id>` (Stage D, §7.6). The event
+     * row is immutable, so a picked delivery carries its chosen
+     * amount + recomputed `dedupe_key` here; the worker applies
+     * the override at claim time.
+     */
+    const val PICKED_PAYLOAD_PREFIX: String = "picked_payload:"
+
     /** Diagnostic counters document (capture/staging/drain counters, §8.3). */
     const val DIAGNOSTICS: String = "diagnostics"
 }

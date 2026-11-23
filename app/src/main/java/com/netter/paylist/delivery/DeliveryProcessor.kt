@@ -900,7 +900,9 @@ class DeliveryProcessor(
         outcomes: List<HopOutcome>,
         isRepost: Boolean,
     ): ClaimBody? {
-        val stored = buildPayload(event, routeId)
+        val stored = applyPickedPayloadOverride(
+            delivery.deliveryId, buildPayload(event, routeId),
+        )
         // Non-B deliveries and legacy imports post the stored payload.
         if (!delivery.rawEphemeral) {
             return stored?.let { ClaimBody.Body(it, null, null, false) }
@@ -1011,6 +1013,36 @@ class DeliveryProcessor(
                 rawLost = true,
             )
         return ClaimBody.Body(fallback, null, null, isFallback = true)
+    }
+
+    /**
+     * Applies a §7.6 picked-payload override (Stage D review): the
+     * event row is immutable, so a picked delivery carries its
+     * chosen amount + recomputed `dedupe_key` in a
+     * `picked_payload:<delivery_id>` document. The override is
+     * applied before the B/non-B branching, so the chosen amount
+     * flows into the raw body, the fallback body, and the §7.3B
+     * evaluation (the §7.6 precedence rule: the pick re-runs the
+     * fallback evaluation with the chosen amount). A missing or
+     * malformed override leaves the stored payload untouched
+     * (fail-closed: the stored first-token amount is never silently
+     * replaced by a partial override).
+     */
+    private suspend fun applyPickedPayloadOverride(
+        deliveryId: String,
+        stored: JSONObject?,
+    ): JSONObject? {
+        if (stored == null) return null
+        val raw = deliveryDao.readCollectorValue(
+            CollectorStateKeys.PICKED_PAYLOAD_PREFIX + deliveryId,
+        ) ?: return stored
+        val override = runCatching { JSONObject(raw) }.getOrNull() ?: return stored
+        if (!override.has("amount") || !override.has("dedupe_key")) return stored
+        stored.put("amount", override.optLong("amount"))
+        stored.put("dedupe_key", override.optString("dedupe_key"))
+        stored.put("amount_ambiguous", false)
+        stored.remove("amount_tokens")
+        return stored
     }
 
     /** The raw POST body: the stored payload with the raw title/text restored. */

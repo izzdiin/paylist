@@ -464,6 +464,17 @@ class CaptureCoordinator(
         routeIds: List<String>,
     ): Boolean {
         val mode = modeReader()
+        // §7.6 is absolute: an amount-ambiguous event is NEVER
+        // enqueued to the legacy sender (the first-token amount may
+        // be a balance, and the legacy sender cannot hold it for
+        // review). It promotes to Room as NEEDS_REVIEW in EVERY
+        // mode — in LEGACY_ONLY the delivery is inert (the worker
+        // claims only in WORKER_ONLY) and the pick releases it to
+        // PENDING; it dispatches after cutover. The review surface
+        // discloses the wait in LEGACY_ONLY mode.
+        if (delivery.state == DeliveryState.NEEDS_REVIEW) {
+            return promoteToRoom(stagingRow, delivery, payload, snapshot, routeIds, mode)
+        }
         return when (mode) {
             CutoverMode.LEGACY_ONLY -> {
                 val ok = legacyEnqueue.enqueue(payload, LegacyQkey.KIND_CHAIN, routeIds)
@@ -484,29 +495,40 @@ class CaptureCoordinator(
                 )
                 true
             }
-            CutoverMode.DRAINING, CutoverMode.WORKER_ONLY -> {
-                val result = repository.promoteStagingToRoom(stagingRow, delivery)
-                if (!result.deliveryInserted && repository.getDeliveryByQkey(stagingRow.legacyQkey) == null) {
-                    // Insert failed AND no delivery exists: the
-                    // staging row is retained for the sweep (§8.3 (7′)).
-                    parked.incrementAndGet()
-                    logger.logLocal(
-                        "capture parkir (gagal promote Room): ${snapshot.packageName} " +
-                            "@${snapshot.postTimeMs}; dicoba lagi oleh sweep",
-                    )
-                    return false
-                }
-                if (mode == CutoverMode.DRAINING) roomCapturesDuringDraining.incrementAndGet()
-                enqueued.incrementAndGet()
-                logger.logEvent(
-                    snapshot.packageName,
-                    "payment: Rp${payload.optLong("amount")} dari ${snapshot.packageName} -> " +
-                        routeIds.joinToString(" > ") + " (Room)",
-                )
-                if (mode == CutoverMode.WORKER_ONLY) onRoomEnqueued()
-                true
-            }
+            CutoverMode.DRAINING, CutoverMode.WORKER_ONLY ->
+                promoteToRoom(stagingRow, delivery, payload, snapshot, routeIds, mode)
         }
+    }
+
+    /** Promotes one staged capture to a Room delivery (all modes for NEEDS_REVIEW). */
+    private suspend fun promoteToRoom(
+        stagingRow: CaptureStagingEntity,
+        delivery: Delivery,
+        payload: JSONObject,
+        snapshot: NotificationSnapshot,
+        routeIds: List<String>,
+        mode: CutoverMode,
+    ): Boolean {
+        val result = repository.promoteStagingToRoom(stagingRow, delivery)
+        if (!result.deliveryInserted && repository.getDeliveryByQkey(stagingRow.legacyQkey) == null) {
+            // Insert failed AND no delivery exists: the staging row
+            // is retained for the sweep (§8.3 (7′)).
+            parked.incrementAndGet()
+            logger.logLocal(
+                "capture parkir (gagal promote Room): ${snapshot.packageName} " +
+                    "@${snapshot.postTimeMs}; dicoba lagi oleh sweep",
+            )
+            return false
+        }
+        if (mode == CutoverMode.DRAINING) roomCapturesDuringDraining.incrementAndGet()
+        enqueued.incrementAndGet()
+        logger.logEvent(
+            snapshot.packageName,
+            "payment: Rp${payload.optLong("amount")} dari ${snapshot.packageName} -> " +
+                routeIds.joinToString(" > ") + " (Room)",
+        )
+        if (mode == CutoverMode.WORKER_ONLY) onRoomEnqueued()
+        return true
     }
 
     // --- Staging sweep (executor thread) ---
