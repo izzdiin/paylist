@@ -83,6 +83,15 @@ class ListenerCaptureIntegrationTest {
         val routes = app.store.routes()
         val gopay = routes.first { it.packages.contains(PKG) }
         app.store.upsertRoute(gopay.copy(url = DEAD_URL))
+        // D5 consent gate (F15): capture drops notifications for
+        // routes without a granted consent record, before any parse
+        // or durable write. In production the operator completes the
+        // P6 opt-in (or the upgrade migration carries it forward);
+        // the test process never launches MainActivity, so the
+        // upgrade migration ran with no routes and granted nothing
+        // — and setUp's clearAllTables() wipes the consent doc
+        // anyway. Grant explicitly here, after every wipe.
+        app.consentStore.grant(gopay.id)
         app.store.saveQueueSync(emptyList())
         setMode(CutoverMode.LEGACY_ONLY)
 
