@@ -123,9 +123,11 @@ class SenderBFlushTest {
     }
 
     @After
-    fun tearDown() = runBlocking {
-        runCatching { app.db.clearAllTables() }
-        app.store.saveQueueSync(emptyList())
+    fun tearDown() {
+        runBlocking {
+            runCatching { app.db.clearAllTables() }
+            app.store.saveQueueSync(emptyList())
+        }
     }
 
     private suspend fun grantB(expiresInMs: Long = 3_600_000L) {

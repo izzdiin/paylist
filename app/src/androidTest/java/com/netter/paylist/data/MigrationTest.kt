@@ -55,6 +55,10 @@ class MigrationTest {
                         "AND name NOT LIKE 'capture_log%' " +
                         "AND name NOT LIKE 'index_capture_log%' " +
                         "AND name != 'room_master_table' " +
+                        // android_metadata is created by the framework
+                        // before onCreate runs; replaying its CREATE
+                        // fails ("table android_metadata already exists").
+                        "AND name != 'android_metadata' " +
                         "ORDER BY type DESC, name",
                 ),
             )

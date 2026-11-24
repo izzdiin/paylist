@@ -60,7 +60,10 @@ class ReviewNotifierTest {
         val extras = notification.extras
         val title = extras.getCharSequence("android.title")?.toString().orEmpty()
         val text = extras.getCharSequence("android.text")?.toString().orEmpty()
-        assertTrue("title mentions ambiguous payment", title.contains("Ambigu"))
+        // The notifier title is Indonesian ("Pembayaran ambigu ..."):
+        // match case-insensitively; the exact capitalisation is not
+        // the assertion.
+        assertTrue("title mentions ambiguous payment", title.contains("ambigu", ignoreCase = true))
         assertTrue("text carries the amount", text.contains("170.286"))
     }
 

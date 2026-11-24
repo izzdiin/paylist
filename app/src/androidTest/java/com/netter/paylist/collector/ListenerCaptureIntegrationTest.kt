@@ -91,9 +91,11 @@ class ListenerCaptureIntegrationTest {
     }
 
     @After
-    fun tearDown() = runBlocking {
-        runCatching { app.db.clearAllTables() }
-        app.store.saveQueueSync(emptyList())
+    fun tearDown() {
+        runBlocking {
+            runCatching { app.db.clearAllTables() }
+            app.store.saveQueueSync(emptyList())
+        }
     }
 
     private suspend fun setMode(mode: CutoverMode) {
