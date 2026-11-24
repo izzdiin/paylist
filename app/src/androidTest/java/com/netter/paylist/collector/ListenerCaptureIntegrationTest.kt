@@ -13,6 +13,7 @@ import com.netter.paylist.data.entity.CollectorStateEntity
 import com.netter.paylist.data.entity.CollectorStateKeys
 import com.netter.paylist.migration.CutoverMode
 import com.netter.paylist.migration.LegacyQkey
+import com.netter.paylist.security.SecretVault
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.After
@@ -60,6 +61,9 @@ class ListenerCaptureIntegrationTest {
     private lateinit var app: PaylistApplication
     private lateinit var service: TestableListenerService
 
+    /** Route id of the seeded GoPay route (for the test vault secret). */
+    private lateinit var gopayRouteId: String
+
     /** Exposes the protected `attachBaseContext` for the test. */
     class TestableListenerService : PaylistListenerService() {
         fun attachForTest(ctx: Context) {
@@ -92,6 +96,18 @@ class ListenerCaptureIntegrationTest {
         // — and setUp's clearAllTables() wipes the consent doc
         // anyway. Grant explicitly here, after every wipe.
         app.consentStore.grant(gopay.id)
+        // Route secret (D5 vault, F-P1-06): both senders skip a hop
+        // whose route has no vault secret — the Room worker then
+        // BLOCKs the delivery ("all_routes_skipped") and the legacy
+        // flush drops the queue item as "done". The seeded route
+        // carries no secret (the operator enters it in production),
+        // so store a test secret here to make the hops attemptable;
+        // the dead URL still guarantees no production traffic.
+        gopayRouteId = gopay.id
+        assertTrue(
+            "test secret must be stored in the vault",
+            SecretVault(app).putSecret(gopay.id, "test-secret"),
+        )
         app.store.saveQueueSync(emptyList())
         setMode(CutoverMode.LEGACY_ONLY)
 
@@ -101,6 +117,7 @@ class ListenerCaptureIntegrationTest {
 
     @After
     fun tearDown() {
+        runCatching { SecretVault(app).deleteSecret(gopayRouteId) }
         runBlocking {
             runCatching { app.db.clearAllTables() }
             app.store.saveQueueSync(emptyList())
@@ -208,11 +225,18 @@ class ListenerCaptureIntegrationTest {
         await("Room delivery") { app.db.deliveryDao().getByLegacyQkey(qkey) != null }
         val delivery = app.db.deliveryDao().getByLegacyQkey(qkey)
         assertNotNull(delivery)
-        // The worker may claim the delivery while the test polls, so
-        // PENDING or IN_FLIGHT both prove the Room landing.
+        // The worker may claim the delivery while the test polls, and
+        // may even complete its attempt against the dead URL before
+        // the test reads: a refused connection is a retryable NO_POST
+        // failure, so the delivery lands in RETRY_WAIT. PENDING,
+        // IN_FLIGHT, or RETRY_WAIT all prove the Room landing;
+        // BLOCKED would mean every hop was skipped (no secret) and
+        // still fails the test.
         assertTrue(
-            "delivery must be PENDING or IN_FLIGHT, was ${delivery!!.state}",
-            delivery.state == DeliveryState.PENDING || delivery.state == DeliveryState.IN_FLIGHT,
+            "delivery must be PENDING, IN_FLIGHT, or RETRY_WAIT, was ${delivery!!.state}",
+            delivery.state == DeliveryState.PENDING ||
+                delivery.state == DeliveryState.IN_FLIGHT ||
+                delivery.state == DeliveryState.RETRY_WAIT,
         )
         assertEquals(0, app.store.queueSnapshot().size)
     }

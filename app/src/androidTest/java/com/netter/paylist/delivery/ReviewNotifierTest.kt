@@ -2,6 +2,7 @@ package com.netter.paylist.delivery
 
 import android.app.NotificationManager
 import android.content.Context
+import android.service.notification.StatusBarNotification
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.netter.paylist.PaylistApplication
@@ -43,6 +44,23 @@ class ReviewNotifierTest {
         notificationManager.cancelAll()
     }
 
+    /**
+     * Polls activeNotifications until a notification with [id]
+     * appears (or the timeout elapses). `notify()` returns before
+     * the system has necessarily propagated the post to the active
+     * list, so an immediate read can spuriously find nothing on a
+     * loaded emulator (flaked once in CI run 45304077042).
+     */
+    private fun awaitActive(id: Int, timeoutMs: Long = 2_000L): StatusBarNotification? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val found = notificationManager.activeNotifications.firstOrNull { it.id == id }
+            if (found != null) return found
+            Thread.sleep(50)
+        }
+        return null
+    }
+
     @Test
     fun notifyAmbiguous_postsNotificationOnReviewChannel() {
         val shown = ReviewNotifier.notifyAmbiguous(app, "test-case-1", 170286L, "com.gojek.gopay")
@@ -52,8 +70,7 @@ class ReviewNotifierTest {
             return
         }
         val id = ReviewNotifier.notificationIdFor("test-case-1")
-        val active = notificationManager.activeNotifications
-        val mine = active.firstOrNull { it.id == id }
+        val mine = awaitActive(id)
         assertTrue("expected an active notification with id $id", mine != null)
         val notification = mine!!.notification
         assertEquals(ReviewNotifier.CHANNEL_ID, notification.channelId)
@@ -74,7 +91,15 @@ class ReviewNotifierTest {
         val shown2 = ReviewNotifier.notifyAmbiguous(app, "test-case-2", 100800L, "com.gojek.gopay")
         assertTrue(shown2)
         val id = ReviewNotifier.notificationIdFor("test-case-2")
-        val count = notificationManager.activeNotifications.count { it.id == id }
+        // Poll for the single updated notification (see awaitActive):
+        // the immediate read raced the system's propagation once.
+        val deadline = System.currentTimeMillis() + 2_000L
+        var count = 0
+        while (System.currentTimeMillis() < deadline) {
+            count = notificationManager.activeNotifications.count { it.id == id }
+            if (count == 1) break
+            Thread.sleep(50)
+        }
         assertEquals(1, count)
     }
 }
