@@ -1,0 +1,70 @@
+--- a/paylist/notify.php
++++ b/paylist/notify.php
+@@ -130,31 +130,16 @@
+ // top-up saldo mitra (kode unik hanya lahir saat QRIS dirender di
+ // checkout, jadi nominalnya memang bisa terbentuk). Rumus meniru
+ // checkout.php persis: nominal = tagihan + ceil(tagihan * 0,7%) + kode.
++// Matcher bersama (paylist/paylist_match.php, perbaikan C2): kandidat dan
++// rumus nominal sama persis dengan sebelumnya — ekstraksi ini tidak
++// mengubah perilaku insert baru. Re-match baris lama ditangani
++// paylist_rematch.php (operator) dan hook kode-birth, bukan di sini.
+ $match = null;
+ if ($inserted && $type === 'payment' && $amount !== null && $amount > 0) {
+-    $candSql = "SELECT id, id_pelanggan, tagihan, kode_unik FROM payment
+-                WHERE status = 'UNPAID' AND kode_unik IS NOT NULL";
+-    $hits = [];
+-    if ($res = $db->query($candSql)) {
+-        while ($row = $res->fetch_assoc()) {
+-            $baseInt = (int)ceil((float)$row['tagihan']);
+-            $expected = $baseInt + (int)ceil($baseInt * 0.007) + (int)$row['kode_unik'];
+-            if ($expected === $amount) {
+-                $hits[] = $row;
+-            }
+-        }
+-        $res->free();
+-    }
+-    if (count($hits) === 1) {
+-        $upd = $db->prepare("UPDATE paylist_log SET match_status = 'matched', matched_id_pelanggan = ?, matched_id_payment = ? WHERE dedupe_key = ?");
+-        // id_pelanggan dipertahankan sebagai string: pada baris top-up
+-        // nilainya nomor HP mitra (melebihi jangkauan INT 32-bit).
+-        $mid = (string)$hits[0]['id_pelanggan'];
+-        $mpy = (int)$hits[0]['id'];
+-        $upd->bind_param('sis', $mid, $mpy, $dedupeKey);
+-        $upd->execute();
+-        $upd->close();
+-        $match = ['status' => 'matched', 'id_pelanggan' => (int)$mid, 'payment' => $mpy];
++    require_once __DIR__ . '/paylist_match.php';
++    $mres = paylist_match_notification($db, $logId);
++    if ($mres['status'] === 'matched') {
++        $match = ['status' => 'matched', 'id_pelanggan' => $mres['id_pelanggan'], 'payment' => $mres['payment']];
+         // Pelunasan (ada gerbang uji di dalam paylist_apply.php).
+         // Kegagalan di sini TIDAK boleh menggagalkan pencatatan notifikasi.
+         if ($logId > 0) {
+@@ -162,16 +147,21 @@
+                 require_once __DIR__ . '/paylist_apply.php';
+                 $applyRes = paylist_apply_payment($db, $logId);
+                 $match['apply'] = $applyRes['applied'] ? 'ok' : 'skip';
++                if (empty($applyRes['applied'])) {
++                    // C3 bentuk A: bila kalah klaim (payment sudah PAID),
++                    // tandai kekalahan di baris log ini (best-effort).
++                    try { paylist_maybe_mark_loser($db, $logId); } catch (Throwable $e) { /* abaikan */ }
++                }
+             } catch (Throwable $e) {
+                 $match['apply'] = 'error';
++                // C3 bentuk A: klaim atomik yang kalah MELEMPAR (bukan
++                // mengembalikan applied=false) — tandai kekalahan di jalur
++                // ini juga; helper diam bila payment belum PAID.
++                try { paylist_maybe_mark_loser($db, $logId); } catch (Throwable $e2) { /* abaikan */ }
+             }
+         }
+-    } elseif (count($hits) > 1) {
+-        $upd = $db->prepare("UPDATE paylist_log SET match_status = 'ambiguous' WHERE dedupe_key = ?");
+-        $upd->bind_param('s', $dedupeKey);
+-        $upd->execute();
+-        $upd->close();
+-        $match = ['status' => 'ambiguous', 'candidates' => count($hits)];
++    } elseif ($mres['status'] === 'ambiguous') {
++        $match = ['status' => 'ambiguous', 'candidates' => $mres['candidates']];
+     } else {
+         $match = ['status' => 'logged'];
+     }

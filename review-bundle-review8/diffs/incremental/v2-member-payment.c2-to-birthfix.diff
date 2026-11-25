@@ -1,0 +1,42 @@
+--- a/member/payment.php
++++ b/member/payment.php
+@@ -357,18 +357,37 @@
+     $kodeBaruLahir = false;
+     if ($kodeUnik <= 0) {
+         for ($percobaan = 0; $percobaan < 5 && $kodeUnik <= 0; $percobaan++) {
++            // Birth-fix (24 Nov 2026): himpunan kode terpakai dihitung dari
++            // SEMUA proforma UNPAID yang sudah berkode — sebelumnya hanya
++            // proforma TERBARU tiap pelanggan (JOIN MAX(id)), sehingga
++            // tunggakan lama tidak terlihat dan tagihan baru bisa lahir
++            // dengan kode yang sama (nominal sama persis -> ambigu). Pola
++            // ini disamakan dengan warganet (checkout.php) dan dengan
++            // cakupan kandidat matcher C6 (qris_find_candidates).
++            // Satu query yang sama juga membangun himpunan nominal akhir
++            // yang terpakai: kandidat ditolak bila jumlah akhirnya
++            // (total + fee + kode, rumus yang sama dengan
++            // qris_expected_nominal()) sama dengan nominal tagihan UNPAID
++            // lain — total berbeda + kode berbeda bisa berjumlah sama.
+             $terpakai = [];
+-            $qUsed = $conn->query("SELECT p.kode_unik FROM proforma p JOIN (SELECT id_pelanggan, MAX(id) AS mid FROM proforma GROUP BY id_pelanggan) terakhir ON terakhir.mid = p.id WHERE p.status = 'UNPAID' AND p.kode_unik IS NOT NULL");
++            $nominalTerpakai = [];
++            $qUsed = $conn->query("SELECT tagihan, addon, biaya_instalasi, pajak, diskon, total_tagihan, kode_unik FROM proforma WHERE status = 'UNPAID' AND kode_unik IS NOT NULL");
+             if ($qUsed) {
+                 while ($rUsed = $qUsed->fetch_assoc()) {
+                     $terpakai[(int)$rUsed['kode_unik']] = true;
++                    $dasarNom = (float)($rUsed['total_tagihan'] ?? 0);
++                    if ($dasarNom <= 0) {
++                        $dasarNom = (float)$rUsed['tagihan'] + (float)$rUsed['addon'] + (float)$rUsed['biaya_instalasi'] + (float)$rUsed['pajak'] - (float)$rUsed['diskon'];
++                    }
++                    $dasarNomInt = (int)ceil($dasarNom);
++                    $nominalTerpakai[$dasarNomInt + (int)ceil($dasarNomInt * 0.007) + (int)$rUsed['kode_unik']] = true;
+                 }
+             }
+             $calon = 0;
+             // Rentang 3 digit (100-999); kode lama < 100 yang sudah
+             // tersimpan TIDAK diubah di sini.
+             for ($k = 100; $k <= 999; $k++) {
+-                if (!isset($terpakai[$k])) {
++                if (!isset($terpakai[$k]) && !isset($nominalTerpakai[$qrisBase + $qrisFee + $k])) {
+                     $calon = $k;
+                     break;
+                 }

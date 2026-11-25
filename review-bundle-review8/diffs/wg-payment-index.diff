@@ -1,0 +1,226 @@
+--- a/payment/index.php
++++ b/payment/index.php
+@@ -1,6 +1,9 @@
+ <?php
+ session_start();
+ require_once('../db_config.php');
++require_once('../csrf.php');
++// Token CSRF sesi (untuk tombol "Cocokkan ulang" di tab Paylist).
++$csrfToken = csrf_token();
+ 
+ if (!isset($_SESSION['username'])) {
+     header("Location: ../login.php");
+@@ -36,6 +39,50 @@
+ $paylistNewSecret = $_SESSION['paylist_new_secret'] ?? null;
+ unset($_SESSION['paylist_new_secret']);
+ 
++// Log Paylist (paylist_log): pembayaran terbaru + detak jantung listener terakhir.
++// (Tampilan log baru, perbaikan C2 — sebelumnya tab ini hanya konfigurasi.)
++$paylistLogs = [];
++$paylistLastHb = null;
++$paylistLastPay = null;
++// C1: hitungan kasus yang perlu perhatian operator (seluruh tabel).
++$paylistNeedLogged = 0;
++$paylistNeedAmb = 0;
++$paylistNeedPending = 0;
++try {
++    $logRes = $conn->query("SELECT id, received_at, device, source_pkg, amount, raw_text, match_status, matched_id_pelanggan, matched_id_payment, applied_at, apply_note, rematch_count, last_rematch_at, rematched_by FROM paylist_log WHERE dedupe_key NOT LIKE 'hb-%' ORDER BY id DESC LIMIT 500");
++    if ($logRes) { while ($r = $logRes->fetch_assoc()) { $paylistLogs[] = $r; } }
++    $hbRes = $conn->query("SELECT received_at FROM paylist_log WHERE dedupe_key LIKE 'hb-%' ORDER BY id DESC LIMIT 1");
++    if ($hbRes && $hbRes->num_rows) { $paylistLastHb = $hbRes->fetch_assoc()['received_at']; }
++    if (!empty($paylistLogs)) { $paylistLastPay = $paylistLogs[0]['received_at']; }
++    // C1: hitungan kasus yang perlu perhatian operator — seluruh tabel,
++    // bukan hanya 500 baris terakhir (logged/ambiguous bernominal +
++    // matched yang belum diterapkan, termasuk loser C3).
++    $cntRes = $conn->query("SELECT SUM(match_status='logged' AND amount IS NOT NULL) AS c_logged, SUM(match_status='ambiguous' AND amount IS NOT NULL) AS c_amb, SUM(match_status='matched' AND applied_at IS NULL) AS c_pending FROM paylist_log WHERE dedupe_key NOT LIKE 'hb-%'");
++    if ($cntRes && $cntRes->num_rows) { $cntRow = $cntRes->fetch_assoc(); $paylistNeedLogged = (int)$cntRow['c_logged']; $paylistNeedAmb = (int)$cntRow['c_amb']; $paylistNeedPending = (int)$cntRow['c_pending']; }
++} catch (Throwable $e) {
++    $paylistLogs = [];
++}
++
++$paylistJson = [];
++foreach ($paylistLogs as $r) {
++    $paylistJson[] = [
++        'id' => (int)$r['id'],
++        'received_at' => (string)$r['received_at'],
++        'amount' => $r['amount'] !== null ? (int)$r['amount'] : null,
++        'raw_text' => (string)$r['raw_text'],
++        'match_status' => (string)$r['match_status'],
++        'matched_id_pelanggan' => $r['matched_id_pelanggan'] !== null ? (string)$r['matched_id_pelanggan'] : null,
++        'matched_id_payment' => $r['matched_id_payment'] !== null ? (int)$r['matched_id_payment'] : null,
++        'applied_at' => $r['applied_at'] !== null ? (string)$r['applied_at'] : null,
++        'apply_note' => $r['apply_note'] !== null ? (string)$r['apply_note'] : '',
++        'rematch_count' => (int)($r['rematch_count'] ?? 0),
++        'last_rematch_at' => $r['last_rematch_at'] !== null ? (string)$r['last_rematch_at'] : null,
++        'rematched_by' => $r['rematched_by'] !== null ? (string)$r['rematched_by'] : null,
++        '_rematching' => false,
++        '_rematchMsg' => '',
++    ];
++}
++
+ ?>
+ 
+     
+@@ -468,6 +515,162 @@
+             }
+             </script>
+             <?php endif; ?>
++            <hr class="my-6">
++            <div style="border:1px solid #e5e7eb;border-left:6px solid #b45309;border-radius:8px;padding:10px 14px;margin-bottom:14px;background:#fffbeb">
++                <div class="text-sm text-gray-800">Perlu perhatian operator: <b><?= $paylistNeedLogged + $paylistNeedAmb ?> belum cocok</b> (logged <?= $paylistNeedLogged ?> &middot; <span style="color:#b91c1c;font-weight:700">ambiguous <?= $paylistNeedAmb ?></span>) &middot; <b><?= $paylistNeedPending ?> matched belum diterapkan</b></div>
++                <div class="text-sm text-gray-600" style="margin-top:2px">Kasus ambiguous diputuskan operator setelah pemeriksaan (C1). Baris matched yang belum diterapkan termasuk yang kalah berebut (C3) — cocokkan ulang lewat tombol di tiap baris. Hitungan di seluruh log, bukan hanya 500 baris di bawah.</div>
++            </div>
++            <h3 class="text-md font-semibold text-gray-800 mb-2">Log Pembayaran Paylist</h3>
++            <p class="text-sm text-gray-600 mb-3">Heartbeat terakhir dari app Paylist: <b><?= $paylistLastHb ? htmlspecialchars((string)$paylistLastHb, ENT_QUOTES, 'UTF-8') : 'belum pernah' ?></b>. Bila heartbeat berhenti berjam-jam, HP pendengar kemungkinan mati/tertidur dan notifikasi bisa terlewat. Pembayaran terakhir tercatat: <b><?= $paylistLastPay ? htmlspecialchars((string)$paylistLastPay, ENT_QUOTES, 'UTF-8') : 'belum ada' ?></b>.</p>
++            <div x-data="paylistLogApp()" x-init="initWatchers()">
++                <div class="flex flex-wrap items-center gap-2 mb-3">
++                    <input type="text" x-model.debounce.300ms="q" placeholder="Cari keterangan, nominal, id pelanggan/payment..." class="flex-1 min-w-[220px] px-3 py-2 border border-gray-300 rounded-md text-sm">
++                    <select x-model="fStatus" class="px-3 py-2 border border-gray-300 rounded-md text-sm">
++                        <option value="">Semua status cocok</option>
++                        <option value="belum-cocok">Belum cocok (perlu re-match)</option>
++                        <option value="matched">matched</option>
++                        <option value="logged">logged</option>
++                        <option value="ambiguous">ambiguous</option>
++                    </select>
++                    <select x-model="fApplied" class="px-3 py-2 border border-gray-300 rounded-md text-sm">
++                        <option value="">Semua penerapan</option>
++                        <option value="applied">Sudah diterapkan</option>
++                        <option value="pending">Matched, belum diterapkan</option>
++                    </select>
++                    <select x-model.number="perPage" class="px-3 py-2 border border-gray-300 rounded-md text-sm">
++                        <option value="10">10 / halaman</option>
++                        <option value="15">15 / halaman</option>
++                        <option value="25">25 / halaman</option>
++                        <option value="50">50 / halaman</option>
++                    </select>
++                </div>
++                <div class="overflow-x-auto">
++                <table class="min-w-full text-sm">
++                    <thead>
++                        <tr class="text-left text-gray-600 border-b">
++                            <th class="py-2 pr-3">Waktu</th>
++                            <th class="py-2 pr-3">Nominal</th>
++                            <th class="py-2 pr-3">Keterangan</th>
++                            <th class="py-2 pr-3">Pencocokan</th>
++                            <th class="py-2 pr-3">Pelanggan / Payment</th>
++                            <th class="py-2 pr-3">Penerapan</th>
++                            <th class="py-2">Aksi</th>
++                        </tr>
++                    </thead>
++                    <tbody>
++                        <template x-for="log in paged" :key="log.id">
++                            <tr class="border-b align-top">
++                                <td class="py-2 pr-3 whitespace-nowrap" x-text="log.received_at"></td>
++                                <td class="py-2 pr-3 whitespace-nowrap" x-text="fmtRp(log.amount)"></td>
++                                <td class="py-2 pr-3" x-text="log.raw_text"></td>
++                                <td class="py-2 pr-3"><span class="px-2 py-0.5 rounded text-xs" :class="badgeClass(log.match_status)" x-text="log.match_status"></span></td>
++                                <td class="py-2 pr-3 whitespace-nowrap" x-text="pelangganText(log)"></td>
++                                <td class="py-2 pr-3">
++                                    <span x-text="appliedText(log)"></span>
++                                    <div class="text-xs text-gray-500" x-show="log.apply_note" x-text="log.apply_note"></div>
++                                    <div class="text-xs text-gray-500" x-show="log.rematch_count > 0" x-text="rematchText(log)"></div>
++                                </td>
++                                <td class="py-2">
++                                    <template x-if="canRematch(log)">
++                                        <button type="button" @click="rematch(log)" :disabled="log._rematching" class="px-2 py-1 border border-gray-300 rounded-md text-xs hover:bg-gray-100 disabled:opacity-40" x-text="log._rematching ? 'Mencocokkan...' : 'Cocokkan ulang'"></button>
++                                    </template>
++                                    <div class="text-xs text-gray-500" x-show="log._rematchMsg" x-text="log._rematchMsg"></div>
++                                </td>
++                            </tr>
++                        </template>
++                        <tr x-show="filtered.length === 0">
++                            <td colspan="7" class="py-4 text-center text-gray-500">Tidak ada catatan yang cocok dengan pencarian/filter.</td>
++                        </tr>
++                    </tbody>
++                </table>
++                </div>
++                <div class="flex flex-wrap items-center justify-between mt-3 gap-2">
++                    <p class="text-xs text-gray-500" x-text="'Menampilkan ' + startNum + '–' + endNum + ' dari ' + filtered.length + ' catatan (dari ' + rows.length + ' catatan pembayaran terakhir; heartbeat hanya ditampilkan waktu terakhirnya di atas).'"></p>
++                    <div class="flex items-center gap-1">
++                        <button type="button" @click="page = Math.max(1, pageSafe - 1)" :disabled="pageSafe <= 1" class="px-3 py-1 border border-gray-300 rounded-md text-sm disabled:opacity-40">&laquo;</button>
++                        <template x-for="p in pageList" :key="p">
++                            <button type="button" @click="page = p" class="px-3 py-1 border rounded-md text-sm" :class="p === pageSafe ? 'bg-gray-700 text-white border-gray-700' : 'border-gray-300'" x-text="p"></button>
++                        </template>
++                        <button type="button" @click="page = Math.min(totalPages, pageSafe + 1)" :disabled="pageSafe >= totalPages" class="px-3 py-1 border border-gray-300 rounded-md text-sm disabled:opacity-40">&raquo;</button>
++                    </div>
++                </div>
++            </div>
++            <script>
++            function paylistLogApp() {
++                return {
++                    rows: <?= json_encode($paylistJson, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP) ?>,
++                    csrfToken: <?= json_encode($csrfToken) ?>,
++                    q: '', fStatus: '', fApplied: '', page: 1, perPage: 15,
++                    initWatchers() {
++                        this.$watch('q', () => { this.page = 1; });
++                        this.$watch('fStatus', () => { this.page = 1; });
++                        this.$watch('fApplied', () => { this.page = 1; });
++                        this.$watch('perPage', () => { this.page = 1; });
++                    },
++                    get filtered() {
++                        const q = this.q.trim().toLowerCase();
++                        return this.rows.filter(r => {
++                            if (this.fStatus === 'belum-cocok') {
++                                // C3: matched + belum diterapkan (loser) juga perlu re-match.
++                                if (!(((r.match_status === 'logged' || r.match_status === 'ambiguous') || (r.match_status === 'matched' && !r.applied_at)) && r.amount !== null)) return false;
++                            } else if (this.fStatus && r.match_status !== this.fStatus) return false;
++                            if (this.fApplied === 'applied' && !r.applied_at) return false;
++                            if (this.fApplied === 'pending' && !(r.match_status === 'matched' && !r.applied_at)) return false;
++                            if (q) {
++                                const hay = (r.raw_text + ' ' + (r.amount === null ? '' : r.amount) + ' ' + (r.matched_id_pelanggan || '') + ' ' + (r.matched_id_payment || '') + ' ' + r.received_at).toLowerCase();
++                                if (!hay.includes(q)) return false;
++                            }
++                            return true;
++                        });
++                    },
++                    get totalPages() { return Math.max(1, Math.ceil(this.filtered.length / this.perPage)); },
++                    get pageSafe() { return Math.min(this.page, this.totalPages); },
++                    get paged() { const st = (this.pageSafe - 1) * this.perPage; return this.filtered.slice(st, st + this.perPage); },
++                    get startNum() { return this.filtered.length ? (this.pageSafe - 1) * this.perPage + 1 : 0; },
++                    get endNum() { return Math.min(this.filtered.length, this.pageSafe * this.perPage); },
++                    get pageList() {
++                        const total = this.totalPages, cur = this.pageSafe, out = [];
++                        let a = Math.max(1, cur - 2), b = Math.min(total, cur + 2);
++                        if (b - a < 4) { a = Math.max(1, b - 4); b = Math.min(total, a + 4); }
++                        for (let n = a; n <= b; n++) out.push(n);
++                        return out;
++                    },
++                    fmtRp(n) { return (n === null || n === undefined) ? '-' : 'Rp' + Number(n).toLocaleString('id-ID'); },
++                    badgeClass(st) { return st === 'matched' ? 'bg-green-100 text-green-800' : (st === 'ambiguous' ? 'bg-red-100 text-red-800' : 'bg-gray-100 text-gray-700'); },
++                    pelangganText(r) { if (!r.matched_id_pelanggan) return '-'; return r.matched_id_pelanggan + (r.matched_id_payment ? ' / ' + r.matched_id_payment : ''); },
++                    appliedText(r) { if (r.applied_at) return 'Diterapkan ' + r.applied_at; if (r.match_status === 'matched') return 'Belum diterapkan'; return '-'; },
++                    rematchText(r) { return 'Cocok ulang ' + r.rematch_count + '× oleh ' + (r.rematched_by || '?') + (r.last_rematch_at ? ' (' + r.last_rematch_at + ')' : ''); },
++                    canRematch(r) { return (r.match_status === 'logged' || r.match_status === 'ambiguous' || r.match_status === 'matched') && !r.applied_at && r.amount !== null; },
++                    rematch(r) {
++                        if (!this.canRematch(r)) return;
++                        if (!confirm('Cocokkan ulang pembayaran Rp' + Number(r.amount).toLocaleString('id-ID') + ' ini? Bila cocok, tagihan langsung dilunasi.')) return;
++                        r._rematching = true; r._rematchMsg = '';
++                        const fd = new FormData();
++                        fd.append('log_id', r.id);
++                        fd.append('csrf_token', this.csrfToken);
++                        fetch('../paylist/paylist_rematch.php', { method: 'POST', body: fd, credentials: 'same-origin' })
++                            .then(res => res.json().then(j => ({ status: res.status, body: j })).catch(() => ({ status: res.status, body: null })))
++                            .then(({ status, body }) => {
++                                r._rematching = false;
++                                if (!body || body.ok !== true) {
++                                    r._rematchMsg = 'Gagal (' + status + '): ' + ((body && (body.error || body.note)) || 'respons tidak terbaca');
++                                    return;
++                                }
++                                r.match_status = body.after;
++                                if (body.id_pelanggan) r.matched_id_pelanggan = body.id_pelanggan;
++                                if (body.payment) r.matched_id_payment = body.payment;
++                                if (body.applied_at !== undefined) r.applied_at = body.applied_at;
++                                if (body.apply_note !== undefined) r.apply_note = body.apply_note;
++                                if (body.rematch_count !== undefined) r.rematch_count = body.rematch_count;
++                                if (body.last_rematch_at !== undefined) r.last_rematch_at = body.last_rematch_at;
++                                if (body.rematched_by !== undefined) r.rematched_by = body.rematched_by;
++                                r._rematchMsg = body.note || ('Status: ' + body.after);
++                            })
++                            .catch(err => { r._rematching = false; r._rematchMsg = 'Gagal: ' + err.message; });
++                    }
++                };
++            }
++            </script>
+                         <h3 class="text-md font-semibold text-gray-800 mb-2" style="margin-top:22px">Catatan Arus Uang myBCA (hanya mencatat)</h3>
+             <p class="text-sm text-gray-600 mb-3">Endpoint pencatat: <b>https://warga.netter.my.id/paylist/catat.php</b>. Endpoint ini murni mencatat uang masuk/keluar dari notifikasi myBCA; tidak melunasi, tidak mengubah status atau data apa pun.</p>
+             <?php

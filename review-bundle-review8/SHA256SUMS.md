@@ -1,0 +1,86 @@
+# sha256 manifest — C2 review #8 bundle (generated 2026-11-24T03:26:06Z)
+# originals verified byte-identical to production 23 Nov 2026, re-verified 24 Nov 2026 (zero drift)
+# patched = review #8 state: C2 (review #7) + birth-fix 24 Nov 07:54 + stale-binding fix 24 Nov 10:16
+
+## v2New originals (production)
+2bea5462a886682390a4cf659a197a3b23f5919a0efe3f544b9991655553a552  v2new/notify.php
+d5d17144befc29b4e1399f273b75852f9b606407448a128d671ffd76516ac236  v2new/member-payment.php
+267af3928512c307c978203b177aeecb32cdf7996e43246446721648d0bba669  v2new/payment-index.php
+0d3c24e692bb9732d70a05347a76847e1abcbcd1867f4c942b47ff6101e2f8d3  v2new/csrf.php
+a35e11aeccb7c4594b1baef6c76da48ffa0db9714dcc82bef7e0a3281ec70448  v2new/qris_apply.php
+b9527f59ce476280652b82d8ebc7c018398bd43e99188bdc75ce40a7ca1fe551  bayar-hook/bayar.php.orig
+
+## v2New patched (review #8 state)
+acf59f78423d63a37b6b572ff112998cb8733657425b57c71e0e3ff29a0a23a6  patched/v2/notify.php
+fbc1fee093055ac3c9e4b0125898f219d5074fa16d231600305de3711b0e67c7  patched/v2/member-payment.php
+7a424e22259b56880f06b7e0bc1ed89de2eabb0e9eb5708b41e66fa5c6a9934a  patched/v2/payment-index.php
+99a99e487918f9e800d8f2969a8ce9ded71f8da6f0b57d975cb2a6390625d9bd  patched/v2/qris_apply.php
+4ff18fc64ba215ce86bafdeeac68eb0e4ba0340280e5aaa4761cefabb1f17f9a  bayar-hook/bayar.php
+
+## v2New new files
+b9e986efd411818092bf5e00556b2abb5da665ceb699c8643fdaf5d5f8bda584  new/v2/qris_match.php
+32aca8aa79ba7ddd3a002143f908889f58d51156a748fd2861bb7e9bdf5b4059  new/v2/qris_rematch.php
+0d3c24e692bb9732d70a05347a76847e1abcbcd1867f4c942b47ff6101e2f8d3  new/v2/csrf.php
+f8d1e3b2ea600bbfd38eb0c259dfd2a1e1a0f52a4a7cf5a654e9bf2fb3f14028  new/migrate-c2-v2.sql
+
+## warganet originals (production)
+a7403af61bf9f53f2b14b980d62795b407588df389a8f566306067ac16d7a1a0  warganet/notify.php
+c59250de8f608b8a2593c4a6475db02cb7cf471d10ca50d8a667868b0a214bd7  warganet/checkout.php
+8bafeaa02f5d685912f32bffd693fb5cbc3c314a74390c16d94f85177935c2d7  warganet/index.php
+dfebb8db583ada95762c023be0657805bb881c9e1ce5a703ae8acad727dd14dd  warganet/paylist_apply.php
+
+## warganet patched (review #8 state)
+b0f8d5534a4c17c6955eb3edb081868c0bb8f38171187b4a3f80db59167f7eeb  patched/wg/notify.php
+0895ce836bf9c6c65356b5b73c5ea81663ae5db3b869170d4186897ab0ba505d  patched/wg/checkout.php
+f434731c3ef69ef5c9478152639e71d68e201d65c51378e9646a12b3410a1645  patched/wg/index.php
+30ec1ff5ce14f3747f9a2a75ef4d48e498a51caba0b82aad9e17828a5a781a03  patched/wg/paylist_apply.php
+
+## warganet new files
+771fd5bd5c7a31e6a1ce9b6bd90af52f669d12db73252b2480cb2889cc2e35c3  new/wg/paylist_match.php
+aa42c6f9ddabef912ebb552a011ec3ca90c6caf22cc592a63ea486704e21f3ef  new/wg/paylist_rematch.php
+3c7f0a863d3621a03adb72e26145303dd002755287481ee5b9f5dc2f98a05c0a  new/wg/csrf.php
+ec8040795abb6cfec4446327b4c34a26ef806d477cc3ec3296297700583dedec  new/migrate-c2-wg.sql
+
+## deV2 deployed (verified live 24 Nov)
+member/payment.php (deV2, birth-fix 24 Nov 07:52): fbc1fee093055ac3c9e4b0125898f219d5074fa16d231600305de3711b0e67c7
+bayar.php (deV2, birth-fix 24 Nov 07:52): 4ff18fc64ba215ce86bafdeeac68eb0e4ba0340280e5aaa4761cefabb1f17f9a
+bayarQR/qris_apply.php (deV2, review8 stale-binding fix 24 Nov 10:14): 99a99e487918f9e800d8f2969a8ce9ded71f8da6f0b57d975cb2a6390625d9bd
+
+## bundle diffs (this directory)
+f057c52afd33d531075d1dd1bd79976be486e86dfb9c8a515c8f50df4d7f3215  dev2-member-payment.diff
+d4a8353a5dc53f24c5b181862b381373c28c8a2995cd49773e259f0d9f439038  v2-bayar.diff
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  v2-csrf.diff
+b4f8f60366fd5663fd8598d7cdb5340a2e5973f8682d43c35751247e8254bc9d  v2-member-payment.diff
+22f917470250446c5fce2faa6811a85dad54578e5f2f333f19098223f8b8bbbf  v2-notify.diff
+fc88a1311d6731392025077daad104b4bb27cf989b0991f9d115580b045ae2e5  v2-payment-index.diff
+a5fe515b12a27f6c87c36170508861cb95b280c537d350d7ff73462a00416bd7  v2-qris-apply.diff
+facea27957bcea56e6f57edb695095c3cda62201a685f2693bbe65e4c7170606  wg-checkout.diff
+b0269b2bb5aa7ec91b5735415b70b6b8e34d83f094ffba58ffeb2e12cea0e334  wg-notify.diff
+695e896c7b0237e36bdbc5fb27e3f044479d9be650b60dbaa6b74636f020841c  wg-paylist-apply.diff
+caf81a8c9fe3781cee8821c19176429fdf05892628ec89ba83a3b7deb3398b6f  wg-payment-index.diff
+3c7f0a863d3621a03adb72e26145303dd002755287481ee5b9f5dc2f98a05c0a  new-files/csrf.php
+771fd5bd5c7a31e6a1ce9b6bd90af52f669d12db73252b2480cb2889cc2e35c3  new-files/paylist_match.php
+aa42c6f9ddabef912ebb552a011ec3ca90c6caf22cc592a63ea486704e21f3ef  new-files/paylist_rematch.php
+b9e986efd411818092bf5e00556b2abb5da665ceb699c8643fdaf5d5f8bda584  new-files/qris_match.php
+32aca8aa79ba7ddd3a002143f908889f58d51156a748fd2861bb7e9bdf5b4059  new-files/qris_rematch.php
+ece2bb62848eb4356f6b78d61cf63a9550fa55d02fd6aa7bde07235ea29a82ee  incremental/v2-bayar.c2-to-birthfix.diff
+8569a4e874cfa57ea4689685d87fcc333a64ac82a59616043ace5a2ddff83eb6  incremental/v2-member-payment.c2-to-birthfix.diff
+dc91e9cdc011d99b44dd654e01ac30fa58af55431edba4c575763e6c9f927d36  incremental/v2-qris-apply.review7-to-review8.diff
+97a3efc200f68092ffd1df8e76e297855f462fb49569964d849b786a91ccd12c  incremental/wg-checkout.c2-to-birthfix.diff
+40c08b5312defa23e6698579a0faf979f053f32392e64074eeace0d282f393e7  incremental/wg-paylist-apply.review7-to-review8.diff
+
+## test logs & runners (this directory)
+d862ae0843f5cd3de8d9dec7886e426f60fe8a1412b05471fccf41b5adcc66c4  logs/run-20261124-101010.log
+3af8fbe56086b072bdd1c39fab5f81ed7423938f3c4666ad613cda4439717155  logs/run-birth-20261124-101222.log
+2b77d31077152dd7309a2b9f2bb4903ce8b4413e3bb7ea7f4a3ea8f3e5fd9f19  logs/run-review7-20261124-101927.log
+c6622841110b00c2df5f7e14f02a4dcde68adcd2adf5d4c1bbfdca7e92635a89  logs/run-review7-20261124-101938.log
+b3b62a6281cee20c42d040dda5d33df6eee4641e1d6ab13175d47131a059cea8  logs/run-review7-20261124-102117.log
+88bf0607cf3a46a75a846f2201df1f844a9aca1a93f51d7ea585e73e141f8f50  logs/run-review8-20261124-100935.log
+94f75836208fa57791ef7bdc548e3ba59376f718b5c77a6ee8294230f8891631  runners/run-birth.sh
+e9ff9e613befd3ba24920c88f7d0beb4859a9e39c8aede2e834c59d9ec684499  runners/run-contract.sh
+b38eb06da945d06424101fa023fe51253296aaedb11a2fd6d9001c2a589805f2  runners/run-review7.sh
+2cf23c5487b1bc5265f72650c5f5a9d7fee5305f4a480ec81e7f534c6aff1b56  runners/run-review8.sh
+c9a2d585f8a4443a8f7d17dce0c2739735e5e7427445baf841641adb347f288f  runners/schema-v2.sql
+a2d1828c081a1ef972fb11d6aa20ddfa3a38e13dbc5c6b8a5ee26790c6eb7c37  runners/schema-wg.sql
+a49342147a94c0653dfb775e9e9ca8ebdb312123c73bc1380749dc48d0b4249b  runners/setup-scratch.sh
+c8f9d2f3d42800e0049f2c85cbf2f80f6cad68a587be3045323a49c7f6dc3052  runners/stale-orchestrator.php

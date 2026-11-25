@@ -1,0 +1,72 @@
+--- a/member/payment.php
++++ b/member/payment.php
+@@ -353,20 +353,41 @@
+     $qrisFee = (int)ceil($qrisBase * 0.007);
+ 
+     $kodeUnik = (int)($proformaData['kode_unik'] ?? 0);
++    // Hook kode-birth C2 (§4c): benar hanya bila kode diklaim request ini.
++    $kodeBaruLahir = false;
+     if ($kodeUnik <= 0) {
+         for ($percobaan = 0; $percobaan < 5 && $kodeUnik <= 0; $percobaan++) {
++            // Birth-fix (24 Nov 2026): himpunan kode terpakai dihitung dari
++            // SEMUA proforma UNPAID yang sudah berkode — sebelumnya hanya
++            // proforma TERBARU tiap pelanggan (JOIN MAX(id)), sehingga
++            // tunggakan lama tidak terlihat dan tagihan baru bisa lahir
++            // dengan kode yang sama (nominal sama persis -> ambigu). Pola
++            // ini disamakan dengan warganet (checkout.php) dan dengan
++            // cakupan kandidat matcher C6 (qris_find_candidates).
++            // Satu query yang sama juga membangun himpunan nominal akhir
++            // yang terpakai: kandidat ditolak bila jumlah akhirnya
++            // (total + fee + kode, rumus yang sama dengan
++            // qris_expected_nominal()) sama dengan nominal tagihan UNPAID
++            // lain — total berbeda + kode berbeda bisa berjumlah sama.
+             $terpakai = [];
+-            $qUsed = $conn->query("SELECT p.kode_unik FROM proforma p JOIN (SELECT id_pelanggan, MAX(id) AS mid FROM proforma GROUP BY id_pelanggan) terakhir ON terakhir.mid = p.id WHERE p.status = 'UNPAID' AND p.kode_unik IS NOT NULL");
++            $nominalTerpakai = [];
++            $qUsed = $conn->query("SELECT tagihan, addon, biaya_instalasi, pajak, diskon, total_tagihan, kode_unik FROM proforma WHERE status = 'UNPAID' AND kode_unik IS NOT NULL");
+             if ($qUsed) {
+                 while ($rUsed = $qUsed->fetch_assoc()) {
+                     $terpakai[(int)$rUsed['kode_unik']] = true;
++                    $dasarNom = (float)($rUsed['total_tagihan'] ?? 0);
++                    if ($dasarNom <= 0) {
++                        $dasarNom = (float)$rUsed['tagihan'] + (float)$rUsed['addon'] + (float)$rUsed['biaya_instalasi'] + (float)$rUsed['pajak'] - (float)$rUsed['diskon'];
++                    }
++                    $dasarNomInt = (int)ceil($dasarNom);
++                    $nominalTerpakai[$dasarNomInt + (int)ceil($dasarNomInt * 0.007) + (int)$rUsed['kode_unik']] = true;
+                 }
+             }
+             $calon = 0;
+             // Rentang 3 digit (100-999); kode lama < 100 yang sudah
+             // tersimpan TIDAK diubah di sini.
+             for ($k = 100; $k <= 999; $k++) {
+-                if (!isset($terpakai[$k])) {
++                if (!isset($terpakai[$k]) && !isset($nominalTerpakai[$qrisBase + $qrisFee + $k])) {
+                     $calon = $k;
+                     break;
+                 }
+@@ -379,6 +400,7 @@
+             $updKode->execute();
+             if ($updKode->affected_rows > 0) {
+                 $kodeUnik = $calon;
++                $kodeBaruLahir = true;
+             } else {
+                 $cekKode = $conn->prepare("SELECT kode_unik FROM proforma WHERE id = ?");
+                 $cekKode->bind_param('i', $proformaData['id']);
+@@ -392,6 +414,17 @@
+             $updKode->close();
+         }
+     }
++    // Hook kode-birth C2 (§4c): kode baru saja lahir — bila ada pembayaran
++    // yang datang lebih dulu dan nominalnya kini cocok, lunasi lewat
++    // re-match. Best-effort: kegagalan hook TIDAK BOLEH merusak render QR.
++    if ($kodeBaruLahir && $kodeUnik > 0) {
++        try {
++            require_once __DIR__ . '/../bayarQR/qris_match.php';
++            qris_kode_birth_rematch($conn, (int)$proformaData['id'], $kodeUnik);
++        } catch (Throwable $e) {
++            error_log('C2 kode-birth hook gagal (proforma ' . $proformaData['id'] . '): ' . $e->getMessage());
++        }
++    }
+     $qrisNominal = $qrisBase + $qrisFee + $kodeUnik;
+     $qrDyn = false;
+     $qrRow = $conn->query("SELECT payload FROM qris_statis WHERE merchant_name LIKE 'Intermedia%' LIMIT 1");

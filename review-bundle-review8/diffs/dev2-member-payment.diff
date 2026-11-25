@@ -1,0 +1,273 @@
+--- a/member/payment.php (deV2)
++++ b/member/payment.php (deV2)
+@@ -337,23 +337,13 @@
+ }
+ 
+ // QRIS dinamis (logika persis bayar.php): diturunkan dari payload QRIS
+-// statis yang tersimpan di qris_statis. Nominal = total + fee 0,7% +
+-// kode unik per proforma.
+-// QRIS SILANG (demo 23 Nov 2026): dua QR dinamis dari nominal yang
+-// SAMA (satu kode unik, satu proforma). Pembayar GoPay diarahkan ke
+-// QRIS ShopeePay (payload "Netter", id 1); pembayar ShopeePay ke QRIS
+-// GoPay (payload "Intermedia", id 4). Alasannya: pembayaran lewat
+-// aplikasi GoPay tercatat "Tagihan QRIS" tanpa notifikasi merchant,
+-// sehingga listener buta; pembayaran via QRIS merchant lain tercatat
+-// "QRIS" dan notifikasinya ada. Pilihan e-wallet hanya mengganti
+-// gambar QR yang tampil — nominal dan kode uniknya sama.
++// statis GoPay merchant "Intermedia Network Soluti" yang tersimpan di
++// qris_statis. Nominal = total + fee 0,7% + kode unik per proforma.
+ // Kode unik ditugaskan malas (lazy) di sini lalu tersimpan permanen di
+ // proforma.kode_unik — satu-satunya tempat QR terbayar lahir.
+ $isUnpaid = ($status_pembayaran === 'UNPAID');
+ $qrisShow = $isUnpaid && !$show_waiting;
+ $qrisPngUri = '';
+-$qrisPngUriGopay = '';   // QRIS GoPay/Intermedia (id 4) — untuk pembayar ShopeePay
+-$qrisPngUriShopee = '';  // QRIS ShopeePay/Netter (id 1) — untuk pembayar GoPay
+ $qrisNominal = 0;
+ $qrisFee = 0;
+ $kodeUnik = 0;
+@@ -363,20 +353,41 @@
+     $qrisFee = (int)ceil($qrisBase * 0.007);
+ 
+     $kodeUnik = (int)($proformaData['kode_unik'] ?? 0);
++    // Hook kode-birth C2 (§4c): benar hanya bila kode diklaim request ini.
++    $kodeBaruLahir = false;
+     if ($kodeUnik <= 0) {
+         for ($percobaan = 0; $percobaan < 5 && $kodeUnik <= 0; $percobaan++) {
++            // Birth-fix (24 Nov 2026): himpunan kode terpakai dihitung dari
++            // SEMUA proforma UNPAID yang sudah berkode — sebelumnya hanya
++            // proforma TERBARU tiap pelanggan (JOIN MAX(id)), sehingga
++            // tunggakan lama tidak terlihat dan tagihan baru bisa lahir
++            // dengan kode yang sama (nominal sama persis -> ambigu). Pola
++            // ini disamakan dengan warganet (checkout.php) dan dengan
++            // cakupan kandidat matcher C6 (qris_find_candidates).
++            // Satu query yang sama juga membangun himpunan nominal akhir
++            // yang terpakai: kandidat ditolak bila jumlah akhirnya
++            // (total + fee + kode, rumus yang sama dengan
++            // qris_expected_nominal()) sama dengan nominal tagihan UNPAID
++            // lain — total berbeda + kode berbeda bisa berjumlah sama.
+             $terpakai = [];
+-            $qUsed = $conn->query("SELECT p.kode_unik FROM proforma p JOIN (SELECT id_pelanggan, MAX(id) AS mid FROM proforma GROUP BY id_pelanggan) terakhir ON terakhir.mid = p.id WHERE p.status = 'UNPAID' AND p.kode_unik IS NOT NULL");
++            $nominalTerpakai = [];
++            $qUsed = $conn->query("SELECT tagihan, addon, biaya_instalasi, pajak, diskon, total_tagihan, kode_unik FROM proforma WHERE status = 'UNPAID' AND kode_unik IS NOT NULL");
+             if ($qUsed) {
+                 while ($rUsed = $qUsed->fetch_assoc()) {
+                     $terpakai[(int)$rUsed['kode_unik']] = true;
++                    $dasarNom = (float)($rUsed['total_tagihan'] ?? 0);
++                    if ($dasarNom <= 0) {
++                        $dasarNom = (float)$rUsed['tagihan'] + (float)$rUsed['addon'] + (float)$rUsed['biaya_instalasi'] + (float)$rUsed['pajak'] - (float)$rUsed['diskon'];
++                    }
++                    $dasarNomInt = (int)ceil($dasarNom);
++                    $nominalTerpakai[$dasarNomInt + (int)ceil($dasarNomInt * 0.007) + (int)$rUsed['kode_unik']] = true;
+                 }
+             }
+             $calon = 0;
+             // Rentang 3 digit (100-999); kode lama < 100 yang sudah
+             // tersimpan TIDAK diubah di sini.
+             for ($k = 100; $k <= 999; $k++) {
+-                if (!isset($terpakai[$k])) {
++                if (!isset($terpakai[$k]) && !isset($nominalTerpakai[$qrisBase + $qrisFee + $k])) {
+                     $calon = $k;
+                     break;
+                 }
+@@ -389,6 +400,7 @@
+             $updKode->execute();
+             if ($updKode->affected_rows > 0) {
+                 $kodeUnik = $calon;
++                $kodeBaruLahir = true;
+             } else {
+                 $cekKode = $conn->prepare("SELECT kode_unik FROM proforma WHERE id = ?");
+                 $cekKode->bind_param('i', $proformaData['id']);
+@@ -402,42 +414,36 @@
+             $updKode->close();
+         }
+     }
+-    $qrisNominal = $qrisBase + $qrisFee + $kodeUnik;
+-    // Bangun kedua QR dinamis (GoPay id 4 + ShopeePay id 1) dari nominal
+-    // yang sama. Tiap payload diproses independen: bila satu gagal, opsi
+-    // pasangannya tetap tampil dan tombolnya yang dinonaktifkan.
+-    $qrPayloads = [];
+-    $qrRow = $conn->query("SELECT id, payload FROM qris_statis WHERE id IN (1, 4)");
+-    if ($qrRow) {
+-        while ($rQr = $qrRow->fetch_assoc()) {
+-            $qrPayloads[(int)$rQr['id']] = $rQr['payload'];
++    // Hook kode-birth C2 (§4c): kode baru saja lahir — bila ada pembayaran
++    // yang datang lebih dulu dan nominalnya kini cocok, lunasi lewat
++    // re-match. Best-effort: kegagalan hook TIDAK BOLEH merusak render QR.
++    if ($kodeBaruLahir && $kodeUnik > 0) {
++        try {
++            require_once __DIR__ . '/../bayarQR/qris_match.php';
++            qris_kode_birth_rematch($conn, (int)$proformaData['id'], $kodeUnik);
++        } catch (Throwable $e) {
++            error_log('C2 kode-birth hook gagal (proforma ' . $proformaData['id'] . '): ' . $e->getMessage());
+         }
+     }
+-    foreach (['gopay' => 4, 'shopee' => 1] as $kunciQr => $idPayload) {
+-        $qrDyn = isset($qrPayloads[$idPayload])
+-            ? qris_static_to_dynamic($qrPayloads[$idPayload], $qrisNominal)
+-            : false;
+-        if ($qrDyn === false) {
+-            continue;
+-        }
++    $qrisNominal = $qrisBase + $qrisFee + $kodeUnik;
++    $qrDyn = false;
++    $qrRow = $conn->query("SELECT payload FROM qris_statis WHERE merchant_name LIKE 'Intermedia%' LIMIT 1");
++    if ($qrRow && $qrRow->num_rows > 0) {
++        $qrDyn = qris_static_to_dynamic($qrRow->fetch_assoc()['payload'], $qrisNominal);
++    }
++    if ($qrDyn === false) {
++        $qrisError = 'Payload QRIS Intermedia tidak ditemukan atau tidak valid.';
++    } else {
+         $qrTmp = tempnam(sys_get_temp_dir(), 'qris');
+         \QRcode::png($qrDyn, $qrTmp, \QR_ECLEVEL_L, 6, 2);
+         $qrPng = file_get_contents($qrTmp);
+         unlink($qrTmp);
+-        if ($qrPng !== false) {
+-            $uriQr = 'data:image/png;base64,' . base64_encode($qrPng);
+-            if ($kunciQr === 'gopay') {
+-                $qrisPngUriGopay = $uriQr;
+-            } else {
+-                $qrisPngUriShopee = $uriQr;
+-            }
++        if ($qrPng === false) {
++            $qrisError = 'Gagal membuat gambar QR.';
++        } else {
++            $qrisPngUri = 'data:image/png;base64,' . base64_encode($qrPng);
+         }
+     }
+-    // Default bila JS tidak jalan: QRIS GoPay (perilaku lama).
+-    $qrisPngUri = $qrisPngUriGopay;
+-    if ($qrisPngUriGopay === '' && $qrisPngUriShopee === '') {
+-        $qrisError = 'Payload QRIS tidak ditemukan atau tidak valid.';
+-    }
+ }
+ 
+ // Badge notifikasi + nomor WA bantuan (untuk template, sama seperti
+@@ -662,7 +668,7 @@
+                     <span class="w-10 h-10 shrink-0 flex items-center justify-center rounded-lg bg-gray-100 text-gray-500"><i class="fas fa-qrcode text-lg"></i></span>
+                     <span class="flex-1">
+                         <span class="block font-bold leading-tight">QRIS</span>
+-                        <span class="block text-xs text-gray-500">GoPay / ShopeePay — pilih e-walletmu</span>
++                        <span class="block text-xs text-gray-500">Semua e-wallet &amp; m-banking</span>
+                     </span>
+                     <span class="text-sm font-semibold text-gray-600">+ 0,7% (<?php echo formatRupiah($qrisFee); ?>)</span>
+                 </button>
+@@ -685,39 +691,8 @@
+             <?php if ($qrisError): ?>
+             <p class="text-sm text-red-700 bg-red-50 border border-red-100 rounded-lg px-3 py-2 mt-4"><?php echo h($qrisError); ?></p>
+             <?php else: ?>
+-            <!-- Langkah 1 (QRIS silang): pilih e-wallet yang dipakai membayar.
+-                 Pembayar GoPay mendapat QRIS ShopeePay, pembayar ShopeePay
+-                 mendapat QRIS GoPay. -->
+-            <div id="qris-pilih" class="mt-4 text-left">
+-                <p class="text-sm font-semibold text-gray-700">Bayar pakai e-wallet apa?</p>
+-                <p class="text-xs text-gray-500 mt-1">QR yang tampil disesuaikan dengan e-walletmu, supaya pembayaranmu tercatat dan terkonfirmasi.</p>
+-                <div class="mt-3 space-y-3">
+-                    <button id="qris-pilih-gopay" class="w-full flex items-center gap-3 bg-white hover:bg-gray-50 text-gray-800 border border-gray-300 rounded-lg px-4 py-3 text-left <?php echo $qrisPngUriShopee === '' ? 'opacity-50 cursor-not-allowed' : ''; ?>" <?php echo $qrisPngUriShopee === '' ? 'disabled' : ''; ?>>
+-                        <span class="w-10 h-10 shrink-0 flex items-center justify-center rounded-lg bg-teal-50 text-teal-600 font-extrabold text-sm">G</span>
+-                        <span class="flex-1">
+-                            <span class="block font-bold leading-tight">Bayar dari GoPay</span>
+-                            <span class="block text-xs text-gray-500"><?php echo $qrisPngUriShopee === '' ? 'QRIS ShopeePay tidak tersedia' : 'Scan QRIS ShopeePay'; ?></span>
+-                        </span>
+-                    </button>
+-                    <button id="qris-pilih-shopee" class="w-full flex items-center gap-3 bg-white hover:bg-gray-50 text-gray-800 border border-gray-300 rounded-lg px-4 py-3 text-left <?php echo $qrisPngUriGopay === '' ? 'opacity-50 cursor-not-allowed' : ''; ?>" <?php echo $qrisPngUriGopay === '' ? 'disabled' : ''; ?>>
+-                        <span class="w-10 h-10 shrink-0 flex items-center justify-center rounded-lg bg-orange-50 text-orange-600 font-extrabold text-sm">S</span>
+-                        <span class="flex-1">
+-                            <span class="block font-bold leading-tight">Bayar dari ShopeePay</span>
+-                            <span class="block text-xs text-gray-500"><?php echo $qrisPngUriGopay === '' ? 'QRIS GoPay tidak tersedia' : 'Scan QRIS GoPay'; ?></span>
+-                        </span>
+-                    </button>
+-                </div>
+-            </div>
+-            <!-- Langkah 2: QR sesuai pilihan. -->
+-            <div id="qris-tampil" class="hidden">
+-                <p id="qris-label" class="text-sm font-semibold text-gray-700 mt-4"></p>
+-                <div id="qris-qr-wrap" class="mt-3 inline-block bg-white border border-gray-200 rounded-2xl p-3 shadow-sm">
+-                    <img id="qris-img" src="<?php echo $qrisPngUri; ?>" alt="QRIS dinamis" class="block" style="width:240px;height:240px;">
+-                </div>
+-                <p id="qris-catatan-shopee" class="hidden text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 mt-3 text-left">Catatan demo: pembayaran via QRIS ShopeePay belum terkonfirmasi otomatis — status di halaman ini belum berubah sendiri setelah bayar.</p>
+-                <div class="mt-3">
+-                    <button id="qris-ganti" class="text-sm font-semibold text-blue-600 hover:text-blue-800"><i class="fas fa-exchange-alt"></i> Ganti e-wallet</button>
+-                </div>
++            <div id="qris-qr-wrap" class="mt-4 inline-block bg-white border border-gray-200 rounded-2xl p-3 shadow-sm">
++                <img id="qris-img" src="<?php echo $qrisPngUri; ?>" alt="QRIS dinamis" class="block" style="width:240px;height:240px;">
+             </div>
+             <?php endif; ?>
+             <div id="qris-rincian" class="mt-5 bg-gray-50 rounded-xl px-4 py-2.5">
+@@ -794,7 +769,6 @@
+             if (id === 'qris-modal') {
+                 berhentiCekStatusQris();
+                 if (qrisCountdownTimer) { clearInterval(qrisCountdownTimer); qrisCountdownTimer = null; }
+-                tampilPilihQris();
+             }
+         }
+ 
+@@ -810,7 +784,6 @@
+             metodeQrisBtn.onclick = function () {
+                 tutupModal('metode-modal');
+                 bukaModal('qris-modal');
+-                tampilPilihQris();
+                 mulaiCekStatusQris();
+             };
+         }
+@@ -830,51 +803,6 @@
+         var qrisKembaliBtn = document.getElementById('qris-modal-kembali');
+         if (qrisKembaliBtn) qrisKembaliBtn.onclick = function () { tutupModal('qris-modal'); bukaModal('metode-modal'); };
+ 
+-        // QRIS silang (demo 23 Nov 2026): gambar QR diganti sesuai
+-        // e-wallet yang dipilih. Pembayar GoPay -> QRIS ShopeePay,
+-        // pembayar ShopeePay -> QRIS GoPay. Nominal dan kode unik sama.
+-        var QRIS_QR = {
+-            gopay: <?php echo json_encode($qrisPngUriGopay); ?>,
+-            shopee: <?php echo json_encode($qrisPngUriShopee); ?>
+-        };
+-        var QRIS_SILANG = {
+-            gopay: { qris: 'shopee', label: 'Scan QRIS ShopeePay ini dengan aplikasi GoPay', catatanShopee: true },
+-            shopee: { qris: 'gopay', label: 'Scan QRIS GoPay ini dengan aplikasi ShopeePay', catatanShopee: false }
+-        };
+-
+-        function tampilPilihQris() {
+-            var pilih = document.getElementById('qris-pilih');
+-            var tampil = document.getElementById('qris-tampil');
+-            if (pilih) pilih.classList.remove('hidden');
+-            if (tampil) tampil.classList.add('hidden');
+-        }
+-
+-        function pilihQris(ewallet) {
+-            var cfg = QRIS_SILANG[ewallet];
+-            if (!cfg) return;
+-            var uri = QRIS_QR[cfg.qris];
+-            if (!uri) return;
+-            var img = document.getElementById('qris-img');
+-            if (img) img.src = uri;
+-            var unduh = document.getElementById('qris-download');
+-            if (unduh) unduh.href = uri;
+-            var label = document.getElementById('qris-label');
+-            if (label) label.textContent = cfg.label;
+-            var catatan = document.getElementById('qris-catatan-shopee');
+-            if (catatan) catatan.classList.toggle('hidden', !cfg.catatanShopee);
+-            var pilih = document.getElementById('qris-pilih');
+-            var tampil = document.getElementById('qris-tampil');
+-            if (pilih) pilih.classList.add('hidden');
+-            if (tampil) tampil.classList.remove('hidden');
+-        }
+-
+-        var pilihGopayBtn = document.getElementById('qris-pilih-gopay');
+-        if (pilihGopayBtn) pilihGopayBtn.onclick = function () { pilihQris('gopay'); };
+-        var pilihShopeeBtn = document.getElementById('qris-pilih-shopee');
+-        if (pilihShopeeBtn) pilihShopeeBtn.onclick = function () { pilihQris('shopee'); };
+-        var qrisGantiBtn = document.getElementById('qris-ganti');
+-        if (qrisGantiBtn) qrisGantiBtn.onclick = function () { tampilPilihQris(); };
+-
+         var metodeModal = document.getElementById('metode-modal');
+         if (metodeModal) {
+             metodeModal.onclick = function (e) {
+@@ -948,7 +876,7 @@
+         }
+ 
+         function tampilSuksesQris() {
+-            ['qris-pilih', 'qris-tampil', 'qris-qr-wrap', 'qris-download', 'qris-rincian', 'qris-note', 'qris-actions'].forEach(function (id) {
++            ['qris-qr-wrap', 'qris-download', 'qris-rincian', 'qris-note', 'qris-actions'].forEach(function (id) {
+                 var el = document.getElementById(id);
+                 if (el) el.classList.add('hidden');
+             });

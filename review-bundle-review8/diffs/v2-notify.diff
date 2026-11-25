@@ -1,0 +1,81 @@
+--- a/bayarQR/notify.php
++++ b/bayarQR/notify.php
+@@ -144,42 +144,16 @@
+ // Hanya menandai baris log ini (match_status + proforma/pelanggan yang cocok).
+ // TIDAK mengubah status proforma, pelanggan, atau pemasukan apa pun; penanda
+ // lunas adalah tahap 2 dengan persetujuan terpisah.
++// Matcher bersama (bayarQR/qris_match.php, perbaikan C2): kandidat dan rumus
++// nominal sama persis dengan sebelumnya — ekstraksi ini tidak mengubah
++// perilaku insert baru. Re-match baris lama ditangani qris_rematch.php
++// (operator) dan hook kode-birth, bukan di sini.
+ $match = null;
+ if ($inserted && $type === 'payment' && $amount !== null && $amount > 0) {
+-    // Kandidat: proforma TERBARU tiap pelanggan yang UNPAID dan sudah punya
+-    // kode unik (kode hanya lahir saat halaman QRIS dirender, jadi nominalnya
+-    // memang bisa terbentuk). Rumus nominal meniru bayarQris.php persis:
+-    // dasar = total_tagihan tersimpan (atau hitung ulang komponen bila kosong),
+-    // fee = ceil(dasar * 0,7%), nominal = dasar + fee + kode_unik.
+-    $candSql = "SELECT p.id, p.id_pelanggan, p.tagihan, p.addon, p.biaya_instalasi,
+-                       p.pajak, p.diskon, p.total_tagihan, p.kode_unik
+-                FROM proforma p
+-                JOIN (SELECT MAX(id) AS maxid FROM proforma GROUP BY id_pelanggan) m
+-                  ON p.id = m.maxid
+-                WHERE p.status = 'UNPAID' AND p.kode_unik IS NOT NULL";
+-    $hits = [];
+-    if ($res = $db->query($candSql)) {
+-        while ($row = $res->fetch_assoc()) {
+-            $base = (float)($row['total_tagihan'] ?? 0);
+-            if ($base <= 0) {
+-                $base = (float)$row['tagihan'] + (float)$row['addon'] + (float)$row['biaya_instalasi'] + (float)$row['pajak'] - (float)$row['diskon'];
+-            }
+-            $baseInt = (int)ceil($base);
+-            $expected = $baseInt + (int)ceil($baseInt * 0.007) + (int)$row['kode_unik'];
+-            if ($expected === $amount) {
+-                $hits[] = $row;
+-            }
+-        }
+-        $res->free();
+-    }
+-    if (count($hits) === 1) {
+-        $upd = $db->prepare("UPDATE qris_notif_log SET match_status = 'matched', matched_id_pelanggan = ?, matched_id_proforma = ? WHERE dedupe_key = ?");
+-        $mid = (int)$hits[0]['id_pelanggan'];
+-        $mpf = (int)$hits[0]['id'];
+-        $upd->bind_param('iis', $mid, $mpf, $dedupeKey);
+-        $upd->execute();
+-        $upd->close();
+-        $match = ['status' => 'matched', 'id_pelanggan' => $mid, 'proforma' => $mpf];
++    require_once __DIR__ . '/qris_match.php';
++    $mres = qris_match_notification($db, $logId);
++    if ($mres['status'] === 'matched') {
++        $match = ['status' => 'matched', 'id_pelanggan' => $mres['id_pelanggan'], 'proforma' => $mres['proforma']];
+         // Tahap 2: penanda lunas (ada gerbang uji di dalam qris_apply.php).
+         // Kegagalan di sini TIDAK boleh menggagalkan pencatatan notifikasi.
+         if ($logId > 0) {
+@@ -187,16 +161,21 @@
+                 require_once __DIR__ . '/qris_apply.php';
+                 $applyRes = qris_apply_payment($db, $logId);
+                 $match['apply'] = $applyRes['applied'] ? 'ok' : 'skip';
++                if (empty($applyRes['applied'])) {
++                    // C3 bentuk A: bila kalah klaim (proforma sudah PAID),
++                    // tandai kekalahan di baris log ini (best-effort).
++                    try { qris_maybe_mark_loser($db, $logId); } catch (Throwable $e) { /* abaikan */ }
++                }
+             } catch (Throwable $e) {
+                 $match['apply'] = 'error';
++                // C3 bentuk A: klaim atomik yang kalah MELEMPAR (bukan
++                // mengembalikan applied=false) — tandai kekalahan di jalur
++                // ini juga; helper diam bila proforma belum PAID.
++                try { qris_maybe_mark_loser($db, $logId); } catch (Throwable $e2) { /* abaikan */ }
+             }
+         }
+-    } elseif (count($hits) > 1) {
+-        $upd = $db->prepare("UPDATE qris_notif_log SET match_status = 'ambiguous' WHERE dedupe_key = ?");
+-        $upd->bind_param('s', $dedupeKey);
+-        $upd->execute();
+-        $upd->close();
+-        $match = ['status' => 'ambiguous', 'candidates' => count($hits)];
++    } elseif ($mres['status'] === 'ambiguous') {
++        $match = ['status' => 'ambiguous', 'candidates' => $mres['candidates']];
+     } else {
+         $match = ['status' => 'logged'];
+     }

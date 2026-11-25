@@ -1,0 +1,76 @@
+No syntax errors detected in /home/warganet/paylist-contract-c2/html-v2/bayar.php
+[birth 10:12:22] v2 bayar.php (fixed) deployed, sha 4ff18fc64ba215ce86bafdeeac68eb0e4ba0340280e5aaa4761cefabb1f17f9a
+No syntax errors detected in /home/warganet/paylist-contract-c2/html-wg/payment/checkout.php
+[birth 10:12:25] wg checkout.php (fixed) deployed, sha 0895ce836bf9c6c65356b5b73c5ea81663ae5db3b869170d4186897ab0ba505d
+[birth 10:12:27] birth run 20261124-101222 (target=all, pages=fixed)
+[birth 10:12:27] F-birth-stale [v2] stale UNPAID bill (code 105) + fresh bill, same customer
+      bayar.php HTTP 200
+  PASS: F-birth-stale [v2] page renders 200 (expected=200, actual=200)
+  PASS: F-birth-stale [v2] page loaded the FRESH bill (matches /INV-TEST-910002/)
+  PASS: F-birth-stale [v2] fresh bill born code (not the stale 105) (expected=106, actual=106)
+  PASS: F-birth-stale [v2] stale bill code untouched (expected=105, actual=105)
+  PASS: F-birth-stale [v2] fresh nominal != stale nominal (expected=100806, actual=100806)
+      -- v2 evidence: proforma
+      id	id_pelanggan	status	kode_unik
+      910001	900001	UNPAID	105
+      910002	900001	UNPAID	106
+      910011	900011	UNPAID	100
+      910012	900012	UNPAID	101
+      910013	900013	UNPAID	102
+      910014	900014	UNPAID	103
+      910015	900015	UNPAID	104
+  ==> F-birth-stale [v2]: PASS (birth skips the stale bill's code)
+[birth 10:12:29] F-birth-sum [v2] twin nominal at the lowest free code must be skipped
+  PASS: F-birth-sum [v2] twin nominal sanity (expected=100800, actual=100800)
+  PASS: F-birth-sum [v2] collision sanity (fresh @100) (expected=100800, actual=100800)
+      bayar.php HTTP 200
+  PASS: F-birth-sum [v2] page renders 200 (expected=200, actual=200)
+  PASS: F-birth-sum [v2] page loaded the FRESH bill (matches /INV-TEST-910002/)
+  PASS: F-birth-sum [v2] fresh bill born code (100 skipped: amount collides) (expected=101, actual=101)
+  PASS: F-birth-sum [v2] fresh nominal != twin nominal (expected=100801, actual=100801)
+      -- v2 evidence: proforma
+      id	id_pelanggan	status	kode_unik
+      910001	900001	UNPAID	200
+      910002	900001	UNPAID	101
+  ==> F-birth-sum [v2]: PASS (birth skips the amount-colliding code)
+[birth 10:12:30] F-birth-stale [wg] stale UNPAID bill (code 105) + fresh bill, same customer
+      checkout.php HTTP 200
+  PASS: F-birth-stale [wg] page renders 200 (expected=200, actual=200)
+  PASS: F-birth-stale [wg] fresh bill born code (not the stale 105) (expected=106, actual=106)
+  PASS: F-birth-stale [wg] stale bill code untouched (expected=105, actual=105)
+      -- wg evidence: payment
+      id	id_pelanggan	status	kode_unik
+      920001	900001	UNPAID	105
+      920002	900001	UNPAID	106
+      920011	900011	UNPAID	100
+      920012	900012	UNPAID	101
+      920013	900013	UNPAID	102
+      920014	900014	UNPAID	103
+      920015	900015	UNPAID	104
+  ==> F-birth-stale [wg]: PASS (birth skips the stale bill's code)
+[birth 10:12:31] F-birth-sum [wg] twin nominal at the lowest free code must be skipped
+  PASS: F-birth-sum [wg] twin nominal sanity (expected=100800, actual=100800)
+  PASS: F-birth-sum [wg] collision sanity (fresh @100) (expected=100800, actual=100800)
+      checkout.php HTTP 200
+  PASS: F-birth-sum [wg] page renders 200 (expected=200, actual=200)
+  PASS: F-birth-sum [wg] fresh bill born code (100 skipped: amount collides) (expected=101, actual=101)
+      -- wg evidence: payment
+      id	id_pelanggan	status	kode_unik
+      920001	900001	UNPAID	200
+      920002	900001	UNPAID	101
+  ==> F-birth-sum [wg]: PASS (birth skips the amount-colliding code)
+[birth 10:12:32] Birth-block equivalence [v2] member/payment.php vs bayar.php (fixed)
+  PASS: Birth-block equivalence [v2] member/payment.php == bayar.php (decision logic identical)
+  ==> Birth-block equivalence [v2]: PASS (same decision logic; bayar.php test covers member/payment.php)
+
+==================== SUMMARY ====================
+  F-birth-stale [v2]: PASS (birth skips the stale bill's code)
+  F-birth-sum [v2]: PASS (birth skips the amount-colliding code)
+  F-birth-stale [wg]: PASS (birth skips the stale bill's code)
+  F-birth-sum [wg]: PASS (birth skips the amount-colliding code)
+  Birth-block equivalence [v2]: PASS (same decision logic; bayar.php test covers member/payment.php)
+-------------------------------------------------
+assertions: PASS=19 FAIL=0
+full log: /home/warganet/paylist-contract-c2/results/run-birth-20261124-101222.log
+page responses: /home/warganet/paylist-contract-c2/results/run-birth-20261124-101222/
+RESULT: ALL SCENARIOS BEHAVED AS SPECIFIED

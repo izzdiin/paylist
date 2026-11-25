@@ -1,0 +1,65 @@
+[review7 10:19:27] review7 run 20261124-101927 (target=all, rounds=2)
+[review7 10:19:27] amounts: AMT_A=100823 (100000+fee+123), AMT_TWIN=100823 (99900+fee+223)
+[review7 10:19:27] H10-hook-ambiguous [v2] hook must not settle while 2 candidates live
+  PASS: H10 [v2] early POST logged (expected=logged, actual=logged)
+  PASS: H10 [v2] row still logged after missed hook (expected=logged, actual=logged)
+      hook response (ambiguous expected): {"ok":true,"hook":{"proforma":910002,"kode_unik":223,"expected":100823,"checked":1,"applied":0}}
+  PASS: H10 [v2] hook probe ok (expected=True, actual=True)
+  PASS: H10 [v2] hook checked 1 waiting row (expected=1, actual=1)
+  PASS: H10 [v2] hook applied 0 (ambiguous) (expected=0, actual=0)
+  PASS: H10 [v2] row ambiguous after hook (expected=ambiguous, actual=ambiguous)
+  PASS: H10 [v2] bills PAID (none settles) (expected=0, actual=0)
+  PASS: H10 [v2] pemasukan rows (expected=0, actual=0)
+  PASS: H10 [v2] row unapplied (expected=0, actual=0)
+  PASS: H10 [v2] ambiguous note names candidates (C1) (matches /ambiguous: 2 kandidat/: ambiguous: 2 kandidat — perlu keputusan operator)
+  PASS: H10 [v2] hook stamped rematch (kode-birth) (expected=kode-birth, actual=kode-birth)
+  PASS: H10 [v2] rematch_count=1 (hook attempt stamped) (expected=1, actual=1)
+  PASS: H10 [v2] 2nd hook call checks 0 rows (ambiguous ignored) (expected=0, actual=0)
+  PASS: H10 [v2] still 0 effects after 2nd hook (expected=0, actual=0)
+  PASS: H10 [v2] row visible to Belum-cocok filter (ambiguous + amount) (expected=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      526	h10-v2-1	ambiguous	NULL	NULL	0	1	kode-birth	ambiguous: 2 kandidat — perlu keputusan operator
+      -- v2 evidence: proforma + pemasukan
+      id	id_pelanggan	status
+      910001	900001	UNPAID
+      910002	900001	UNPAID
+      pemasukan_rows
+      0
+  ==> H10-hook-ambiguous [v2]: PASS (hook sees 2 candidates -> ambiguous, 0 effects; ambiguous rows ignored by later hooks)
+[review7 10:19:29] H10-hook-ambiguous [wg] hook must not settle while 2 candidates live
+  PASS: H10 [wg] early POST logged (expected=logged, actual=logged)
+  PASS: H10 [wg] row still logged after missed hook (expected=logged, actual=logged)
+      hook response (ambiguous expected): {"ok":true,"hook":{"payment":920002,"kode_unik":223,"expected":100823,"checked":1,"applied":0}}
+  PASS: H10 [wg] hook probe ok (expected=True, actual=True)
+  PASS: H10 [wg] hook checked 1 waiting row (expected=1, actual=1)
+  PASS: H10 [wg] hook applied 0 (ambiguous) (expected=0, actual=0)
+  PASS: H10 [wg] row ambiguous after hook (expected=ambiguous, actual=ambiguous)
+  PASS: H10 [wg] bills PAID (none settles) (expected=0, actual=0)
+  PASS: H10 [wg] pemasukan rows (expected=0, actual=0)
+  PASS: H10 [wg] row unapplied (expected=0, actual=0)
+  PASS: H10 [wg] ambiguous note names candidates (C1) (matches /ambiguous: 2 kandidat/: ambiguous: 2 kandidat — perlu keputusan operator)
+  PASS: H10 [wg] hook stamped rematch (kode-birth) (expected=kode-birth, actual=kode-birth)
+  PASS: H10 [wg] rematch_count=1 (hook attempt stamped) (expected=1, actual=1)
+  PASS: H10 [wg] 2nd hook call checks 0 rows (ambiguous ignored) (expected=0, actual=0)
+  PASS: H10 [wg] still 0 effects after 2nd hook (expected=0, actual=0)
+  PASS: H10 [wg] row visible to Belum-cocok filter (ambiguous + amount) (expected=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      508	h10-wg-1	ambiguous	NULL	NULL	0	1	kode-birth	ambiguous: 2 kandidat — perlu keputusan operator
+      -- wg evidence: payment + pemasukan
+      id	id_pelanggan	status
+      920001	900001	UNPAID
+      920002	900001	UNPAID
+      pemasukan_rows
+      0
+  ==> H10-hook-ambiguous [wg]: PASS (hook sees 2 candidates -> ambiguous, 0 effects; ambiguous rows ignored by later hooks)
+
+==================== SUMMARY ====================
+  H10-hook-ambiguous [v2]: PASS (hook sees 2 candidates -> ambiguous, 0 effects; ambiguous rows ignored by later hooks)
+  H10-hook-ambiguous [wg]: PASS (hook sees 2 candidates -> ambiguous, 0 effects; ambiguous rows ignored by later hooks)
+-------------------------------------------------
+assertions: PASS=30 FAIL=0
+full log: /home/warganet/paylist-contract-c2/results/run-review7-20261124-101927.log
+actor responses: /home/warganet/paylist-contract-c2/results/run-review7-20261124-101927/
+RESULT: ALL SCENARIOS BEHAVED AS SPECIFIED

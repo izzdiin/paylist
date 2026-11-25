@@ -1,0 +1,128 @@
+--- a/bayarQR/qris_apply.php
++++ b/bayarQR/qris_apply.php
+@@ -52,6 +52,12 @@
+     }
+     $idPelanggan = (int)$log['matched_id_pelanggan'];
+     $proformaId  = (int)$log['matched_id_proforma'];
++    // "Seleksi" yang akan direvalidasi di bawah kunci (perbaikan C2
++    // review #8, P1 stale match binding): ketiga nilai ini dibaca TANPA
++    // kunci; bila aktor re-match mengubah binding baris log di antara
++    // baca ini dan kunci transaksi, nilai segar di bawah kunci akan
++    // berbeda — dan apply WAJIB menolak, bukan mengklaim tagihan basi.
++    $amountSel   = (int)$log['amount'];
+     if (QRIS_APPLY_TEST_ONLY && !in_array($idPelanggan, QRIS_APPLY_TEST_CUSTOMERS, true)) {
+         $res['steps'][] = 'dilewati: gerbang uji (hanya pelanggan uji)';
+         return $res;
+@@ -111,6 +117,112 @@
+     // ============ TULIS DB (satu transaksi) ============
+     $db->begin_transaction();
+     try {
++        // Kunci baris log DULU (perbaikan C2 review #7, temuan lomba
++        // F2-hookrace 24 Nov 2026): apply sebelumnya membaca baris log
++        // tanpa kunci lalu baru menulisnya di akhir transaksi; bila
++        // aktor re-match mengubah baris yang sama di tengah jalan
++        // (stempel rematch_count), MariaDB membatalkan SELURUH
++        // transaksi dengan ER_CHECKREAD (1020) "Record has changed
++        // since last read in table 'qris_notif_log'" — tagihan batal
++        // lunas padahal tidak ada yang kalah klaim, dan tidak ada aktor
++        // yang mencoba lagi (semua sudah lewat dengan "transisi kalah").
++        // Dengan kunci FOR UPDATE sejak awal, tidak ada modifikasi
++        // antar-sela yang mungkin. Penjaga diperiksa ulang di bawah
++        // kunci: apply kedua atas baris yang sama gagal di sini (bukan
++        // di klaim) bila baris sudah diterapkan aktor lain.
++        $lock = $db->prepare("SELECT amount, match_status, matched_id_pelanggan, matched_id_proforma, applied_at FROM qris_notif_log WHERE id = ? FOR UPDATE");
++        $lock->bind_param('i', $logId);
++        $lock->execute();
++        $logKunci = $lock->get_result()->fetch_assoc();
++        $lock->close();
++        if (!$logKunci) {
++            throw new RuntimeException('log tidak ditemukan (di bawah kunci)');
++        }
++        if ($logKunci['match_status'] !== 'matched' || $logKunci['applied_at'] !== null) {
++            throw new RuntimeException('log sudah tidak matched / sudah diterapkan oleh proses lain');
++        }
++
++        // Revalidasi binding basi (perbaikan C2 review #8, P1 stale match
++        // binding, 24 Nov 2026): penjaga review #7 di atas hanya memeriksa
++        // match_status/applied_at — TIDAK memeriksa KE MANA baris ini
++        // cocok. Bila aktor re-match mengubah matched_id_proforma /
++        // matched_id_pelanggan di antara baca-seleksi dan kunci ini,
++        // apply lama tetap mengklaim proforma BASI: klaim atomik di bawah
++        // hanya gagal bila tagihan lama sudah PAID; bila masih UNPAID,
++        // tagihan yang SALAH ikut lunas (celah yang ditunjukkan
++        // re-review #8 atas klaim "known-safe edge" §13.5 desain).
++        // Di bawah kunci, baca ulang binding segar dari baris log itu
++        // sendiri dan TOLAK bila berbeda dengan seleksi — tanpa efek apa
++        // pun (tanpa pelunasan, poin, WA, router). Penolakan dicatat di
++        // apply_note lewat commit khusus catatan ini; match_status TIDAK
++        // diubah — baris tetap matched ke binding segarnya dan tetap bisa
++        // dilunasi aktor yang benar.
++        $segarPelanggan = (int)$logKunci['matched_id_pelanggan'];
++        $segarProforma  = (int)$logKunci['matched_id_proforma'];
++        $segarAmount    = (int)$logKunci['amount'];
++        $tolak = null;
++        if ($segarProforma !== $proformaId || $segarPelanggan !== $idPelanggan || $segarAmount !== $amountSel) {
++            $tolak = 'pilihan proforma ' . $proformaId . ' (pelanggan ' . $idPelanggan . ', Rp ' . $amountSel . ') tidak lagi cocok dengan log (proforma ' . $segarProforma . ', pelanggan ' . $segarPelanggan . ', Rp ' . $segarAmount . ')';
++        }
++
++        // Kunci baris tagihan KEDUA (urutan kunci seragam di semua
++        // entrypoint: baris log dulu, lalu baris tagihan — tidak ada
++        // entrypoint yang mengunci tagihan dulu lalu log, jadi tidak ada
++        // siklus deadlock baru) dan revalidasi kelayakan + nominal dari
++        // baris segar di bawah kuncinya sendiri: status masih UNPAID,
++        // pelanggan cocok, dan nominal harapan (rumus matcher yang sama
++        // dengan qris_match.php) sama dengan amount log. Ini menangkap
++        // perubahan tagihan di antara seleksi dan kunci (mis. admin
++        // mengubah total) yang tidak terlihat di binding log.
++        $profSegar = null;
++        if ($tolak === null) {
++            $pf = $db->prepare("SELECT id, idtrx, id_pelanggan, layanan, tagihan, addon, biaya_instalasi, pajak, diskon, total_tagihan, kode_unik, status FROM proforma WHERE id = ? FOR UPDATE");
++            $pf->bind_param('i', $segarProforma);
++            $pf->execute();
++            $profSegar = $pf->get_result()->fetch_assoc();
++            $pf->close();
++            if (!$profSegar) {
++                $tolak = 'proforma ' . $segarProforma . ' tidak ditemukan (di bawah kunci)';
++            } elseif ($profSegar['status'] !== 'UNPAID') {
++                $tolak = 'proforma ' . $segarProforma . ' sudah ' . $profSegar['status'];
++            } elseif ((int)$profSegar['id_pelanggan'] !== $segarPelanggan) {
++                $tolak = 'proforma ' . $segarProforma . ' milik pelanggan ' . $profSegar['id_pelanggan'] . ', bukan ' . $segarPelanggan;
++            } elseif ($profSegar['kode_unik'] === null) {
++                $tolak = 'proforma ' . $segarProforma . ' belum berkode unik';
++            } else {
++                if (!function_exists('qris_expected_nominal')) {
++                    require_once __DIR__ . '/qris_match.php';
++                }
++                $nominalHarapan = qris_expected_nominal(qris_base_from_proforma_row($profSegar), (int)$profSegar['kode_unik']);
++                if ($nominalHarapan !== $segarAmount) {
++                    $tolak = 'nominal harapan proforma ' . $segarProforma . ' (Rp ' . $nominalHarapan . ') tidak sama dengan amount log (Rp ' . $segarAmount . ')';
++                }
++            }
++        }
++
++        if ($tolak !== null) {
++            // Tolak TANPA efek bisnis: satu-satunya tulisan adalah
++            // catatan penolakan di baris log, di dalam transaksi yang
++            // sama dan di bawah kunci — agar tidak menimpa catatan apply
++            // sukses aktor lain bila ditulis sesudah rollback.
++            $noteTolak = mb_substr('ditolak (binding basi): ' . $tolak, 0, 255);
++            $updN = $db->prepare("UPDATE qris_notif_log SET apply_note = ? WHERE id = ?");
++            $updN->bind_param('si', $noteTolak, $logId);
++            $updN->execute();
++            $updN->close();
++            $db->commit();
++            $res['steps'][] = 'ditolak tanpa efek (binding basi): ' . $tolak;
++            return $res;
++        }
++
++        // Nilai segar di bawah kunci dipakai ke bawah (bukan hasil baca
++        // pra-kunci): total/idtrx/layanan proforma bisa berubah di
++        // antara seleksi dan kunci.
++        $prof = $profSegar;
++        $total = (float)$profSegar['total_tagihan'];
++        $idtrxInv = str_replace('PRO-', 'INV-', (string)$profSegar['idtrx']);
++        $layanan = $profSegar['layanan'];
++
+         $upd = $db->prepare("UPDATE proforma SET status = 'PAID', tanggal_bayar = NOW() WHERE id = ? AND status = 'UNPAID'");
+         $upd->bind_param('i', $proformaId);
+         $upd->execute();

@@ -1,0 +1,489 @@
+[review7 10:21:17] review7 run 20261124-102117 (target=all, rounds=2)
+[review7 10:21:17] amounts: AMT_A=100823 (100000+fee+123), AMT_TWIN=100823 (99900+fee+223)
+[review7 10:21:17] F2-mixed [v2] manual re-match + birth hook + notify retry + competing match, 2 rounds
+  PASS: F2-mixed [v2] r1 setup: early row logged (expected=logged, actual=logged)
+      actor f2m-v2-r1-comp-1: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-v2-r1-comp-2: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-v2-r1-comp-3: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-v2-r1-hook-1: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2m-v2-r1-hook-2: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":1,"applied":0}}
+      actor f2m-v2-r1-rem-1: {"ok":false,"log_id":552,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-v2-r1-rem-2: {"ok":true,"log_id":552,"before":"logged","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"proforma":910001,"applied_at":"2026-11-24 10:21:18","apply_note":"ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)","rematch_count":1,"last_rematch_at":"2026-11-24 10:21:18","rematched_by":"harness-race"}
+      actor f2m-v2-r1-rem-3: {"ok":false,"log_id":552,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-v2-r1-rem-4: {"ok":false,"log_id":552,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-v2-r1-retry-1: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001}}
+      actor f2m-v2-r1-retry-2: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001}}
+      actor f2m-v2-r1-retry-3: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001}}
+  PASS: F2-mixed [v2] r1 bills PAID (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [v2] r1 pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [v2] r1 applied log rows (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [v2] r1 log rows (early + competing only) (expected=2, actual=2)
+  PASS: F2-mixed [v2] r1 distinct dedupe keys (stable, no new key) (expected=2, actual=2)
+  PASS: F2-mixed [v2] r1 early key kept its row (expected=1, actual=1)
+  PASS: F2-mixed [v2] r1 competing key kept its row (expected=1, actual=1)
+  PASS: F2-mixed [v2] r1 applied rows point at one bill (expected=1, actual=1)
+  PASS: F2-mixed [v2] r1 applied row points at the PAID bill (expected=910001, actual=910001)
+  PASS: F2-mixed [v2] r1 exactly one unapplied (loser) row (expected=1, actual=1)
+  PASS: F2-mixed [v2] r1 loser marked with winner (C3) (expected=1, actual=1)
+  PASS: F2-mixed [v2] r1 early row rematch_count>=1 (min=1, actual=1)
+  PASS: F2-mixed [v2] r2 setup: early row logged (expected=logged, actual=logged)
+      actor f2m-v2-r2-comp-1: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-v2-r2-comp-2: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-v2-r2-comp-3: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-v2-r2-hook-1: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2m-v2-r2-hook-2: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2m-v2-r2-rem-1: {"ok":false,"log_id":559,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-v2-r2-rem-2: {"ok":false,"log_id":559,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-v2-r2-rem-3: {"ok":true,"log_id":559,"before":"logged","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"proforma":910001,"applied_at":"2026-11-24 10:21:19","apply_note":"ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)","rematch_count":1,"last_rematch_at":"2026-11-24 10:21:19","rematched_by":"harness-race"}
+      actor f2m-v2-r2-rem-4: {"ok":false,"log_id":559,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-v2-r2-retry-1: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001}}
+      actor f2m-v2-r2-retry-2: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001}}
+      actor f2m-v2-r2-retry-3: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001}}
+  PASS: F2-mixed [v2] r2 bills PAID (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [v2] r2 pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [v2] r2 applied log rows (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [v2] r2 log rows (early + competing only) (expected=2, actual=2)
+  PASS: F2-mixed [v2] r2 distinct dedupe keys (stable, no new key) (expected=2, actual=2)
+  PASS: F2-mixed [v2] r2 early key kept its row (expected=1, actual=1)
+  PASS: F2-mixed [v2] r2 competing key kept its row (expected=1, actual=1)
+  PASS: F2-mixed [v2] r2 applied rows point at one bill (expected=1, actual=1)
+  PASS: F2-mixed [v2] r2 applied row points at the PAID bill (expected=910001, actual=910001)
+  PASS: F2-mixed [v2] r2 exactly one unapplied (loser) row (expected=1, actual=1)
+  PASS: F2-mixed [v2] r2 loser marked with winner (C3) (expected=1, actual=1)
+  PASS: F2-mixed [v2] r2 early row rematch_count>=1 (min=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      559	f2m-v2-r2-early	matched	900001	910001	1	1	harness-race	ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kos
+      560	f2m-v2-r2-comp	logged	NULL	NULL	0	0	NULL	nominal sama dengan pembayaran log #559 yang melunasi proforma 910001 — kemungkinan bayar 
+      -- v2 evidence: proforma + pemasukan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+  ==> F2-mixed [v2] 4-way race: PASS (12 actors/round x 2, exactly 1 effect; loser marked; keys stable)
+[review7 10:21:21] F2-hookrace [v2] 6 concurrent hook calls vs 6 concurrent re-matches, 2 rounds
+      actor f2h-v2-r1-hook-1: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r1-hook-2: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r1-hook-3: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r1-hook-4: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r1-hook-5: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r1-hook-6: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r1-rem-1: {"ok":false,"log_id":566,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-v2-r1-rem-2: {"ok":false,"log_id":566,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-v2-r1-rem-3: {"ok":false,"log_id":566,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-v2-r1-rem-4: {"ok":false,"log_id":566,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-v2-r1-rem-5: {"ok":true,"log_id":566,"before":"logged","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"proforma":910001,"applied_at":"2026-11-24 10:21:21","apply_note":"ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)","rematch_count":2,"last_rematch_at":"2026-11-24 10:21:21","rematched_by":"harness-race"}
+      actor f2h-v2-r1-rem-6: {"ok":true,"log_id":566,"before":"matched","after":"matched","applied":false,"note":"transisi kalah oleh aktor lain \u2014 baca ulang, berhenti","candidates":1,"id_pelanggan":900001,"proforma":910001,"applied_at":null,"apply_note":null,"rematch_count":2,"last_rematch_at":"2026-11-24 10:21:21","rematched_by":"harness-race"}
+  PASS: F2-hookrace [v2] r1 bills PAID (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [v2] r1 pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [v2] r1 applied log rows (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [v2] r1 log rows (still one) (expected=1, actual=1)
+  PASS: F2-hookrace [v2] r1 rematch_count>=1 (min=1, actual=2)
+      actor f2h-v2-r2-hook-1: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r2-hook-2: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r2-hook-3: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r2-hook-4: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r2-hook-5: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r2-hook-6: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-v2-r2-rem-1: {"ok":false,"log_id":567,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-v2-r2-rem-2: {"ok":false,"log_id":567,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-v2-r2-rem-3: {"ok":false,"log_id":567,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-v2-r2-rem-4: {"ok":false,"log_id":567,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-v2-r2-rem-5: {"ok":false,"log_id":567,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-v2-r2-rem-6: {"ok":true,"log_id":567,"before":"logged","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"proforma":910001,"applied_at":"2026-11-24 10:21:22","apply_note":"ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)","rematch_count":1,"last_rematch_at":"2026-11-24 10:21:22","rematched_by":"harness-race"}
+  PASS: F2-hookrace [v2] r2 bills PAID (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [v2] r2 pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [v2] r2 applied log rows (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [v2] r2 log rows (still one) (expected=1, actual=1)
+  PASS: F2-hookrace [v2] r2 rematch_count>=1 (min=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      567	f2h-v2-r2-early	matched	900001	910001	1	1	harness-race	ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kos
+      -- v2 evidence: proforma + pemasukan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+  ==> F2-hookrace [v2] hook vs re-match: PASS (12 actors/round x 2, exactly 1 effect)
+[review7 10:21:23] F2-nodouble [v2] settled payment re-matched after a twin bill appears
+  PASS: F2-nodouble [v2] setup: bill A PAID (expected=PAID, actual=PAID)
+  PASS: F2-nodouble [v2] setup: pemasukan 1 (expected=1, actual=1)
+  PASS: F2-nodouble [v2] twin nominal sanity (expected=100823, actual=100823)
+  PASS: F2-nodouble [v2] setup: bill B UNPAID (expected=UNPAID, actual=UNPAID)
+      rematch applied-row response: {"ok":false,"log_id":568,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+  PASS: F2-nodouble [v2] re-match applied row: ok=false (expected=False, actual=False)
+  PASS: F2-nodouble [v2] re-match applied row: applied=false (expected=False, actual=False)
+  PASS: F2-nodouble [v2] re-match applied row: reason given (matches /sudah diterapkan/: sudah diterapkan — tidak ada yang dicocokkan ulang)
+  PASS: F2-nodouble [v2] bill B still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F2-nodouble [v2] pemasukan still 1 (expected=1, actual=1)
+  PASS: F2-nodouble [v2] row still attached to bill A only (expected=910001, actual=910001)
+  PASS: F2-nodouble [v2] rematch_count stays 0 (refused before stamp) (expected=0, actual=0)
+  PASS: F2-nodouble [v2] bill B PAID by its own payment (expected=PAID, actual=PAID)
+  PASS: F2-nodouble [v2] pemasukan now 2 (one per payment) (expected=2, actual=2)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      568	f2n-v2-1	matched	900001	910001	1	0	NULL	ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kos
+      569	f2n-v2-2	matched	900001	910002	1	0	NULL	ok: proforma 910002 PAID; pemasukan INV-TEST-910002 | mt: dilewati (konfigurasi router kos
+      -- v2 evidence: proforma + pemasukan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      910002	900001	PAID
+      pemasukan_rows
+      2
+  ==> F2-nodouble [v2] no double attach: PASS (applied row refuses re-match; twin settles only via its own payment)
+[review7 10:21:25] F4-stale [v2] stale + fresh UNPAID bills, same nominal
+  PASS: F4-stale [v2] twin nominal sanity (expected=100823, actual=100823)
+      resp stale-twin payment: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"ambiguous","candidates":2}}
+  PASS: F4-stale [v2] stale twins -> ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: F4-stale [v2] bills PAID (none settles) (expected=0, actual=0)
+  PASS: F4-stale [v2] pemasukan rows (expected=0, actual=0)
+  PASS: F4-stale [v2] ambiguous note names candidates (C1) (matches /ambiguous: 2 kandidat/: ambiguous: 2 kandidat — perlu keputusan operator)
+      rematch ambiguous response: {"ok":true,"log_id":570,"before":"ambiguous","after":"ambiguous","applied":false,"note":"re-match: 2 kandidat (ambiguous)","candidates":2,"applied_at":null,"apply_note":"ambiguous: 2 kandidat \u2014 perlu keputusan operator","rematch_count":1,"last_rematch_at":"2026-11-24 10:21:25","rematched_by":"harness-race"}
+  PASS: F4-stale [v2] re-match still ambiguous (2 live candidates) (expected=ambiguous, actual=ambiguous)
+  PASS: F4-stale [v2] re-match applied=false (expected=False, actual=False)
+  PASS: F4-stale [v2] bills PAID still 0 (expected=0, actual=0)
+      rematch after set shrinks: {"ok":true,"log_id":570,"before":"ambiguous","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"proforma":910001,"applied_at":"2026-11-24 10:21:26","apply_note":"ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)","rematch_count":2,"last_rematch_at":"2026-11-24 10:21:26","rematched_by":"harness-race"}
+  PASS: F4-stale [v2] after shrink: rematch matched (expected=matched, actual=matched)
+  PASS: F4-stale [v2] after shrink: rematch applied (expected=True, actual=True)
+  PASS: F4-stale [v2] stale bill PAID (expected=PAID, actual=PAID)
+  PASS: F4-stale [v2] pemasukan rows (only the matched one) (expected=1, actual=1)
+  PASS: F4-stale [v2] row attached to the stale bill (expected=910001, actual=910001)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      570	f4-v2-1	matched	900001	910001	1	2	harness-race	ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kos
+      -- v2 evidence: proforma + pemasukan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      910002	900001	PAID
+      pemasukan_rows
+      1
+  ==> F4-stale [v2] stale twins: PASS (ambiguous while 2 live; re-match alone cannot pick; settles stale bill after out-of-band shrink)
+[review7 10:21:26] F3-hookfail [v2] total hook failure -> payment stays discoverable + recoverable
+  PASS: F3-hookfail [v2] setup: early row logged (expected=logged, actual=logged)
+hook broken in scratch copy: /home/warganet/paylist-contract-c2/html-v2/bayarQR/qris_match.php
+      hook response with broken hook: 
+  PASS: F3-hookfail [v2] broken hook did not report ok
+  PASS: F3-hookfail [v2] row still logged after hook failure (expected=logged, actual=logged)
+  PASS: F3-hookfail [v2] row still unapplied (expected=0, actual=0)
+  PASS: F3-hookfail [v2] bill still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F3-hookfail [v2] row visible to Belum-cocok filter (logged + amount) (expected=1, actual=1)
+  PASS: F3-hookfail [v2] scratch matcher restored (sha == endpoint src) (expected=b9e986efd411818092bf5e00556b2abb5da665ceb699c8643fdaf5d5f8bda584, actual=b9e986efd411818092bf5e00556b2abb5da665ceb699c8643fdaf5d5f8bda584)
+      recovery rematch response: {"ok":true,"log_id":571,"before":"logged","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"proforma":910001,"applied_at":"2026-11-24 10:21:33","apply_note":"ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)","rematch_count":1,"last_rematch_at":"2026-11-24 10:21:33","rematched_by":"harness-race"}
+  PASS: F3-hookfail [v2] recovery rematch ok (expected=True, actual=True)
+  PASS: F3-hookfail [v2] recovery rematch matched (expected=matched, actual=matched)
+  PASS: F3-hookfail [v2] recovery rematch applied (expected=True, actual=True)
+  PASS: F3-hookfail [v2] bill PAID after recovery (expected=PAID, actual=PAID)
+  PASS: F3-hookfail [v2] pemasukan rows (exactly one) (expected=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      571	f3-v2-1	matched	900001	910001	1	1	harness-race	ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kos
+      -- v2 evidence: proforma + pemasukan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+  ==> F3-hookfail [v2] hook failure recovery: PASS (failure leaves payment logged + discoverable; operator re-match recovers it)
+[review7 10:21:34] H10-hook-ambiguous [v2] hook must not settle while 2 candidates live
+  PASS: H10 [v2] early POST logged (expected=logged, actual=logged)
+  PASS: H10 [v2] row still logged after missed hook (expected=logged, actual=logged)
+      hook response (ambiguous expected): {"ok":true,"hook":{"proforma":910002,"kode_unik":223,"expected":100823,"checked":1,"applied":0}}
+  PASS: H10 [v2] hook probe ok (expected=True, actual=True)
+  PASS: H10 [v2] hook checked 1 waiting row (expected=1, actual=1)
+  PASS: H10 [v2] hook applied 0 (ambiguous) (expected=0, actual=0)
+  PASS: H10 [v2] row ambiguous after hook (expected=ambiguous, actual=ambiguous)
+  PASS: H10 [v2] bills PAID (none settles) (expected=0, actual=0)
+  PASS: H10 [v2] pemasukan rows (expected=0, actual=0)
+  PASS: H10 [v2] row unapplied (expected=0, actual=0)
+  PASS: H10 [v2] ambiguous note names candidates (C1) (matches /ambiguous: 2 kandidat/: ambiguous: 2 kandidat — perlu keputusan operator)
+  PASS: H10 [v2] hook stamped rematch (kode-birth) (expected=kode-birth, actual=kode-birth)
+  PASS: H10 [v2] rematch_count=1 (hook attempt stamped) (expected=1, actual=1)
+  PASS: H10 [v2] 2nd hook call checks 0 rows (ambiguous ignored) (expected=0, actual=0)
+  PASS: H10 [v2] still 0 effects after 2nd hook (expected=0, actual=0)
+  PASS: H10 [v2] row visible to Belum-cocok filter (ambiguous + amount) (expected=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      572	h10-v2-1	ambiguous	NULL	NULL	0	1	kode-birth	ambiguous: 2 kandidat — perlu keputusan operator
+      -- v2 evidence: proforma + pemasukan
+      id	id_pelanggan	status
+      910001	900001	UNPAID
+      910002	900001	UNPAID
+      pemasukan_rows
+      0
+  ==> H10-hook-ambiguous [v2]: PASS (hook sees 2 candidates -> ambiguous, 0 effects; ambiguous rows ignored by later hooks)
+[review7 10:21:36] H11-hold-persists [v2] ambiguous row survives retry + rematch + hook
+  PASS: H11 [v2] POST ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [v2] retry still ambiguous (stored) (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [v2] rematch 1 still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [v2] rematch 1 applied=false (expected=False, actual=False)
+  PASS: H11 [v2] rematch 2 still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [v2] rematch 2 applied=false (expected=False, actual=False)
+  PASS: H11 [v2] hook checks 0 rows (ambiguous ignored) (expected=0, actual=0)
+  PASS: H11 [v2] row still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [v2] row unapplied (expected=0, actual=0)
+  PASS: H11 [v2] bills PAID (none settles) (expected=0, actual=0)
+  PASS: H11 [v2] pemasukan rows (expected=0, actual=0)
+  PASS: H11 [v2] rematch_count=2 (both attempts stamped) (expected=2, actual=2)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      573	h11-v2-1	ambiguous	NULL	NULL	0	2	harness-race	ambiguous: 2 kandidat — perlu keputusan operator
+      -- v2 evidence: proforma + pemasukan
+      id	id_pelanggan	status
+      910001	900001	UNPAID
+      910002	900001	UNPAID
+      pemasukan_rows
+      0
+  ==> H11-hold-persists [v2]: PASS (ambiguous survives retry + 2x rematch + hook, 0 effects)
+[review7 10:21:37] F2-mixed [wg] manual re-match + birth hook + notify retry + competing match, 2 rounds
+  PASS: F2-mixed [wg] r1 setup: early row logged (expected=logged, actual=logged)
+      actor f2m-wg-r1-comp-1: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-wg-r1-comp-2: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-wg-r1-comp-3: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-wg-r1-hook-1: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2m-wg-r1-hook-2: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2m-wg-r1-rem-1: {"ok":false,"log_id":534,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-wg-r1-rem-2: {"ok":true,"log_id":534,"before":"logged","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"payment":920001,"applied_at":"2026-11-24 10:21:38","apply_note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)","rematch_count":1,"last_rematch_at":"2026-11-24 10:21:38","rematched_by":"harness-race"}
+      actor f2m-wg-r1-rem-3: {"ok":false,"log_id":534,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-wg-r1-rem-4: {"ok":false,"log_id":534,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-wg-r1-retry-1: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920001}}
+      actor f2m-wg-r1-retry-2: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920001}}
+      actor f2m-wg-r1-retry-3: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920001}}
+  PASS: F2-mixed [wg] r1 bills PAID (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [wg] r1 pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [wg] r1 applied log rows (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [wg] r1 log rows (early + competing only) (expected=2, actual=2)
+  PASS: F2-mixed [wg] r1 distinct dedupe keys (stable, no new key) (expected=2, actual=2)
+  PASS: F2-mixed [wg] r1 early key kept its row (expected=1, actual=1)
+  PASS: F2-mixed [wg] r1 competing key kept its row (expected=1, actual=1)
+  PASS: F2-mixed [wg] r1 applied rows point at one bill (expected=1, actual=1)
+  PASS: F2-mixed [wg] r1 applied row points at the PAID bill (expected=920001, actual=920001)
+  PASS: F2-mixed [wg] r1 exactly one unapplied (loser) row (expected=1, actual=1)
+  PASS: F2-mixed [wg] r1 loser marked with winner (C3) (expected=1, actual=1)
+  PASS: F2-mixed [wg] r1 early row rematch_count>=1 (min=1, actual=1)
+  PASS: F2-mixed [wg] r2 setup: early row logged (expected=logged, actual=logged)
+      actor f2m-wg-r2-comp-1: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-wg-r2-comp-2: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-wg-r2-comp-3: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-wg-r2-hook-1: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":1,"applied":0}}
+      actor f2m-wg-r2-hook-2: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":1,"applied":0}}
+      actor f2m-wg-r2-rem-1: {"ok":true,"log_id":541,"before":"logged","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"payment":920001,"applied_at":"2026-11-24 10:21:40","apply_note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)","rematch_count":1,"last_rematch_at":"2026-11-24 10:21:40","rematched_by":"harness-race"}
+      actor f2m-wg-r2-rem-2: {"ok":false,"log_id":541,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-wg-r2-rem-3: {"ok":false,"log_id":541,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-wg-r2-rem-4: {"ok":false,"log_id":541,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2m-wg-r2-retry-1: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"logged"}}
+      actor f2m-wg-r2-retry-2: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920001}}
+      actor f2m-wg-r2-retry-3: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920001}}
+  PASS: F2-mixed [wg] r2 bills PAID (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [wg] r2 pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [wg] r2 applied log rows (exactly one) (expected=1, actual=1)
+  PASS: F2-mixed [wg] r2 log rows (early + competing only) (expected=2, actual=2)
+  PASS: F2-mixed [wg] r2 distinct dedupe keys (stable, no new key) (expected=2, actual=2)
+  PASS: F2-mixed [wg] r2 early key kept its row (expected=1, actual=1)
+  PASS: F2-mixed [wg] r2 competing key kept its row (expected=1, actual=1)
+  PASS: F2-mixed [wg] r2 applied rows point at one bill (expected=1, actual=1)
+  PASS: F2-mixed [wg] r2 applied row points at the PAID bill (expected=920001, actual=920001)
+  PASS: F2-mixed [wg] r2 exactly one unapplied (loser) row (expected=1, actual=1)
+  PASS: F2-mixed [wg] r2 loser marked with winner (C3) (expected=1, actual=1)
+  PASS: F2-mixed [wg] r2 early row rematch_count>=1 (min=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      541	f2m-wg-r2-early	matched	900001	920001	1	1	harness-race	lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)
+      543	f2m-wg-r2-comp	logged	NULL	NULL	0	2	kode-birth	nominal sama dengan pembayaran log #541 yang melunasi payment 920001 — kemungkinan bayar g
+      -- wg evidence: payment + pemasukan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+  ==> F2-mixed [wg] 4-way race: PASS (12 actors/round x 2, exactly 1 effect; loser marked; keys stable)
+[review7 10:21:41] F2-hookrace [wg] 6 concurrent hook calls vs 6 concurrent re-matches, 2 rounds
+      actor f2h-wg-r1-hook-1: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-wg-r1-hook-2: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-wg-r1-hook-3: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-wg-r1-hook-4: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-wg-r1-hook-5: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-wg-r1-hook-6: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-wg-r1-rem-1: {"ok":false,"log_id":548,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-wg-r1-rem-2: {"ok":false,"log_id":548,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-wg-r1-rem-3: {"ok":true,"log_id":548,"before":"logged","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"payment":920001,"applied_at":"2026-11-24 10:21:42","apply_note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)","rematch_count":1,"last_rematch_at":"2026-11-24 10:21:42","rematched_by":"harness-race"}
+      actor f2h-wg-r1-rem-4: {"ok":false,"log_id":548,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-wg-r1-rem-5: {"ok":false,"log_id":548,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-wg-r1-rem-6: {"ok":false,"log_id":548,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+  PASS: F2-hookrace [wg] r1 bills PAID (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [wg] r1 pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [wg] r1 applied log rows (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [wg] r1 log rows (still one) (expected=1, actual=1)
+  PASS: F2-hookrace [wg] r1 rematch_count>=1 (min=1, actual=1)
+      actor f2h-wg-r2-hook-1: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":1,"applied":1}}
+      actor f2h-wg-r2-hook-2: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-wg-r2-hook-3: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-wg-r2-hook-4: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-wg-r2-hook-5: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-wg-r2-hook-6: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":0,"applied":0}}
+      actor f2h-wg-r2-rem-1: {"ok":false,"log_id":549,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-wg-r2-rem-2: {"ok":false,"log_id":549,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-wg-r2-rem-3: {"ok":false,"log_id":549,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-wg-r2-rem-4: {"ok":false,"log_id":549,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-wg-r2-rem-5: {"ok":false,"log_id":549,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+      actor f2h-wg-r2-rem-6: {"ok":false,"log_id":549,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+  PASS: F2-hookrace [wg] r2 bills PAID (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [wg] r2 pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [wg] r2 applied log rows (exactly one) (expected=1, actual=1)
+  PASS: F2-hookrace [wg] r2 log rows (still one) (expected=1, actual=1)
+  PASS: F2-hookrace [wg] r2 rematch_count>=1 (min=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      549	f2h-wg-r2-early	matched	900001	920001	1	1	kode-birth	lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)
+      -- wg evidence: payment + pemasukan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+  ==> F2-hookrace [wg] hook vs re-match: PASS (12 actors/round x 2, exactly 1 effect)
+[review7 10:21:44] F2-nodouble [wg] settled payment re-matched after a twin bill appears
+  PASS: F2-nodouble [wg] setup: bill A PAID (expected=PAID, actual=PAID)
+  PASS: F2-nodouble [wg] setup: pemasukan 1 (expected=1, actual=1)
+  PASS: F2-nodouble [wg] twin nominal sanity (expected=100823, actual=100823)
+  PASS: F2-nodouble [wg] setup: bill B UNPAID (expected=UNPAID, actual=UNPAID)
+      rematch applied-row response: {"ok":false,"log_id":550,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+  PASS: F2-nodouble [wg] re-match applied row: ok=false (expected=False, actual=False)
+  PASS: F2-nodouble [wg] re-match applied row: applied=false (expected=False, actual=False)
+  PASS: F2-nodouble [wg] re-match applied row: reason given (matches /sudah diterapkan/: sudah diterapkan — tidak ada yang dicocokkan ulang)
+  PASS: F2-nodouble [wg] bill B still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F2-nodouble [wg] pemasukan still 1 (expected=1, actual=1)
+  PASS: F2-nodouble [wg] row still attached to bill A only (expected=920001, actual=920001)
+  PASS: F2-nodouble [wg] rematch_count stays 0 (refused before stamp) (expected=0, actual=0)
+  PASS: F2-nodouble [wg] bill B PAID by its own payment (expected=PAID, actual=PAID)
+  PASS: F2-nodouble [wg] pemasukan now 2 (one per payment) (expected=2, actual=2)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      550	f2n-wg-1	matched	900001	920001	1	0	NULL	lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)
+      551	f2n-wg-2	matched	900001	920002	1	0	NULL	lunas via Paylist (payment 920002, idtrx TRX-TEST-920002)
+      -- wg evidence: payment + pemasukan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      920002	900001	PAID
+      pemasukan_rows
+      2
+  ==> F2-nodouble [wg] no double attach: PASS (applied row refuses re-match; twin settles only via its own payment)
+[review7 10:21:45] F4-stale [wg] stale + fresh UNPAID bills, same nominal
+  PASS: F4-stale [wg] twin nominal sanity (expected=100823, actual=100823)
+      resp stale-twin payment: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"ambiguous","candidates":2}}
+  PASS: F4-stale [wg] stale twins -> ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: F4-stale [wg] bills PAID (none settles) (expected=0, actual=0)
+  PASS: F4-stale [wg] pemasukan rows (expected=0, actual=0)
+  PASS: F4-stale [wg] ambiguous note names candidates (C1) (matches /ambiguous: 2 kandidat/: ambiguous: 2 kandidat — perlu keputusan operator)
+      rematch ambiguous response: {"ok":true,"log_id":552,"before":"ambiguous","after":"ambiguous","applied":false,"note":"re-match: 2 kandidat (ambiguous)","candidates":2,"applied_at":null,"apply_note":"ambiguous: 2 kandidat \u2014 perlu keputusan operator","rematch_count":1,"last_rematch_at":"2026-11-24 10:21:46","rematched_by":"harness-race"}
+  PASS: F4-stale [wg] re-match still ambiguous (2 live candidates) (expected=ambiguous, actual=ambiguous)
+  PASS: F4-stale [wg] re-match applied=false (expected=False, actual=False)
+  PASS: F4-stale [wg] bills PAID still 0 (expected=0, actual=0)
+      rematch after set shrinks: {"ok":true,"log_id":552,"before":"ambiguous","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"payment":920001,"applied_at":"2026-11-24 10:21:46","apply_note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)","rematch_count":2,"last_rematch_at":"2026-11-24 10:21:46","rematched_by":"harness-race"}
+  PASS: F4-stale [wg] after shrink: rematch matched (expected=matched, actual=matched)
+  PASS: F4-stale [wg] after shrink: rematch applied (expected=True, actual=True)
+  PASS: F4-stale [wg] stale bill PAID (expected=PAID, actual=PAID)
+  PASS: F4-stale [wg] pemasukan rows (only the matched one) (expected=1, actual=1)
+  PASS: F4-stale [wg] row attached to the stale bill (expected=920001, actual=920001)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      552	f4-wg-1	matched	900001	920001	1	2	harness-race	lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)
+      -- wg evidence: payment + pemasukan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      920002	900001	PAID
+      pemasukan_rows
+      1
+  ==> F4-stale [wg] stale twins: PASS (ambiguous while 2 live; re-match alone cannot pick; settles stale bill after out-of-band shrink)
+[review7 10:21:47] F3-hookfail [wg] total hook failure -> payment stays discoverable + recoverable
+  PASS: F3-hookfail [wg] setup: early row logged (expected=logged, actual=logged)
+hook broken in scratch copy: /home/warganet/paylist-contract-c2/html-wg/paylist/paylist_match.php
+      hook response with broken hook: 
+  PASS: F3-hookfail [wg] broken hook did not report ok
+  PASS: F3-hookfail [wg] row still logged after hook failure (expected=logged, actual=logged)
+  PASS: F3-hookfail [wg] row still unapplied (expected=0, actual=0)
+  PASS: F3-hookfail [wg] bill still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F3-hookfail [wg] row visible to Belum-cocok filter (logged + amount) (expected=1, actual=1)
+  PASS: F3-hookfail [wg] scratch matcher restored (sha == endpoint src) (expected=771fd5bd5c7a31e6a1ce9b6bd90af52f669d12db73252b2480cb2889cc2e35c3, actual=771fd5bd5c7a31e6a1ce9b6bd90af52f669d12db73252b2480cb2889cc2e35c3)
+      recovery rematch response: {"ok":true,"log_id":553,"before":"logged","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"payment":920001,"applied_at":"2026-11-24 10:21:54","apply_note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)","rematch_count":1,"last_rematch_at":"2026-11-24 10:21:54","rematched_by":"harness-race"}
+  PASS: F3-hookfail [wg] recovery rematch ok (expected=True, actual=True)
+  PASS: F3-hookfail [wg] recovery rematch matched (expected=matched, actual=matched)
+  PASS: F3-hookfail [wg] recovery rematch applied (expected=True, actual=True)
+  PASS: F3-hookfail [wg] bill PAID after recovery (expected=PAID, actual=PAID)
+  PASS: F3-hookfail [wg] pemasukan rows (exactly one) (expected=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      553	f3-wg-1	matched	900001	920001	1	1	harness-race	lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)
+      -- wg evidence: payment + pemasukan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+  ==> F3-hookfail [wg] hook failure recovery: PASS (failure leaves payment logged + discoverable; operator re-match recovers it)
+[review7 10:21:54] H10-hook-ambiguous [wg] hook must not settle while 2 candidates live
+  PASS: H10 [wg] early POST logged (expected=logged, actual=logged)
+  PASS: H10 [wg] row still logged after missed hook (expected=logged, actual=logged)
+      hook response (ambiguous expected): {"ok":true,"hook":{"payment":920002,"kode_unik":223,"expected":100823,"checked":1,"applied":0}}
+  PASS: H10 [wg] hook probe ok (expected=True, actual=True)
+  PASS: H10 [wg] hook checked 1 waiting row (expected=1, actual=1)
+  PASS: H10 [wg] hook applied 0 (ambiguous) (expected=0, actual=0)
+  PASS: H10 [wg] row ambiguous after hook (expected=ambiguous, actual=ambiguous)
+  PASS: H10 [wg] bills PAID (none settles) (expected=0, actual=0)
+  PASS: H10 [wg] pemasukan rows (expected=0, actual=0)
+  PASS: H10 [wg] row unapplied (expected=0, actual=0)
+  PASS: H10 [wg] ambiguous note names candidates (C1) (matches /ambiguous: 2 kandidat/: ambiguous: 2 kandidat — perlu keputusan operator)
+  PASS: H10 [wg] hook stamped rematch (kode-birth) (expected=kode-birth, actual=kode-birth)
+  PASS: H10 [wg] rematch_count=1 (hook attempt stamped) (expected=1, actual=1)
+  PASS: H10 [wg] 2nd hook call checks 0 rows (ambiguous ignored) (expected=0, actual=0)
+  PASS: H10 [wg] still 0 effects after 2nd hook (expected=0, actual=0)
+  PASS: H10 [wg] row visible to Belum-cocok filter (ambiguous + amount) (expected=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      554	h10-wg-1	ambiguous	NULL	NULL	0	1	kode-birth	ambiguous: 2 kandidat — perlu keputusan operator
+      -- wg evidence: payment + pemasukan
+      id	id_pelanggan	status
+      920001	900001	UNPAID
+      920002	900001	UNPAID
+      pemasukan_rows
+      0
+  ==> H10-hook-ambiguous [wg]: PASS (hook sees 2 candidates -> ambiguous, 0 effects; ambiguous rows ignored by later hooks)
+[review7 10:21:56] H11-hold-persists [wg] ambiguous row survives retry + rematch + hook
+  PASS: H11 [wg] POST ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [wg] retry still ambiguous (stored) (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [wg] rematch 1 still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [wg] rematch 1 applied=false (expected=False, actual=False)
+  PASS: H11 [wg] rematch 2 still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [wg] rematch 2 applied=false (expected=False, actual=False)
+  PASS: H11 [wg] hook checks 0 rows (ambiguous ignored) (expected=0, actual=0)
+  PASS: H11 [wg] row still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [wg] row unapplied (expected=0, actual=0)
+  PASS: H11 [wg] bills PAID (none settles) (expected=0, actual=0)
+  PASS: H11 [wg] pemasukan rows (expected=0, actual=0)
+  PASS: H11 [wg] rematch_count=2 (both attempts stamped) (expected=2, actual=2)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      555	h11-wg-1	ambiguous	NULL	NULL	0	2	harness-race	ambiguous: 2 kandidat — perlu keputusan operator
+      -- wg evidence: payment + pemasukan
+      id	id_pelanggan	status
+      920001	900001	UNPAID
+      920002	900001	UNPAID
+      pemasukan_rows
+      0
+  ==> H11-hold-persists [wg]: PASS (ambiguous survives retry + 2x rematch + hook, 0 effects)
+
+==================== SUMMARY ====================
+  F2-mixed [v2] 4-way race: PASS (12 actors/round x 2, exactly 1 effect; loser marked; keys stable)
+  F2-hookrace [v2] hook vs re-match: PASS (12 actors/round x 2, exactly 1 effect)
+  F2-nodouble [v2] no double attach: PASS (applied row refuses re-match; twin settles only via its own payment)
+  F4-stale [v2] stale twins: PASS (ambiguous while 2 live; re-match alone cannot pick; settles stale bill after out-of-band shrink)
+  F3-hookfail [v2] hook failure recovery: PASS (failure leaves payment logged + discoverable; operator re-match recovers it)
+  H10-hook-ambiguous [v2]: PASS (hook sees 2 candidates -> ambiguous, 0 effects; ambiguous rows ignored by later hooks)
+  H11-hold-persists [v2]: PASS (ambiguous survives retry + 2x rematch + hook, 0 effects)
+  F2-mixed [wg] 4-way race: PASS (12 actors/round x 2, exactly 1 effect; loser marked; keys stable)
+  F2-hookrace [wg] hook vs re-match: PASS (12 actors/round x 2, exactly 1 effect)
+  F2-nodouble [wg] no double attach: PASS (applied row refuses re-match; twin settles only via its own payment)
+  F4-stale [wg] stale twins: PASS (ambiguous while 2 live; re-match alone cannot pick; settles stale bill after out-of-band shrink)
+  F3-hookfail [wg] hook failure recovery: PASS (failure leaves payment logged + discoverable; operator re-match recovers it)
+  H10-hook-ambiguous [wg]: PASS (hook sees 2 candidates -> ambiguous, 0 effects; ambiguous rows ignored by later hooks)
+  H11-hold-persists [wg]: PASS (ambiguous survives retry + 2x rematch + hook, 0 effects)
+-------------------------------------------------
+assertions: PASS=202 FAIL=0
+full log: /home/warganet/paylist-contract-c2/results/run-review7-20261124-102117.log
+actor responses: /home/warganet/paylist-contract-c2/results/run-review7-20261124-102117/
+RESULT: ALL SCENARIOS BEHAVED AS SPECIFIED
