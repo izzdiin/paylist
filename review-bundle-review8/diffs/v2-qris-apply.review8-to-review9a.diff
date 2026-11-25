@@ -1,0 +1,88 @@
+--- orig/v2-qris_apply.review8.php	2026-11-25 02:24:40.469134707 +0000
++++ fixed/v2-qris_apply.php	2026-11-25 02:24:51.975969839 +0000
+@@ -92,11 +92,18 @@
+     $namaPelanggan  = $pel['nama_pelanggan'];
+     $noHp           = $pel['no_hp'];
+     $emailPelanggan = $pel['email'];
+-    $masaAktifLama  = (int)$pel['masa_aktif'];
+     $usernamePppoe  = $pel['username'];
+-    $statusLama     = $pel['status_pembayaran'];
+     $routerPelanggan = $pel['router'];
+     $layanan        = $prof['layanan'];
++    // status_pembayaran + masa_aktif TIDAK dibaca di sini (perbaikan C2
++    // review #9, P1 points race, 25 Nov 2026): keduanya dibaca ulang di
++    // bawah kunci baris pelanggan di dalam transaksi, agar poin mengikuti
++    // status SEBELUM pembayaran pada saat pelunasan (bukan status yang
++    // bisa sudah berubah sejak baca pra-kunci ini) dan jatuhTempo
++    // konsisten dengan masa_aktif segar. $statusLama / $masaAktifLama /
++    // $masaAktifBaru / $tanggalExpired didefinisikan di blok kunci
++    // pelanggan di bawah; penolakan binding basi keluar sebelum blok itu
++    // dan tidak memakai keempatnya.
+ 
+     // --- Kredensial MikroTik dari tabel router (baris router pelanggan) ---
+     $router = null;
+@@ -106,11 +113,9 @@
+     $router = $rq->get_result()->fetch_assoc();
+     $rq->close();
+ 
+-    // Masa berlaku baru, pola in.php: hari ini + (masa lama + 30) hari.
+-    $masaAktifBaru  = $masaAktifLama + 30;
+-    $dt             = new DateTime();
+-    $dt->modify("+{$masaAktifBaru} days");
+-    $tanggalExpired = $dt->format('Y-m-d');
++    // Masa berlaku baru dihitung di bawah kunci pelanggan di dalam
++    // transaksi (pola in.php: hari ini + (masa lama + 30) hari) — bukan
++    // di sini, agar memakai masa_aktif segar (lihat blok kunci pelanggan).
+     $tanggalBayar   = substr((string)$log['received_at'], 0, 10) ?: date('Y-m-d');
+     $idtrxInv       = str_replace('PRO-', 'INV-', (string)$prof['idtrx']);
+ 
+@@ -223,6 +228,49 @@
+         $idtrxInv = str_replace('PRO-', 'INV-', (string)$profSegar['idtrx']);
+         $layanan = $profSegar['layanan'];
+ 
++        // Kunci baris pelanggan KETIGA dan baca ulang status + masa_aktif
++        // di bawah kuncinya (perbaikan C2 review #9, P1 points race,
++        // 25 Nov 2026): status sebelumnya dibaca TANPA kunci sebelum
++        // transaksi — bila status berubah di antara baca itu dan kunci
++        // ini (mis. cron membalik UNPAID -> ISOLIR), poin diberikan dari
++        // status BASI (10, bukan 5). Poin WAJIB mengikuti status SEBELUM
++        // pembayaran; status yang dibaca di sini adalah status pada saat
++        // pelunasan, sebelum UPDATE di bawah mengubahnya ke PAID.
++        // Masa_aktif dibaca ulang dari baris yang sama agar jatuhTempo
++        // konsisten dengan masa_aktif sesudah UPDATE relatif (+30).
++        // Status PAID tidak ditolak di sini: pelanggan bisa sah melunasi
++        // proforma kedua selagi statusnya sudah PAID dari proforma
++        // pertama — beriPoinPembayaran mengembalikan 0 untuk PAID.
++        //
++        // Urutan kunci: log -> proforma -> pelanggan — seragam di semua
++        // situs apply. Tidak ada entrypoint C2 lain yang mengunci
++        // pelanggan (re-match: log saja; matcher: tanpa kunci; hook
++        // kode-birth: log saja; klaim kode-birth: tagihan saja,
++        // autocommit). Satu-satunya inversi yang diketahui ada di luar
++        // C2: task/servicechange.php mengunci pelanggan dulu lalu
++        // proforma dalam satu transaksi — inversi itu SUDAH ADA sebelum
++        // perbaikan ini (apply lama sudah mengunci pelanggan lewat
++        // UPDATE-nya sambil memegang kunci proforma); perbaikan ini
++        // TIDAK mengubah urutan kunci, hanya memajukan akuisisi kunci
++        // pelanggan. Tabrakan dengan servicechange (operator mengubah
++        // layanan pelanggan yang sama persis saat QRIS-nya dilunasi)
++        // berakhir 1213 -> rollback -> applied=false, baris tetap
++        // matched + bisa dicocokkan ulang (jalur yang sama dengan 1205).
++        $pl = $db->prepare("SELECT status_pembayaran, masa_aktif FROM pelanggan WHERE id_pelanggan = ? FOR UPDATE");
++        $pl->bind_param('i', $idPelanggan);
++        $pl->execute();
++        $pelSegar = $pl->get_result()->fetch_assoc();
++        $pl->close();
++        if (!$pelSegar) {
++            throw new RuntimeException('pelanggan tidak ditemukan (di bawah kunci)');
++        }
++        $statusLama    = $pelSegar['status_pembayaran'];
++        $masaAktifLama = (int)$pelSegar['masa_aktif'];
++        $masaAktifBaru = $masaAktifLama + 30;
++        $dtSegar = new DateTime();
++        $dtSegar->modify("+{$masaAktifBaru} days");
++        $tanggalExpired = $dtSegar->format('Y-m-d');
++
+         $upd = $db->prepare("UPDATE proforma SET status = 'PAID', tanggal_bayar = NOW() WHERE id = ? AND status = 'UNPAID'");
+         $upd->bind_param('i', $proformaId);
+         $upd->execute();

@@ -1,0 +1,57 @@
+[review7 10:19:39] review7 run 20261124-101938 (target=all, rounds=2)
+[review7 10:19:39] amounts: AMT_A=100823 (100000+fee+123), AMT_TWIN=100823 (99900+fee+223)
+[review7 10:19:39] H11-hold-persists [v2] ambiguous row survives retry + rematch + hook
+  PASS: H11 [v2] POST ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [v2] retry still ambiguous (stored) (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [v2] rematch 1 still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [v2] rematch 1 applied=false (expected=False, actual=False)
+  PASS: H11 [v2] rematch 2 still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [v2] rematch 2 applied=false (expected=False, actual=False)
+  PASS: H11 [v2] hook checks 0 rows (ambiguous ignored) (expected=0, actual=0)
+  PASS: H11 [v2] row still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [v2] row unapplied (expected=0, actual=0)
+  PASS: H11 [v2] bills PAID (none settles) (expected=0, actual=0)
+  PASS: H11 [v2] pemasukan rows (expected=0, actual=0)
+  PASS: H11 [v2] rematch_count=2 (both attempts stamped) (expected=2, actual=2)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      527	h11-v2-1	ambiguous	NULL	NULL	0	2	harness-race	ambiguous: 2 kandidat — perlu keputusan operator
+      -- v2 evidence: proforma + pemasukan
+      id	id_pelanggan	status
+      910001	900001	UNPAID
+      910002	900001	UNPAID
+      pemasukan_rows
+      0
+  ==> H11-hold-persists [v2]: PASS (ambiguous survives retry + 2x rematch + hook, 0 effects)
+[review7 10:19:40] H11-hold-persists [wg] ambiguous row survives retry + rematch + hook
+  PASS: H11 [wg] POST ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [wg] retry still ambiguous (stored) (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [wg] rematch 1 still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [wg] rematch 1 applied=false (expected=False, actual=False)
+  PASS: H11 [wg] rematch 2 still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [wg] rematch 2 applied=false (expected=False, actual=False)
+  PASS: H11 [wg] hook checks 0 rows (ambiguous ignored) (expected=0, actual=0)
+  PASS: H11 [wg] row still ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: H11 [wg] row unapplied (expected=0, actual=0)
+  PASS: H11 [wg] bills PAID (none settles) (expected=0, actual=0)
+  PASS: H11 [wg] pemasukan rows (expected=0, actual=0)
+  PASS: H11 [wg] rematch_count=2 (both attempts stamped) (expected=2, actual=2)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	rematch_count	rematched_by	note
+      509	h11-wg-1	ambiguous	NULL	NULL	0	2	harness-race	ambiguous: 2 kandidat — perlu keputusan operator
+      -- wg evidence: payment + pemasukan
+      id	id_pelanggan	status
+      920001	900001	UNPAID
+      920002	900001	UNPAID
+      pemasukan_rows
+      0
+  ==> H11-hold-persists [wg]: PASS (ambiguous survives retry + 2x rematch + hook, 0 effects)
+
+==================== SUMMARY ====================
+  H11-hold-persists [v2]: PASS (ambiguous survives retry + 2x rematch + hook, 0 effects)
+  H11-hold-persists [wg]: PASS (ambiguous survives retry + 2x rematch + hook, 0 effects)
+-------------------------------------------------
+assertions: PASS=24 FAIL=0
+full log: /home/warganet/paylist-contract-c2/results/run-review7-20261124-101938.log
+actor responses: /home/warganet/paylist-contract-c2/results/run-review7-20261124-101938/
+RESULT: ALL SCENARIOS BEHAVED AS SPECIFIED

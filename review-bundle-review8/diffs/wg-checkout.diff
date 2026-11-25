@@ -1,0 +1,67 @@
+--- a/payment/checkout.php
++++ b/payment/checkout.php
+@@ -77,24 +77,42 @@
+         require_once('phpqrcode/qrlib.php');
+         $rowId = (int)$trx['id'];
+         $kodeUnik = ($trx['kode_unik'] !== null) ? (int)$trx['kode_unik'] : null;
++        // Hook kode-birth C2 (§4c): benar hanya bila kode diklaim request ini.
++        $kodeBaruLahir = false;
+         if ($kodeUnik === null) {
+             // Kode unik 3 digit (100-999): terkecil yang tidak sedang
+             // dipakai baris UNPAID lain; penetapan malas yang aman-lomba,
+             // meniru pola bayarQris.php v2New.
++            // Birth-fix (24 Nov 2026): kandidat juga ditolak bila jumlah
++            // akhirnya sama dengan nominal baris UNPAID lain yang sudah
++            // berkode (termasuk top-up mitra — matcher
++            // paylist_find_candidates menghitung semuanya): total berbeda
++            // + kode berbeda bisa berjumlah sama. Rumus nominal sama
++            // dengan paylist_expected_nominal(); $amount sudah (int)
++            // sehingga ceil() di sini identitas.
++            $qrisDasar = $amount + (int)ceil($amount * 0.007);
+             for ($attempt = 0; $attempt < 5 && $kodeUnik === null; $attempt++) {
+-                $usedRes = $conn->query("SELECT DISTINCT kode_unik FROM payment WHERE status = 'UNPAID' AND kode_unik IS NOT NULL");
+                 $used = [];
++                $nominalTerpakai = [];
++                $usedRes = $conn->query("SELECT tagihan, kode_unik FROM payment WHERE status = 'UNPAID' AND kode_unik IS NOT NULL");
+                 if ($usedRes) {
+-                    while ($u = $usedRes->fetch_assoc()) { $used[(int)$u['kode_unik']] = true; }
++                    while ($u = $usedRes->fetch_assoc()) {
++                        $used[(int)$u['kode_unik']] = true;
++                        $dasarNom = (int)ceil((float)$u['tagihan']);
++                        $nominalTerpakai[$dasarNom + (int)ceil($dasarNom * 0.007) + (int)$u['kode_unik']] = true;
++                    }
+                 }
+                 $candidate = null;
+                 for ($c = 100; $c <= 999; $c++) {
+-                    if (!isset($used[$c])) { $candidate = $c; break; }
++                    if (!isset($used[$c]) && !isset($nominalTerpakai[$qrisDasar + $c])) { $candidate = $c; break; }
+                 }
+                 if ($candidate === null) { break; }
+                 $upd = $conn->prepare("UPDATE payment SET kode_unik = ? WHERE id = ? AND kode_unik IS NULL");
+                 $upd->bind_param('ii', $candidate, $rowId);
+                 $upd->execute();
++                // Hook kode-birth C2 (§4c): catat bila klaim ini yang
++                // melahirkan kode (affected_rows > 0).
++                if ($upd->affected_rows > 0) { $kodeBaruLahir = true; }
+                 $upd->close();
+                 $chk = $conn->prepare("SELECT kode_unik FROM payment WHERE id = ?");
+                 $chk->bind_param('i', $rowId);
+@@ -104,6 +122,18 @@
+                 if ($kr && $kr['kode_unik'] !== null) { $kodeUnik = (int)$kr['kode_unik']; }
+             }
+         }
++        // Hook kode-birth C2 (§4c): kode baru saja lahir — bila ada
++        // pembayaran yang datang lebih dulu dan nominalnya kini cocok,
++        // lunasi lewat re-match. Best-effort: kegagalan hook TIDAK BOLEH
++        // merusak render QR (try/catch sendiri di dalam try/catch luar).
++        if ($kodeBaruLahir && $kodeUnik !== null) {
++            try {
++                require_once(__DIR__ . '/../paylist/paylist_match.php');
++                paylist_kode_birth_rematch($conn, $rowId, $kodeUnik);
++            } catch (\Throwable $e) {
++                error_log('C2 kode-birth hook gagal (payment ' . $rowId . '): ' . $e->getMessage());
++            }
++        }
+         if ($kodeUnik !== null) {
+             $qrisFee = (int)ceil($amount * 0.007);
+             $qrisNominal = $amount + $qrisFee + $kodeUnik;

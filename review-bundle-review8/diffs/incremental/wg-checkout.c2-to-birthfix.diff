@@ -1,0 +1,34 @@
+--- a/payment/checkout.php
++++ b/payment/checkout.php
+@@ -83,15 +83,28 @@
+             // Kode unik 3 digit (100-999): terkecil yang tidak sedang
+             // dipakai baris UNPAID lain; penetapan malas yang aman-lomba,
+             // meniru pola bayarQris.php v2New.
++            // Birth-fix (24 Nov 2026): kandidat juga ditolak bila jumlah
++            // akhirnya sama dengan nominal baris UNPAID lain yang sudah
++            // berkode (termasuk top-up mitra — matcher
++            // paylist_find_candidates menghitung semuanya): total berbeda
++            // + kode berbeda bisa berjumlah sama. Rumus nominal sama
++            // dengan paylist_expected_nominal(); $amount sudah (int)
++            // sehingga ceil() di sini identitas.
++            $qrisDasar = $amount + (int)ceil($amount * 0.007);
+             for ($attempt = 0; $attempt < 5 && $kodeUnik === null; $attempt++) {
+-                $usedRes = $conn->query("SELECT DISTINCT kode_unik FROM payment WHERE status = 'UNPAID' AND kode_unik IS NOT NULL");
+                 $used = [];
++                $nominalTerpakai = [];
++                $usedRes = $conn->query("SELECT tagihan, kode_unik FROM payment WHERE status = 'UNPAID' AND kode_unik IS NOT NULL");
+                 if ($usedRes) {
+-                    while ($u = $usedRes->fetch_assoc()) { $used[(int)$u['kode_unik']] = true; }
++                    while ($u = $usedRes->fetch_assoc()) {
++                        $used[(int)$u['kode_unik']] = true;
++                        $dasarNom = (int)ceil((float)$u['tagihan']);
++                        $nominalTerpakai[$dasarNom + (int)ceil($dasarNom * 0.007) + (int)$u['kode_unik']] = true;
++                    }
+                 }
+                 $candidate = null;
+                 for ($c = 100; $c <= 999; $c++) {
+-                    if (!isset($used[$c])) { $candidate = $c; break; }
++                    if (!isset($used[$c]) && !isset($nominalTerpakai[$qrisDasar + $c])) { $candidate = $c; break; }
+                 }
+                 if ($candidate === null) { break; }
+                 $upd = $conn->prepare("UPDATE payment SET kode_unik = ? WHERE id = ? AND kode_unik IS NULL");

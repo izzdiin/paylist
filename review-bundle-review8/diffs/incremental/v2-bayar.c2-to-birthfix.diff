@@ -1,0 +1,58 @@
+--- a/bayar.php
++++ b/bayar.php
+@@ -379,22 +379,39 @@
+     $qrisFee = (int)ceil($qrisBase * 0.007);
+ 
+     // Kode unik QRIS (30 Okt 2026, perintah user): 1..999, unik di antara
+-    // proforma TERBARU tiap pelanggan yang statusnya UNPAID, supaya nominal
+-    // QRIS menunjuk tepat satu tagihan saat dicocokkan dengan notifikasi
+-    // pembayaran masuk. Kode ditugaskan malas (lazy) di sini — satu-satunya
+-    // tempat QR terbayar lahir — lalu tersimpan permanen di
+-    // proforma.kode_unik. Balapan dua request serentak ditangani syarat
+-    // "kode_unik IS NULL" pada UPDATE + baca ulang nilai tersimpan.
++    // SEMUA proforma UNPAID (birth-fix 24 Nov 2026 — sebelumnya hanya
++    // proforma TERBARU tiap pelanggan, sehingga tunggakan lama tidak
++    // terlihat dan tagihan baru bisa lahir dengan kode yang sama),
++    // supaya nominal QRIS menunjuk tepat satu tagihan saat dicocokkan
++    // dengan notifikasi pembayaran masuk. Kandidat juga ditolak bila
++    // jumlah akhirnya (total + fee + kode) sama dengan nominal tagihan
++    // UNPAID lain — total berbeda + kode berbeda bisa berjumlah sama.
++    // Kode ditugaskan malas (lazy) di sini — satu-satunya tempat QR
++    // terbayar lahir — lalu tersimpan permanen di proforma.kode_unik.
++    // Balapan dua request serentak ditangani syarat "kode_unik IS NULL"
++    // pada UPDATE + baca ulang nilai tersimpan.
+     $kodeUnik = (int)($proformaData['kode_unik'] ?? 0);
+     // Hook kode-birth C2 (§4c): benar hanya bila kode diklaim request ini.
+     $kodeBaruLahir = false;
+     if ($kodeUnik <= 0) {
+         for ($percobaan = 0; $percobaan < 5 && $kodeUnik <= 0; $percobaan++) {
++            // Birth-fix (24 Nov 2026): satu query membangun himpunan kode
++            // terpakai DAN himpunan nominal akhir terpakai dari semua
++            // proforma UNPAID yang sudah berkode — cakupan yang sama
++            // dengan kandidat matcher C6 (qris_find_candidates). Rumus
++            // nominal sama dengan qris_expected_nominal().
+             $terpakai = [];
+-            $qUsed = $conn->query("SELECT p.kode_unik FROM proforma p JOIN (SELECT id_pelanggan, MAX(id) AS mid FROM proforma GROUP BY id_pelanggan) terakhir ON terakhir.mid = p.id WHERE p.status = 'UNPAID' AND p.kode_unik IS NOT NULL");
++            $nominalTerpakai = [];
++            $qUsed = $conn->query("SELECT tagihan, addon, biaya_instalasi, pajak, diskon, total_tagihan, kode_unik FROM proforma WHERE status = 'UNPAID' AND kode_unik IS NOT NULL");
+             if ($qUsed) {
+                 while ($rUsed = $qUsed->fetch_assoc()) {
+                     $terpakai[(int)$rUsed['kode_unik']] = true;
++                    $dasarNom = (float)($rUsed['total_tagihan'] ?? 0);
++                    if ($dasarNom <= 0) {
++                        $dasarNom = (float)$rUsed['tagihan'] + (float)$rUsed['addon'] + (float)$rUsed['biaya_instalasi'] + (float)$rUsed['pajak'] - (float)$rUsed['diskon'];
++                    }
++                    $dasarNomInt = (int)ceil($dasarNom);
++                    $nominalTerpakai[$dasarNomInt + (int)ceil($dasarNomInt * 0.007) + (int)$rUsed['kode_unik']] = true;
+                 }
+             }
+             $calon = 0;
+@@ -403,7 +420,7 @@
+             // Kode lama < 100 yang sudah tersimpan TIDAK diubah di sini;
+             // pencocok notifikasi membaca nilai yang tersimpan.
+             for ($k = 100; $k <= 999; $k++) {
+-                if (!isset($terpakai[$k])) {
++                if (!isset($terpakai[$k]) && !isset($nominalTerpakai[$qrisBase + $qrisFee + $k])) {
+                     $calon = $k;
+                     break;
+                 }

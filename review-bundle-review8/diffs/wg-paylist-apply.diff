@@ -1,0 +1,194 @@
+--- a/paylist/paylist_apply.php
++++ b/paylist/paylist_apply.php
+@@ -18,10 +18,83 @@
+ define('PAYLIST_APPLY_TEST_ONLY', false);
+ define('PAYLIST_APPLY_TEST_CUSTOMERS', array(999999997));
+ 
++// Revalidasi binding di bawah kunci (perbaikan C2 review #8, P1 stale
++// match binding, 24 Nov 2026). Dipakai BERSAMA oleh
++// paylist_apply_payment dan paylist_apply_topup, sebagai pernyataan
++// pertama di DALAM transaksi apply (sesudah begin_transaction).
++//
++// Kunci baris log DULU — ini juga perbaikan C2 review #7 (temuan lomba
++// F2-hookrace 24 Nov 2026): apply sebelumnya membaca baris log tanpa
++// kunci lalu baru menulisnya di akhir transaksi; bila aktor re-match
++// mengubah baris yang sama di tengah jalan (stempel rematch_count),
++// MariaDB membatalkan SELURUH transaksi dengan ER_CHECKREAD (1020)
++// "Record has changed since last read". Dengan kunci FOR UPDATE sejak
++// awal, tidak ada modifikasi antar-sela yang mungkin, dan penjaga
++// diperiksa ulang di bawah kunci.
++//
++// Urutan kunci: baris log dulu (FOR UPDATE), lalu baris payment
++// (FOR UPDATE) — seragam di semua entrypoint; tidak ada entrypoint yang
++// mengunci tagihan dulu lalu log, jadi tidak ada siklus deadlock baru.
++//
++// Membandingkan binding SEGAR dari baris log (matched_id_payment,
++// matched_id_pelanggan, amount) dengan pilihan SELEKSI pemanggil (yang
++// dibaca sebelum transaksi); lalu mengunci baris payment segar dan
++// memeriksa status, pelanggan, dan nominal harapan (rumus matcher).
++// Tanpa ini, apply mengklaim payment BASI: klaim atomik hanya gagal bila
++// tagihan lama sudah PAID; bila masih UNPAID, tagihan yang SALAH ikut
++// lunas (celah yang ditunjukkan re-review #8 atas klaim "known-safe
++// edge" §13.5 desain).
++//
++// Kegagalan PENJAGA (log hilang / sudah tidak matched / sudah
++// diterapkan) MELEMPAR seperti sebelumnya — pemanggil me-rollback tanpa
++// menulis catatan (catatan di baris yang sudah diterapkan akan menimpa
++// catatan sukses). Penolakan BINDING BASI dikembalikan sebagai string
++// alasan (dan mengisi $paySegar dengan baris payment segar bila ada);
++// pemanggil menulis catatan penolakan di apply_note + commit, lalu
++// keluar tanpa efek bisnis lain. Mengembalikan NULL bila valid.
++function paylist_revalidate_binding(mysqli $db, $logId, $selPayId, $selPelanggan, $selAmount, &$paySegar) {
++    $paySegar = null;
++    $lock = $db->prepare("SELECT amount, match_status, matched_id_pelanggan, matched_id_payment, applied_at FROM paylist_log WHERE id = ? FOR UPDATE");
++    $lock->bind_param('i', $logId);
++    $lock->execute();
++    $logKunci = $lock->get_result()->fetch_assoc();
++    $lock->close();
++    if (!$logKunci) { throw new Exception('log tidak ditemukan (di bawah kunci)'); }
++    if ($logKunci['match_status'] !== 'matched' || !empty($logKunci['applied_at'])) {
++        throw new Exception('log sudah tidak matched / sudah diterapkan oleh proses lain');
++    }
++    $segarPay = (int)$logKunci['matched_id_payment'];
++    $segarPelanggan = (string)$logKunci['matched_id_pelanggan'];
++    $segarAmount = (int)$logKunci['amount'];
++    if ($segarPay !== (int)$selPayId || $segarPelanggan !== (string)$selPelanggan
++        || ($selAmount !== null && $segarAmount !== (int)$selAmount)) {
++        return 'pilihan payment ' . $selPayId . ' (pelanggan ' . $selPelanggan . ', Rp ' . $selAmount . ') tidak lagi cocok dengan log (payment ' . $segarPay . ', pelanggan ' . $segarPelanggan . ', Rp ' . $segarAmount . ')';
++    }
++    $pf = $db->prepare("SELECT id, idtrx, id_pelanggan, nama_pelanggan, layanan, tagihan, nama_mitra, kode_unik, status FROM payment WHERE id = ? FOR UPDATE");
++    $pf->bind_param('i', $segarPay);
++    $pf->execute();
++    $paySegar = $pf->get_result()->fetch_assoc();
++    $pf->close();
++    if (!$paySegar) { return 'payment ' . $segarPay . ' tidak ditemukan (di bawah kunci)'; }
++    if ($paySegar['status'] === 'PAID') { return 'payment ' . $segarPay . ' sudah PAID'; }
++    if ((string)$paySegar['id_pelanggan'] !== $segarPelanggan) {
++        return 'payment ' . $segarPay . ' milik ' . $paySegar['id_pelanggan'] . ', bukan ' . $segarPelanggan;
++    }
++    if ($paySegar['kode_unik'] === null) { return 'payment ' . $segarPay . ' belum berkode unik'; }
++    if (!function_exists('paylist_expected_nominal')) {
++        require_once __DIR__ . '/paylist_match.php';
++    }
++    $nominalHarapan = paylist_expected_nominal($paySegar['tagihan'], (int)$paySegar['kode_unik']);
++    if ($nominalHarapan !== $segarAmount) {
++        return 'nominal harapan payment ' . $segarPay . ' (Rp ' . $nominalHarapan . ') tidak sama dengan amount log (Rp ' . $segarAmount . ')';
++    }
++    return null;
++}
++
+ function paylist_apply_payment(mysqli $db, $logId) {
+     $out = array('applied' => false, 'note' => '');
+ 
+-    $stmt = $db->prepare("SELECT matched_id_payment, matched_id_pelanggan, match_status, applied_at FROM paylist_log WHERE id = ?");
++    $stmt = $db->prepare("SELECT amount, matched_id_payment, matched_id_pelanggan, match_status, applied_at FROM paylist_log WHERE id = ?");
+     $stmt->bind_param('i', $logId);
+     $stmt->execute();
+     $log = $stmt->get_result()->fetch_assoc();
+@@ -34,7 +107,15 @@
+     if (!empty($log['applied_at'])) { $out['note'] = 'sudah pernah diterapkan'; return $out; }
+ 
+     $payId = (int)$log['matched_id_payment'];
+-    $stmt = $db->prepare("SELECT id, idtrx, id_pelanggan, nama_pelanggan, layanan, tagihan, nama_mitra, status FROM payment WHERE id = ?");
++    // "Seleksi" yang direvalidasi di bawah kunci (review #8, P1 stale
++    // match binding): ketiga nilai ini dibaca TANPA kunci; bila aktor
++    // re-match mengubah binding baris log sebelum kunci transaksi,
++    // nilai segar di bawah kunci akan berbeda — dan apply WAJIB menolak.
++    // matched_id_pelanggan dipertahankan sebagai string: pada baris
++    // top-up nilainya nomor HP mitra (melebihi jangkauan INT 32-bit).
++    $pelangganSel = (string)$log['matched_id_pelanggan'];
++    $amountSel = (int)$log['amount'];
++    $stmt = $db->prepare("SELECT id, idtrx, id_pelanggan, nama_pelanggan, layanan, tagihan, nama_mitra, kode_unik, status FROM payment WHERE id = ?");
+     $stmt->bind_param('i', $payId);
+     $stmt->execute();
+     $pay = $stmt->get_result()->fetch_assoc();
+@@ -87,6 +168,39 @@
+     // ---- Transaksi DB tunggal ----
+     $db->begin_transaction();
+     try {
++        // Revalidasi binding basi (review #8, P1 stale match binding):
++        // kunci baris log dulu, bandingkan binding segar dengan seleksi,
++        // lalu kunci baris payment + revalidasi kelayakan/nominal —
++        // lihat paylist_revalidate_binding(). Urutan kunci seragam
++        // (log dulu, lalu tagihan) di semua entrypoint.
++        $paySegar = null;
++        $tolak = paylist_revalidate_binding($db, $logId, $payId, $pelangganSel, $amountSel, $paySegar);
++        if ($tolak !== null) {
++            // Tolak TANPA efek bisnis: satu-satunya tulisan adalah
++            // catatan penolakan di baris log, di dalam transaksi yang
++            // sama dan di bawah kunci — agar tidak menimpa catatan apply
++            // sukses aktor lain bila ditulis sesudah rollback.
++            $noteTolak = mb_substr('ditolak (binding basi): ' . $tolak, 0, 255);
++            $stmt = $db->prepare("UPDATE paylist_log SET apply_note = ? WHERE id = ?");
++            $stmt->bind_param('si', $noteTolak, $logId);
++            $stmt->execute();
++            $stmt->close();
++            $db->commit();
++            $out['note'] = 'ditolak tanpa efek (binding basi): ' . $tolak;
++            return $out;
++        }
++
++        // Nilai segar di bawah kunci dipakai ke bawah (bukan hasil baca
++        // pra-kunci): idtrx/nama/layanan/tagihan/mitra payment bisa
++        // berubah di antara seleksi dan kunci.
++        $pay = $paySegar;
++        $idPelanggan = $paySegar['id_pelanggan'];
++        $idtrx = $paySegar['idtrx'];
++        $namaPelanggan = $paySegar['nama_pelanggan'];
++        $layanan = $paySegar['layanan'];
++        $tagihan = $paySegar['tagihan'];
++        $namaMitra = $paySegar['nama_mitra'];
++
+         // G4: cegah pemasukan ganda untuk idtrx yang sama
+         $stmt = $db->prepare("SELECT COUNT(*) AS n FROM pemasukan WHERE idtrx = ?");
+         $stmt->bind_param('s', $idtrx);
+@@ -276,8 +390,49 @@
+     $tagihan = (int)$pay['tagihan'];
+     $tanggalBayar = date('Y-m-d H:i:s');
+ 
++    // Seleksi untuk revalidasi (review #8, P1 stale match binding):
++    // nominal harapan dari baris payment pilihan (tagihan + kode_unik);
++    // NULL bila payment belum berkode — perbandingan amount dilewati,
++    // cek baris terkunci di helper tetap menolak.
++    $selAmountTopup = null;
++    if (isset($pay['kode_unik']) && $pay['kode_unik'] !== null) {
++        if (!function_exists('paylist_expected_nominal')) {
++            require_once __DIR__ . '/paylist_match.php';
++        }
++        $selAmountTopup = paylist_expected_nominal($pay['tagihan'], (int)$pay['kode_unik']);
++    }
++
+     $db->begin_transaction();
+     try {
++        // Revalidasi binding basi (review #8, P1 stale match binding) —
++        // cermin paylist_apply_payment di atas. Cabang top-up tidak
++        // membaca baris log sebelumnya, jadi kunci + penjaga + revalidasi
++        // di helper ini satu-satunya pemeriksaan status di jalur ini.
++        $paySegar = null;
++        $tolak = paylist_revalidate_binding($db, $logId, $payId, (string)$noHp, $selAmountTopup, $paySegar);
++        if ($tolak !== null) {
++            // Tolak TANPA efek bisnis: satu-satunya tulisan adalah
++            // catatan penolakan di baris log, di dalam transaksi yang
++            // sama dan di bawah kunci.
++            $noteTolak = mb_substr('ditolak (binding basi): ' . $tolak, 0, 255);
++            $stmt = $db->prepare("UPDATE paylist_log SET apply_note = ? WHERE id = ?");
++            $stmt->bind_param('si', $noteTolak, $logId);
++            $stmt->execute();
++            $stmt->close();
++            $db->commit();
++            $out['note'] = 'ditolak tanpa efek (binding basi): ' . $tolak;
++            return $out;
++        }
++
++        // Nilai segar di bawah kunci dipakai ke bawah (bukan hasil baca
++        // pra-kunci dari paylist_apply_payment).
++        $pay = $paySegar;
++        $payId = (int)$paySegar['id'];
++        $idtrx = $paySegar['idtrx'];
++        $noHp = $paySegar['id_pelanggan'];
++        $namaPelanggan = $paySegar['nama_pelanggan'];
++        $tagihan = (int)$paySegar['tagihan'];
++
+         $metode = 'qris';
+         $stmt = $db->prepare("UPDATE payment SET status = 'PAID', metode = ? WHERE id = ? AND status <> 'PAID'");
+         $stmt->bind_param('si', $metode, $payId);

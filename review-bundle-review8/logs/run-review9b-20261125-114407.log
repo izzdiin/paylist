@@ -1,0 +1,272 @@
+[review9b 11:44:08] review9b run 20261125-114407 (target=all)
+[review9b 11:44:08] amounts: AMT_A=100823 (100000+fee+123); poin_status UNPAID=10 ISOLIR=5 SUSPEND=1; peer layanan Test 20Mbps, tagihan unchanged
+[review9b 11:44:08] F9D-probe-sanity [v2] plain apply via probe-apply.php (no interference)
+  PASS: F9D-sanity [v2] setup: log matched to bill (expected=910001, actual=910001)
+      probe-apply response: {"ok":true,"apply":{"log_id":864,"applied":true,"steps":["proforma 910001 -> PAID","pemasukan INV-TEST-910001 tercatat Rp 100000.00","pelanggan -> PAID, masa_aktif 0 -> 30, jatuhTempo 2026-12-25","poin +10 (status lama UNPAID)"]}}
+  PASS: F9D-sanity [v2] probe ok (expected=True, actual=True)
+  PASS: F9D-sanity [v2] apply applied=true (expected=True, actual=True)
+  PASS: F9D-sanity [v2] bill PAID (expected=PAID, actual=PAID)
+  PASS: F9D-sanity [v2] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F9D-sanity [v2] log applied_at set (expected=1, actual=1)
+  PASS: F9D-sanity [v2] customer status PAID (expected=PAID, actual=PAID)
+  PASS: F9D-sanity [v2] customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: F9D-sanity [v2] customer poin 0->10 (UNPAID, undisturbed) (expected=10, actual=10)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      864	f9d-s-v2-1	matched	900001	910001	1	ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	layanan	tagihan	status
+      910001	900001	Test 10Mbps	100000.00	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	layanan	status_pembayaran	masa_aktif	poin
+      900001	Test 10Mbps	PAID	30	10
+  ==> F9D-probe-sanity [v2] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+[review9b 11:44:09] F9D-lockwait-control [v2] peer holds customer lock, skips invoice lock -> apply must settle, no deadlock
+  PASS: F9D-control [v2] setup: log matched to bill (expected=910001, actual=910001)
+      orchestrator: {"ok":true,"blocked_detected":true,"apply_waited_on_peer":true,"apply_trx_id":18989,"peer_trx_id":18988,"http_code":"200","switch":{"mode":"deadlock","skip_invoice_lock":true},"peer":{"outcome":"committed","errno":0,"message":"committed tanpa kunci tagihan (kontrol)","trx_id":18988,"extra_updated":0},"apply":{"log_id":865,"applied":true,"steps":["proforma 910001 -> PAID","pemasukan INV-TEST-910001 tercatat Rp 100000.00","pelanggan -> PAID, masa_aktif 0 -> 30, jatuhTempo 2026-12-25","poin +10 (status lama UNPAID)"]},"deadlock_file":"\/home\/warganet\/paylist-contract-c2\/results\/run-review9b-2
+  PASS: F9D-control [v2] orchestration ok (expected=True, actual=True)
+  PASS: F9D-control [v2] apply provably blocked on the lock first (expected=True, actual=True)
+  PASS: F9D-control [v2] apply provably waited on the peer customer lock (expected=True, actual=True)
+  PASS: F9D-control [v2] probe HTTP 200 (expected=200, actual=200)
+  PASS: F9D-control [v2] apply applied=true (settles after the peer commits) (expected=True, actual=True)
+  PASS: F9D-control [v2] peer committed (survivor) (expected=committed, actual=committed)
+  PASS: F9D-control [v2] no new deadlock in worker log (0 -> 0) (expected=0, actual=0)
+  PASS: F9D-control [v2] bill PAID (expected=PAID, actual=PAID)
+  PASS: F9D-control [v2] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F9D-control [v2] customer poin 0->10 (expected=10, actual=10)
+  PASS: F9D-control [v2] peer effect visible: customer layanan Test 20Mbps (expected=Test 20Mbps, actual=Test 20Mbps)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      865	f9d-c-v2-1	matched	900001	910001	1	ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	layanan	tagihan	status
+      910001	900001	Test 10Mbps	100000.00	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	layanan	status_pembayaran	masa_aktif	poin
+      900001	Test 20Mbps	PAID	30	10
+  ==> F9D-control [v2] customer lock alone is not a deadlock: PASS (apply waited, then settled; zero new 1213)
+[review9b 11:44:11] F9D-deadlock [v2] forced 1213: apply (log->bill->customer) vs peer (customer->bill)
+  PASS: F9D-deadlock [v2] setup: log matched to bill (expected=910001, actual=910001)
+  PASS: F9D-deadlock [v2] setup: bill UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F9D-deadlock [v2] setup: customer UNPAID, masa 0, poin 0 (expected=UNPAID|0|0, actual=UNPAID|0|0)
+  PASS: F9D-deadlock [v2] setup: log apply_note NULL (expected=1, actual=1)
+  PASS: F9D-deadlock [v2] setup: 4 dummy customers seeded (expected=4, actual=4)
+      orchestrator: {"ok":true,"blocked_detected":true,"apply_waited_on_peer":true,"apply_trx_id":19018,"peer_trx_id":19017,"http_code":"200","switch":{"mode":"deadlock","skip_invoice_lock":false},"peer":{"outcome":"committed","errno":0,"message":"committed sesudah deadlock","trx_id":19017,"extra_updated":4,"bill_updated":true},"apply":{"log_id":866,"applied":false,"steps":["GAGAL transaksi, rollback: Deadlock found when trying to get lock; try restarting transaction"]},"deadlock_file":"\/home\/warganet\/paylist-contract-c2\/results\/run-review9b-20261125-114407\/f9d-d-v2.innodb-deadlock.txt","raw":"{\"ok\":true,\"apply\":{\"log_id\":866,\"applied\":false,\"steps\":[\"GAGAL transaksi, rollback: Deadlock found when trying to get lock; try restarting transaction\"]}}"}
+  PASS: F9D-deadlock [v2] orchestration ok (expected=True, actual=True)
+  PASS: F9D-deadlock [v2] apply provably blocked on the log lock first (expected=True, actual=True)
+  PASS: F9D-deadlock [v2] apply provably waited on the peer customer lock (expected=True, actual=True)
+  PASS: F9D-deadlock [v2] probe HTTP 200 (expected=200, actual=200)
+  PASS: F9D-deadlock [v2] apply applied=false (victim) (expected=False, actual=False)
+  PASS: F9D-deadlock [v2] apply reports its transaction rolled back (matches /GAGAL transaksi, rollback/: GAGAL transaksi, rollback: Deadlock found when trying to get lock; try restarting transaction)
+  PASS: F9D-deadlock [v2] peer committed (survivor, not victim) (expected=committed, actual=committed)
+  PASS: F9D-deadlock [v2] peer errno 0 (no 1213 on the survivor) (expected=0, actual=0)
+  PASS: F9D-deadlock [v2] peer locked 4 dummy customers (weight) (expected=4, actual=4)
+  PASS: F9D-deadlock [v2] InnoDB reports LATEST DETECTED DEADLOCK (found /LATEST DETECTED DEADLOCK/ in f9d-d-v2.innodb-deadlock.txt)
+  PASS: F9D-deadlock [v2] InnoDB rolled back one transaction (found /WE ROLL BACK TRANSACTION/ in f9d-d-v2.innodb-deadlock.txt)
+  PASS: F9D-deadlock [v2] InnoDB rolled back a transaction (found /WE ROLL BACK TRANSACTION \([0-9]+\)/ in f9d-d-v2.innodb-deadlock.txt)
+  PASS: F9D-deadlock [v2] deadlock section shows the apply waiting on pelanggan (found /FROM pelanggan WHERE id_pelanggan/ in f9d-d-v2.innodb-deadlock.txt)
+  PASS: F9D-deadlock [v2] deadlock section shows the peer waiting on the bill lock (found /UPDATE proforma SET layanan/ in f9d-d-v2.innodb-deadlock.txt)
+  PASS: F9D-deadlock [v2] apply names the deadlock itself (ER 1213 in its own text) (matches /Deadlock found/: GAGAL transaksi, rollback: Deadlock found when trying to get lock; try restarting transaction)
+      deadlock section: LATEST DETECTED DEADLOCK ------------------------ 2026-11-25 11:44:12 0x7fa8f00e56c0 *** (1) TRANSACTION: TRANSACTION 19017, ACTIVE 0 sec starting index read mysql tables in use 1, locked 1 LOCK WAIT 5 lock struct(s), heap size 1120, 7 row lock(s), undo log entries 5 MariaDB thread id 1328, OS thread handle 140363558704832, query id 8632 localhost root Updating UPDATE proforma SET layanan = ?, tagihan = ? WHERE id_pelanggan = ? AND DATE_FORMAT(tanggal_terbit, '%Y-%m') = ? *** WAITING FOR THIS LOCK TO BE GRANTED: RECORD LOCKS space id 9 page no 3 n bits 320 index PRIMARY of table `paylist_contract_v2`.`proforma` trx id 19017 lock_mode X locks rec but not gap waiting Record lock, heap no 2 PHYSICAL RECORD: n_fields 19; compact format; info bits 0  0: len 4; hex 800de2b1; asc     ;;  1: len 6; hex 000000004a3c; asc     J<;;  2: len 7; hex 640000002f0110; asc d   /  ;;  3: len 15; hex 50524f
+      F9D-deadlock [v2] worker log Deadlock found count: 0 -> 0 (stays 0; see note above)
+  PASS: F9D-deadlock [v2] bill still UNPAID (no settlement) (expected=UNPAID, actual=UNPAID)
+  PASS: F9D-deadlock [v2] pemasukan rows still 0 (expected=0, actual=0)
+  PASS: F9D-deadlock [v2] customer status still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F9D-deadlock [v2] customer masa_aktif still 0 (expected=0, actual=0)
+  PASS: F9D-deadlock [v2] customer poin still 0 (expected=0, actual=0)
+  PASS: F9D-deadlock [v2] log still matched (expected=matched, actual=matched)
+  PASS: F9D-deadlock [v2] log still matched to the same bill (expected=910001, actual=910001)
+  PASS: F9D-deadlock [v2] log applied_at still NULL (expected=1, actual=1)
+  PASS: F9D-deadlock [v2] log apply_note still NULL (no failure note written) (expected=1, actual=1)
+  PASS: F9D-deadlock [v2] survivor: customer layanan Test 20Mbps (peer committed) (expected=Test 20Mbps, actual=Test 20Mbps)
+  PASS: F9D-deadlock [v2] survivor: bill layanan Test 20Mbps (peer committed) (expected=Test 20Mbps, actual=Test 20Mbps)
+  PASS: F9D-deadlock [v2] survivor: bill tagihan unchanged (100000) (expected=100000, actual=100000)
+  PASS: F9D-deadlock [v2] survivor: 4 dummies layanan Test 20Mbps (peer committed) (expected=4, actual=4)
+  PASS: F9D-deadlock [v2] survivor: dummies status/masa/poin untouched (expected=4, actual=4)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      866	f9d-d-v2-1	matched	900001	910001	0	
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	layanan	tagihan	status
+      910001	900001	Test 20Mbps	100000.00	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	layanan	status_pembayaran	masa_aktif	poin
+      900001	Test 20Mbps	UNPAID	0	0
+      900002	Test 20Mbps	UNPAID	0	0
+      900003	Test 20Mbps	UNPAID	0	0
+      900004	Test 20Mbps	UNPAID	0	0
+      900005	Test 20Mbps	UNPAID	0	0
+[review9b 11:44:14] F9D-deadlock [v2] recoverability: re-apply the same log
+      re-apply response: {"ok":true,"apply":{"log_id":866,"applied":true,"steps":["proforma 910001 -> PAID","pemasukan INV-TEST-910001 tercatat Rp 100000.00","pelanggan -> PAID, masa_aktif 0 -> 30, jatuhTempo 2026-12-25","poin +10 (status lama UNPAID)"]}}
+  PASS: F9D-deadlock [v2] re-apply probe ok (expected=True, actual=True)
+  PASS: F9D-deadlock [v2] re-apply applied=true (expected=True, actual=True)
+  PASS: F9D-deadlock [v2] re-apply: bill PAID (expected=PAID, actual=PAID)
+  PASS: F9D-deadlock [v2] re-apply: pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F9D-deadlock [v2] re-apply: log applied_at set (expected=1, actual=1)
+  PASS: F9D-deadlock [v2] re-apply: customer status PAID (expected=PAID, actual=PAID)
+  PASS: F9D-deadlock [v2] re-apply: customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: F9D-deadlock [v2] re-apply: customer poin 0->10 (UNPAID) (expected=10, actual=10)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      866	f9d-d-v2-1	matched	900001	910001	1	ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	layanan	tagihan	status
+      910001	900001	Test 20Mbps	100000.00	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	layanan	status_pembayaran	masa_aktif	poin
+      900001	Test 20Mbps	PAID	30	10
+      900002	Test 20Mbps	UNPAID	0	0
+      900003	Test 20Mbps	UNPAID	0	0
+      900004	Test 20Mbps	UNPAID	0	0
+      900005	Test 20Mbps	UNPAID	0	0
+  ==> F9D-deadlock [v2] forced 1213, full rollback, recoverable: PASS (victim 1213 + full rollback + survivor committed + re-apply succeeded)
+[review9b 11:44:15] F9D-probe-sanity [wg] plain apply via probe-apply.php (no interference)
+  PASS: F9D-sanity [wg] setup: log matched to bill (expected=920001, actual=920001)
+      probe-apply response: {"ok":true,"apply":{"applied":true,"note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)"}}
+  PASS: F9D-sanity [wg] probe ok (expected=True, actual=True)
+  PASS: F9D-sanity [wg] apply applied=true (expected=True, actual=True)
+  PASS: F9D-sanity [wg] bill PAID (expected=PAID, actual=PAID)
+  PASS: F9D-sanity [wg] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F9D-sanity [wg] log applied_at set (expected=1, actual=1)
+  PASS: F9D-sanity [wg] customer status PAID (expected=PAID, actual=PAID)
+  PASS: F9D-sanity [wg] customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: F9D-sanity [wg] customer poin 0->10 (UNPAID, undisturbed) (expected=10, actual=10)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      843	f9d-s-wg-1	matched	900001	920001	1	lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	layanan	tagihan	status
+      920001	900001	Test 10Mbps	100000.00	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	layanan	status_pembayaran	masa_aktif	poin
+      900001	Test 10Mbps	PAID	30	10
+      report_rows
+      1
+  ==> F9D-probe-sanity [wg] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+[review9b 11:44:17] F9D-lockwait-control [wg] peer holds customer lock, skips invoice lock -> apply must settle, no deadlock
+  PASS: F9D-control [wg] setup: log matched to bill (expected=920001, actual=920001)
+      orchestrator: {"ok":true,"blocked_detected":true,"apply_waited_on_peer":true,"apply_trx_id":19073,"peer_trx_id":19072,"http_code":"200","switch":{"mode":"deadlock","skip_invoice_lock":true},"peer":{"outcome":"committed","errno":0,"message":"committed tanpa kunci tagihan (kontrol)","trx_id":19072,"extra_updated":0},"apply":{"applied":true,"note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)"},"deadlock_file":"\/home\/warganet\/paylist-contract-c2\/results\/run-review9b-20261125-114407\/f9d-c-wg.innodb-deadlock.txt","raw":"{\"ok\":true,\"apply\":{\"applied\":true,\"note\":\"lunas via Paylist (pay
+  PASS: F9D-control [wg] orchestration ok (expected=True, actual=True)
+  PASS: F9D-control [wg] apply provably blocked on the lock first (expected=True, actual=True)
+  PASS: F9D-control [wg] apply provably waited on the peer customer lock (expected=True, actual=True)
+  PASS: F9D-control [wg] probe HTTP 200 (expected=200, actual=200)
+  PASS: F9D-control [wg] apply applied=true (settles after the peer commits) (expected=True, actual=True)
+  PASS: F9D-control [wg] peer committed (survivor) (expected=committed, actual=committed)
+  PASS: F9D-control [wg] no new deadlock in worker log (0 -> 0) (expected=0, actual=0)
+  PASS: F9D-control [wg] bill PAID (expected=PAID, actual=PAID)
+  PASS: F9D-control [wg] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F9D-control [wg] customer poin 0->10 (expected=10, actual=10)
+  PASS: F9D-control [wg] peer effect visible: customer layanan Test 20Mbps (expected=Test 20Mbps, actual=Test 20Mbps)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      844	f9d-c-wg-1	matched	900001	920001	1	lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	layanan	tagihan	status
+      920001	900001	Test 10Mbps	100000.00	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	layanan	status_pembayaran	masa_aktif	poin
+      900001	Test 20Mbps	PAID	30	10
+      report_rows
+      1
+  ==> F9D-control [wg] customer lock alone is not a deadlock: PASS (apply waited, then settled; zero new 1213)
+[review9b 11:44:19] F9D-deadlock [wg] forced 1213: apply (log->bill->customer) vs peer (customer->bill)
+  PASS: F9D-deadlock [wg] setup: log matched to bill (expected=920001, actual=920001)
+  PASS: F9D-deadlock [wg] setup: bill UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F9D-deadlock [wg] setup: customer UNPAID, masa 0, poin 0 (expected=UNPAID|0|0, actual=UNPAID|0|0)
+  PASS: F9D-deadlock [wg] setup: log apply_note NULL (expected=1, actual=1)
+  PASS: F9D-deadlock [wg] setup: 4 dummy customers seeded (expected=4, actual=4)
+      orchestrator: {"ok":true,"blocked_detected":true,"apply_waited_on_peer":true,"apply_trx_id":19121,"peer_trx_id":19120,"http_code":"200","switch":{"mode":"deadlock","skip_invoice_lock":false},"peer":{"outcome":"committed","errno":0,"message":"committed sesudah deadlock","trx_id":19120,"extra_updated":4,"bill_updated":true},"apply":{"applied":false,"note":"gagal: Deadlock found when trying to get lock; try restarting transaction"},"deadlock_file":"\/home\/warganet\/paylist-contract-c2\/results\/run-review9b-20261125-114407\/f9d-d-wg.innodb-deadlock.txt","raw":"{\"ok\":true,\"apply\":{\"applied\":false,\"note\":\"gagal: Deadlock found when trying to get lock; try restarting transaction\"}}"}
+  PASS: F9D-deadlock [wg] orchestration ok (expected=True, actual=True)
+  PASS: F9D-deadlock [wg] apply provably blocked on the log lock first (expected=True, actual=True)
+  PASS: F9D-deadlock [wg] apply provably waited on the peer customer lock (expected=True, actual=True)
+  PASS: F9D-deadlock [wg] probe HTTP 200 (expected=200, actual=200)
+  PASS: F9D-deadlock [wg] apply applied=false (victim) (expected=False, actual=False)
+  PASS: F9D-deadlock [wg] apply reports its transaction rolled back (matches /gagal: /: gagal: Deadlock found when trying to get lock; try restarting transaction)
+  PASS: F9D-deadlock [wg] peer committed (survivor, not victim) (expected=committed, actual=committed)
+  PASS: F9D-deadlock [wg] peer errno 0 (no 1213 on the survivor) (expected=0, actual=0)
+  PASS: F9D-deadlock [wg] peer locked 4 dummy customers (weight) (expected=4, actual=4)
+  PASS: F9D-deadlock [wg] InnoDB reports LATEST DETECTED DEADLOCK (found /LATEST DETECTED DEADLOCK/ in f9d-d-wg.innodb-deadlock.txt)
+  PASS: F9D-deadlock [wg] InnoDB rolled back one transaction (found /WE ROLL BACK TRANSACTION/ in f9d-d-wg.innodb-deadlock.txt)
+  PASS: F9D-deadlock [wg] InnoDB rolled back a transaction (found /WE ROLL BACK TRANSACTION \([0-9]+\)/ in f9d-d-wg.innodb-deadlock.txt)
+  PASS: F9D-deadlock [wg] deadlock section shows the apply waiting on pelanggan (found /FROM pelanggan WHERE id_pelanggan/ in f9d-d-wg.innodb-deadlock.txt)
+  PASS: F9D-deadlock [wg] deadlock section shows the peer waiting on the bill lock (found /UPDATE payment SET layanan/ in f9d-d-wg.innodb-deadlock.txt)
+  PASS: F9D-deadlock [wg] apply names the deadlock itself (ER 1213 in its own text) (matches /Deadlock found/: gagal: Deadlock found when trying to get lock; try restarting transaction)
+      deadlock section: LATEST DETECTED DEADLOCK ------------------------ 2026-11-25 11:44:20 0x7fa8f004f6c0 *** (1) TRANSACTION: TRANSACTION 19120, ACTIVE 0 sec starting index read mysql tables in use 1, locked 1 LOCK WAIT 4 lock struct(s), heap size 1120, 6 row lock(s), undo log entries 5 MariaDB thread id 1409, OS thread handle 140363558090432, query id 9043 localhost root Updating UPDATE payment SET layanan = ?, tagihan = ? WHERE id = ? *** WAITING FOR THIS LOCK TO BE GRANTED: RECORD LOCKS space id 16 page no 3 n bits 320 index PRIMARY of table `paylist_contract_wg`.`payment` trx id 19120 lock_mode X locks rec but not gap waiting Record lock, heap no 2 PHYSICAL RECORD: n_fields 14; compact format; info bits 0  0: len 4; hex 800e09c1; asc     ;;  1: len 6; hex 000000004aa3; asc     J ;;  2: len 7; hex 1f000000330110; asc     3  ;;  3: len 18; hex 556a69204b6f6e7472616b20393030303031; asc Uji Kontrak 900001;;
+      F9D-deadlock [wg] worker log Deadlock found count: 0 -> 0 (stays 0; see note above)
+  PASS: F9D-deadlock [wg] bill still UNPAID (no settlement) (expected=UNPAID, actual=UNPAID)
+  PASS: F9D-deadlock [wg] pemasukan rows still 0 (expected=0, actual=0)
+  PASS: F9D-deadlock [wg] customer status still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F9D-deadlock [wg] customer masa_aktif still 0 (expected=0, actual=0)
+  PASS: F9D-deadlock [wg] customer poin still 0 (expected=0, actual=0)
+  PASS: F9D-deadlock [wg] log still matched (expected=matched, actual=matched)
+  PASS: F9D-deadlock [wg] log still matched to the same bill (expected=920001, actual=920001)
+  PASS: F9D-deadlock [wg] log applied_at still NULL (expected=1, actual=1)
+  PASS: F9D-deadlock [wg] log apply_note still NULL (no failure note written) (expected=1, actual=1)
+  PASS: F9D-deadlock [wg] survivor: customer layanan Test 20Mbps (peer committed) (expected=Test 20Mbps, actual=Test 20Mbps)
+  PASS: F9D-deadlock [wg] survivor: bill layanan Test 20Mbps (peer committed) (expected=Test 20Mbps, actual=Test 20Mbps)
+  PASS: F9D-deadlock [wg] survivor: bill tagihan unchanged (100000) (expected=100000, actual=100000)
+  PASS: F9D-deadlock [wg] survivor: 4 dummies layanan Test 20Mbps (peer committed) (expected=4, actual=4)
+  PASS: F9D-deadlock [wg] survivor: dummies status/masa/poin untouched (expected=4, actual=4)
+  PASS: F9D-deadlock [wg] report rows still 0 (no WA sent by the victim) (expected=0, actual=0)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      845	f9d-d-wg-1	matched	900001	920001	0	
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	layanan	tagihan	status
+      920001	900001	Test 20Mbps	100000.00	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	layanan	status_pembayaran	masa_aktif	poin
+      900001	Test 20Mbps	UNPAID	0	0
+      900002	Test 20Mbps	UNPAID	0	0
+      900003	Test 20Mbps	UNPAID	0	0
+      900004	Test 20Mbps	UNPAID	0	0
+      900005	Test 20Mbps	UNPAID	0	0
+      report_rows
+      0
+[review9b 11:44:23] F9D-deadlock [wg] recoverability: re-apply the same log
+      re-apply response: {"ok":true,"apply":{"applied":true,"note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)"}}
+  PASS: F9D-deadlock [wg] re-apply probe ok (expected=True, actual=True)
+  PASS: F9D-deadlock [wg] re-apply applied=true (expected=True, actual=True)
+  PASS: F9D-deadlock [wg] re-apply: bill PAID (expected=PAID, actual=PAID)
+  PASS: F9D-deadlock [wg] re-apply: pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F9D-deadlock [wg] re-apply: log applied_at set (expected=1, actual=1)
+  PASS: F9D-deadlock [wg] re-apply: customer status PAID (expected=PAID, actual=PAID)
+  PASS: F9D-deadlock [wg] re-apply: customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: F9D-deadlock [wg] re-apply: customer poin 0->10 (UNPAID) (expected=10, actual=10)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      845	f9d-d-wg-1	matched	900001	920001	1	lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	layanan	tagihan	status
+      920001	900001	Test 20Mbps	100000.00	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	layanan	status_pembayaran	masa_aktif	poin
+      900001	Test 20Mbps	PAID	30	10
+      900002	Test 20Mbps	UNPAID	0	0
+      900003	Test 20Mbps	UNPAID	0	0
+      900004	Test 20Mbps	UNPAID	0	0
+      900005	Test 20Mbps	UNPAID	0	0
+      report_rows
+      1
+  ==> F9D-deadlock [wg] forced 1213, full rollback, recoverable: PASS (victim 1213 + full rollback + survivor committed + re-apply succeeded)
+
+==================== SUMMARY ====================
+  F9D-probe-sanity [v2] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+  F9D-control [v2] customer lock alone is not a deadlock: PASS (apply waited, then settled; zero new 1213)
+  F9D-deadlock [v2] forced 1213, full rollback, recoverable: PASS (victim 1213 + full rollback + survivor committed + re-apply succeeded)
+  F9D-probe-sanity [wg] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+  F9D-control [wg] customer lock alone is not a deadlock: PASS (apply waited, then settled; zero new 1213)
+  F9D-deadlock [wg] forced 1213, full rollback, recoverable: PASS (victim 1213 + full rollback + survivor committed + re-apply succeeded)
+-------------------------------------------------
+assertions: PASS=127 FAIL=0
+full log: /home/warganet/paylist-contract-c2/results/run-review9b-20261125-114407.log
+actor responses: /home/warganet/paylist-contract-c2/results/run-review9b-20261125-114407/
+RESULT: ALL SCENARIOS BEHAVED AS SPECIFIED
