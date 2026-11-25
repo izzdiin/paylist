@@ -1,0 +1,90 @@
+--- orig/stale-orchestrator.review8.php	2026-11-25 02:24:40.481619333 +0000
++++ fixed/stale-orchestrator.php	2026-11-25 02:26:07.486799066 +0000
+@@ -17,12 +17,17 @@
+ //   3. Selagi apply terblokir, T mengubah binding baris log
+ //      (mode=bill: matched_id_* ke kandidat lain — persis kolom yang
+ //      ditulis transisi re-match; mode=nominal: total tagihan diubah
+-//      sehingga nominal harapan tidak lagi cocok; mode=lockwait: tidak
+-//      mengubah apa-apa, hanya menahan kunci melewati batas timeout
+-//      apply untuk memicu 1205), lalu COMMIT.
++//      sehingga nominal harapan tidak lagi cocok; mode=status: status
++//      pelanggan dibalik UNPAID -> ISOLIR — persis yang dilakukan cron
++//      status saat masa_aktif habis; mode=lockwait: tidak mengubah
++//      apa-apa, hanya menahan kunci melewati batas timeout apply untuk
++//      memicu 1205), lalu COMMIT.
+ //   4. Apply melanjutkan dengan binding segar di bawah kunci — dan
+ //      harus MENOLAK (perbaikan review #8) atau terbukti melunasi
+-//      tagihan basi (kode pra-perbaikan).
++//      tagihan basi (kode pra-perbaikan). Untuk mode=status, apply
++//      harus MELUNASI dengan poin dari status SEGAR (ISOLIR -> 5),
++//      bukan dari status pra-kunci (UNPAID -> 10); kode pra-perbaikan
++//      review #9 terbukti memberi 10.
+ //
+ // Urutan program apply menjamin baca seleksi sudah selesai saat kunci
+ // ditunggu (kunci adalah pernyataan pertama transaksi; baca seleksi
+@@ -39,10 +44,11 @@
+ // Penggunaan (dipanggil run-review8.sh; jangan dipakai manual tanpa
+ // memahami stack scratch):
+ //   php stale-orchestrator.php --target v2|wg --cnf PATH --db-name DB
+-//     --log-id N --probe-url URL --mode bill|nominal|lockwait
++//     --log-id N --probe-url URL --mode bill|nominal|status|lockwait
+ //     --resp-file PATH --code-file PATH
+ //     [--switch-bill M --switch-customer C]   (mode=bill)
+ //     [--bill-id B --switch-total T]          (mode=nominal)
++//     [--switch-customer C --switch-status S] (mode=status)
+ //     [--hold-seconds S]                      (mode=lockwait)
+ //     [--probe-lock-wait-timeout N]           (lock_wait_timeout sesi apply)
+ 
+@@ -55,13 +61,13 @@
+ $opts = getopt('', [
+     'target:', 'cnf:', 'db-name:', 'log-id:', 'probe-url:', 'mode:',
+     'resp-file:', 'code-file:', 'switch-bill:', 'switch-customer:',
+-    'bill-id:', 'switch-total:', 'hold-seconds:',
++    'switch-status:', 'bill-id:', 'switch-total:', 'hold-seconds:',
+     'probe-lock-wait-timeout:',
+ ]);
+ $target = $opts['target'] ?? '';
+ if (!in_array($target, ['v2', 'wg'], true)) { fail('target harus v2|wg'); }
+ $mode = $opts['mode'] ?? '';
+-if (!in_array($mode, ['bill', 'nominal', 'lockwait'], true)) { fail('mode harus bill|nominal|lockwait'); }
++if (!in_array($mode, ['bill', 'nominal', 'status', 'lockwait'], true)) { fail('mode harus bill|nominal|status|lockwait'); }
+ $logId = (int)($opts['log-id'] ?? 0);
+ if ($logId <= 0) { fail('log-id tidak valid'); }
+ $cnf = $opts['cnf'] ?? '';
+@@ -79,6 +85,9 @@
+ if ($mode === 'nominal' && (empty($opts['bill-id']) || !isset($opts['switch-total']))) {
+     fail('mode=nominal butuh bill-id + switch-total');
+ }
++if ($mode === 'status' && (empty($opts['switch-customer']) || empty($opts['switch-status']))) {
++    fail('mode=status butuh switch-customer + switch-status');
++}
+ $holdSeconds = (int)($opts['hold-seconds'] ?? 5);
+ $probeLwt = (int)($opts['probe-lock-wait-timeout'] ?? 0);
+ 
+@@ -185,6 +194,26 @@
+         $up->close();
+         $switch['bill'] = $bb;
+         $switch['new_total'] = $nt;
++    } elseif ($mode === 'status') {
++        $sc = (string)$opts['switch-customer'];
++        $ss = (string)$opts['switch-status'];
++        // Pembalikan status pelanggan di tengah apply — persis yang
++        // dilakukan cron status (v2 cron/cronetter.php, wg
++        // cron/status.php: UPDATE pelanggan SET status_pembayaran =
++        // 'ISOLIR' ...) saat masa_aktif habis. UPDATE berjalan di dalam
++        // transaksi T yang memegang kunci log: apply yang terblokir pada
++        // kunci log belum bisa memperoleh kunci pelanggan, jadi
++        // perubahan ini mendarat SESUDAH baca pra-kunci apply (selesai
++        // sebelum apply terblokir — urutan program) dan SEBELUM baca
++        // status di bawah kunci pelanggan (perbaikan review #9).
++        // Bind string untuk id_pelanggan: kolomnya INT di v2 dan
++        // VARCHAR di wg; MySQL mengoersi string numerik untuk INT.
++        $up = $db->prepare("UPDATE pelanggan SET status_pembayaran = ? WHERE id_pelanggan = ?");
++        $up->bind_param('ss', $ss, $sc);
++        $up->execute();
++        $up->close();
++        $switch['customer'] = $sc;
++        $switch['new_status'] = $ss;
+     } else { // lockwait: tahan kunci melewati timeout apply
+         sleep($holdSeconds);
+         $switch['held_seconds'] = $holdSeconds;

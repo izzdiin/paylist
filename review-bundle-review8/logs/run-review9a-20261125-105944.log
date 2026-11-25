@@ -1,0 +1,110 @@
+[review9a 10:59:45] review9a run 20261125-105944 (target=all)
+[review9a 10:59:45] amounts: AMT_A=100823 (100000+fee+123); poin_status UNPAID=10 ISOLIR=5 SUSPEND=1
+[review9a 10:59:45] F9-probe-sanity [v2] plain apply via probe-apply.php (no interference)
+  PASS: F9-sanity [v2] setup: log matched to bill (expected=910001, actual=910001)
+      probe-apply response: {"ok":true,"apply":{"log_id":859,"applied":true,"steps":["proforma 910001 -> PAID","pemasukan INV-TEST-910001 tercatat Rp 100000.00","pelanggan -> PAID, masa_aktif 0 -> 30, jatuhTempo 2026-12-25","poin +10 (status lama UNPAID)"]}}
+  PASS: F9-sanity [v2] probe ok (expected=True, actual=True)
+  PASS: F9-sanity [v2] apply applied=true (expected=True, actual=True)
+  PASS: F9-sanity [v2] bill PAID (expected=PAID, actual=PAID)
+  PASS: F9-sanity [v2] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F9-sanity [v2] log applied_at set (expected=1, actual=1)
+  PASS: F9-sanity [v2] customer status PAID (expected=PAID, actual=PAID)
+  PASS: F9-sanity [v2] customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: F9-sanity [v2] customer poin 0->10 (UNPAID, undisturbed) (expected=10, actual=10)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      859	f9s-v2-1	matched	900001	910001	1	ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> F9-probe-sanity [v2] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+[review9a 10:59:46] F9-points-race [v2] status flipped UNPAID -> ISOLIR while apply is blocked on the log lock (cron flip)
+  PASS: F9-points-race [v2] setup: log matched to bill (expected=910001, actual=910001)
+  PASS: F9-points-race [v2] setup: customer UNPAID before the flip (expected=UNPAID, actual=UNPAID)
+      orchestrator: {"ok":true,"blocked_detected":true,"http_code":"200","switch":{"mode":"status","customer":"900001","new_status":"ISOLIR"},"apply":{"log_id":860,"applied":true,"steps":["proforma 910001 -> PAID","pemasukan INV-TEST-910001 tercatat Rp 100000.00","pelanggan -> PAID, masa_aktif 0 -> 30, jatuhTempo 2026-12-25","poin +5 (status lama ISOLIR)"]},"raw":"{\"ok\":true,\"apply\":{\"log_id\":860,\"applied\":true,\"steps\":[\"proforma 910001 -> PAID\",\"pemasukan INV-TEST-910001 tercatat Rp 100000.00\",\"pelanggan -> PAID, masa_aktif 0 -> 30, jatuhTempo 2026-12-25\",\"poin +5 (status lama ISOLIR)\"]}}"}
+  PASS: F9-points-race [v2] orchestration ok (expected=True, actual=True)
+  PASS: F9-points-race [v2] apply provably blocked on the lock first (expected=True, actual=True)
+  PASS: F9-points-race [v2] probe HTTP 200 (expected=200, actual=200)
+  PASS: F9-points-race [v2] apply applied=true (settles; only the points basis changes) (expected=True, actual=True)
+  PASS: F9-points-race [v2] apply names the fresh status (ISOLIR) (matches /status lama ISOLIR/: proforma 910001 -> PAID; pemasukan INV-TEST-910001 tercatat Rp 100000.00; pelanggan -> PAID, masa_aktif 0 -> 30, jatuhTempo 2026-12-25; poin +5 (status lama ISOLIR))
+  PASS: F9-points-race [v2] bill PAID (expected=PAID, actual=PAID)
+  PASS: F9-points-race [v2] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F9-points-race [v2] log applied_at set (expected=1, actual=1)
+  PASS: F9-points-race [v2] log still matched to the same bill (expected=910001, actual=910001)
+  PASS: F9-points-race [v2] customer status PAID (expected=PAID, actual=PAID)
+  PASS: F9-points-race [v2] customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: F9-points-race [v2] customer poin 0->5 (ISOLIR under lock, NOT 10 from stale UNPAID) (expected=5, actual=5)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      860	f9p-v2-1	matched	900001	910001	1	ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	5
+  ==> F9-points-race [v2] points from locked status: PASS (settled with 5 points from the fresh ISOLIR status)
+[review9a 10:59:48] F9-probe-sanity [wg] plain apply via probe-apply.php (no interference)
+  PASS: F9-sanity [wg] setup: log matched to bill (expected=920001, actual=920001)
+      probe-apply response: {"ok":true,"apply":{"applied":true,"note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)"}}
+  PASS: F9-sanity [wg] probe ok (expected=True, actual=True)
+  PASS: F9-sanity [wg] apply applied=true (expected=True, actual=True)
+  PASS: F9-sanity [wg] bill PAID (expected=PAID, actual=PAID)
+  PASS: F9-sanity [wg] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F9-sanity [wg] log applied_at set (expected=1, actual=1)
+  PASS: F9-sanity [wg] customer status PAID (expected=PAID, actual=PAID)
+  PASS: F9-sanity [wg] customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: F9-sanity [wg] customer poin 0->10 (UNPAID, undisturbed) (expected=10, actual=10)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      838	f9s-wg-1	matched	900001	920001	1	lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> F9-probe-sanity [wg] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+[review9a 10:59:49] F9-points-race [wg] status flipped UNPAID -> ISOLIR while apply is blocked on the log lock (cron flip)
+  PASS: F9-points-race [wg] setup: log matched to bill (expected=920001, actual=920001)
+  PASS: F9-points-race [wg] setup: customer UNPAID before the flip (expected=UNPAID, actual=UNPAID)
+      orchestrator: {"ok":true,"blocked_detected":true,"http_code":"200","switch":{"mode":"status","customer":"900001","new_status":"ISOLIR"},"apply":{"applied":true,"note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)"},"raw":"{\"ok\":true,\"apply\":{\"applied\":true,\"note\":\"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)\"}}"}
+  PASS: F9-points-race [wg] orchestration ok (expected=True, actual=True)
+  PASS: F9-points-race [wg] apply provably blocked on the lock first (expected=True, actual=True)
+  PASS: F9-points-race [wg] probe HTTP 200 (expected=200, actual=200)
+  PASS: F9-points-race [wg] apply applied=true (settles; only the points basis changes) (expected=True, actual=True)
+  PASS: F9-points-race [wg] bill PAID (expected=PAID, actual=PAID)
+  PASS: F9-points-race [wg] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F9-points-race [wg] log applied_at set (expected=1, actual=1)
+  PASS: F9-points-race [wg] log still matched to the same bill (expected=920001, actual=920001)
+  PASS: F9-points-race [wg] customer status PAID (expected=PAID, actual=PAID)
+  PASS: F9-points-race [wg] customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: F9-points-race [wg] customer poin 0->5 (ISOLIR under lock, NOT 10 from stale UNPAID) (expected=5, actual=5)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      839	f9p-wg-1	matched	900001	920001	1	lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	5
+  ==> F9-points-race [wg] points from locked status: PASS (settled with 5 points from the fresh ISOLIR status)
+
+==================== SUMMARY ====================
+  F9-probe-sanity [v2] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+  F9-points-race [v2] points from locked status: PASS (settled with 5 points from the fresh ISOLIR status)
+  F9-probe-sanity [wg] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+  F9-points-race [wg] points from locked status: PASS (settled with 5 points from the fresh ISOLIR status)
+-------------------------------------------------
+assertions: PASS=45 FAIL=0
+full log: /home/warganet/paylist-contract-c2/results/run-review9a-20261125-105944.log
+actor responses: /home/warganet/paylist-contract-c2/results/run-review9a-20261125-105944/
+RESULT: ALL SCENARIOS BEHAVED AS SPECIFIED

@@ -6,7 +6,14 @@ the owner approves this checklist. Nothing in this document deploys
 itself. deV2 (staging) already carries the full review-#8 patch set:
 birth-fix (deployed 24 Nov 07:52, backups `.bak-birthfix-20261124`)
 and the review-#8 stale-binding fix (deployed 24 Nov 10:14, backup
-`qris_apply.php.bak-review8-stale`).
+`qris_apply.php.bak-review8-stale`) — plus the review-#9 (a) points-race
+fix (deployed 25 Nov 09:46, sha `aecf9db6…`, backup
+`qris_apply.php.bak-review9-points`). The pending production deploy
+now also includes that review-#9 (a) apply fix (both apply files; no
+schema change) and still awaits owner + reviewer approval. Item (d)
+of review #9 already moved ALL `.bak` files out of the webroots
+(333 files, 25 Nov; see the review-#9 section of `README-review8.md`)
+— backups for this deploy MUST follow the same rule (step 2a).
 
 **What's new in review #8 (vs the review-#7 bundle):**
 
@@ -86,10 +93,17 @@ deV2 E2E; its diff is `diffs/v2-bayar.diff`.
    next.
 2. Per system:
    a. `.bak` backup of every file being replaced
-      (suffix `.bak-c2-review8` for this patch set), in place next
-      to the original. New files have no backup (they did not exist).
-      (deV2 already carries `.bak-birthfix-20261124` and
-      `.bak-review8-stale` backups from the staging deploys.)
+      (suffix `.bak-c2-review8` for this patch set), **OUTSIDE the
+      webroot** — convention `/usr/local/app/<app>-backups/` (e.g.
+      `/usr/local/app/v2New-backups/<suffix>/`, preserving the
+      relative path under `html/`), NEVER in place next to the
+      original. Rationale (review #9 item (d), 25 Nov): `.bak` files
+      inside the webroot were genuinely served on warganet (HTTP 200)
+      before 333 of them were moved out; in-place backups are an
+      exposure, not a safety net. New files have no backup (they did
+      not exist). (deV2's staging backups — `.bak-birthfix-20261124`,
+      `.bak-review8-stale`, `.bak-review9-points` — were moved to
+      `/usr/local/app/deV2-backups/20261125-bak-webroot/` on 25 Nov.)
    b. `mysqldump` the two affected tables (log + bill table) to
       `/usr/local/app/<system>/backup-pre-c2-YYYYMMDD/` before the
       migration. Row counts recorded before/after.

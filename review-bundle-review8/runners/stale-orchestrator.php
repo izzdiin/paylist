@@ -17,12 +17,51 @@
 //   3. Selagi apply terblokir, T mengubah binding baris log
 //      (mode=bill: matched_id_* ke kandidat lain — persis kolom yang
 //      ditulis transisi re-match; mode=nominal: total tagihan diubah
-//      sehingga nominal harapan tidak lagi cocok; mode=lockwait: tidak
-//      mengubah apa-apa, hanya menahan kunci melewati batas timeout
-//      apply untuk memicu 1205), lalu COMMIT.
+//      sehingga nominal harapan tidak lagi cocok; mode=status: status
+//      pelanggan dibalik UNPAID -> ISOLIR — persis yang dilakukan cron
+//      status saat masa_aktif habis; mode=lockwait: tidak mengubah
+//      apa-apa, hanya menahan kunci melewati batas timeout apply untuk
+//      memicu 1205), lalu COMMIT.
 //   4. Apply melanjutkan dengan binding segar di bawah kunci — dan
 //      harus MENOLAK (perbaikan review #8) atau terbukti melunasi
-//      tagihan basi (kode pra-perbaikan).
+//      tagihan basi (kode pra-perbaikan). Untuk mode=status, apply
+//      harus MELUNASI dengan poin dari status SEGAR (ISOLIR -> 5),
+//      bukan dari status pra-kunci (UNPAID -> 10); kode pra-perbaikan
+//      review #9 terbukti memberi 10.
+//
+// Mode=deadlock (review #9 item (b), run-review9b.sh) MEMAKSA deadlock
+// 1213 secara deterministik — bukan mengandalkan nol 1213 yang
+// teramati. Dua transaksi mengakuisisi baris yang sama dengan urutan
+// berlawanan (siklus kunci):
+//   apply:  log -> tagihan -> pelanggan (urutan seragam semua apply)
+//   peer:   pelanggan -> tagihan (persis v2 task/servicechange.php:
+//           UPDATE pelanggan dulu, lalu UPDATE proforma — inversi yang
+//           sudah ada; untuk wg bentuk yang sama sebagai SQL khusus-tes,
+//           karena servicechange wg hanya menyentuh pelanggan)
+// Urutan orkestrasi (setiap langkah dibuktikan kunci baris, bukan
+// sleep): T mengunci log; peer (deadlock-peer.php, proses terpisah)
+// memegang kunci pelanggan (ready-file + trx_id); apply dijalankan
+// dan TERBUKTI menunggu kunci log T; T commit; apply maju (log,
+// tagihan) lalu TERBUKTI menunggu kunci pelanggan peer; baru peer
+// meminta kunci tagihan -> siklus lengkap -> InnoDB mendeteksi
+// deadlock dan mengembalikan 1213 ke korban. KOREKSI (temuan empiris
+// 25 Nov 2026, kontrol pertama run-review9b): korban dipilih
+// berdasarkan BOBOT (jumlah kunci yang dipegang), BUKAN jumlah baris
+// yang diubah — peer servicechange asli (1 kunci pelanggan) LEBIH
+// RINGAN dari apply (kunci log + tagihan), sehingga dalam tabrakan
+// nyata PEER-lah yang jadi korban 1213 dan apply lunas normal
+// (pembayaran menang — perilaku yang menguntungkan produksi).
+// Untuk MEMAKSA apply menjadi korban, peer diberi bobot tambahan
+// lewat deadlock-peer.php --extra-customers (mengunci baris pelanggan
+// dummy tambahan sebelum go); urutan kunci peer tetap pelanggan dulu
+// lalu tagihan. Lihat deadlock-peer.php.
+// Peer lalu commit sebagai survivor; apply harus applied=false
+// dengan rollback penuh; baris tetap matched dan apply ulang harus
+// berhasil (recoverable). Bagian deadlock terakhir InnoDB
+// (LATEST DETECTED DEADLOCK) ditangkap ke --deadlock-file sebagai
+// bukti 1213 yang otoritatif — pesan apply sendiri tidak memuat kode
+// 1213 (mysqli mode senyap: execute() gagal + warning di log worker,
+// lalu fetch_assoc() atas bool melempar Error yang ditangkap apply).
 //
 // Urutan program apply menjamin baca seleksi sudah selesai saat kunci
 // ditunggu (kunci adalah pernyataan pertama transaksi; baca seleksi
@@ -39,12 +78,16 @@
 // Penggunaan (dipanggil run-review8.sh; jangan dipakai manual tanpa
 // memahami stack scratch):
 //   php stale-orchestrator.php --target v2|wg --cnf PATH --db-name DB
-//     --log-id N --probe-url URL --mode bill|nominal|lockwait
+//     --log-id N --probe-url URL --mode bill|nominal|status|lockwait|deadlock
 //     --resp-file PATH --code-file PATH
 //     [--switch-bill M --switch-customer C]   (mode=bill)
 //     [--bill-id B --switch-total T]          (mode=nominal)
+//     [--switch-customer C --switch-status S] (mode=status)
 //     [--hold-seconds S]                      (mode=lockwait)
 //     [--probe-lock-wait-timeout N]           (lock_wait_timeout sesi apply)
+//     [--switch-customer C --bill-id B --peer-script PATH
+//      --peer-layanan L --peer-tagihan T --deadlock-file PATH
+//      [--extra-customers C1,C2,...] --skip-invoice-lock] (mode=deadlock)
 
 function fail($msg, $code = 2) {
     fwrite(STDERR, "stale-orchestrator: $msg\n");
@@ -55,13 +98,14 @@ function fail($msg, $code = 2) {
 $opts = getopt('', [
     'target:', 'cnf:', 'db-name:', 'log-id:', 'probe-url:', 'mode:',
     'resp-file:', 'code-file:', 'switch-bill:', 'switch-customer:',
-    'bill-id:', 'switch-total:', 'hold-seconds:',
-    'probe-lock-wait-timeout:',
+    'switch-status:', 'bill-id:', 'switch-total:', 'hold-seconds:',
+    'probe-lock-wait-timeout:', 'peer-script:', 'peer-layanan:',
+    'peer-tagihan:', 'deadlock-file:', 'extra-customers:', 'skip-invoice-lock',
 ]);
 $target = $opts['target'] ?? '';
 if (!in_array($target, ['v2', 'wg'], true)) { fail('target harus v2|wg'); }
 $mode = $opts['mode'] ?? '';
-if (!in_array($mode, ['bill', 'nominal', 'lockwait'], true)) { fail('mode harus bill|nominal|lockwait'); }
+if (!in_array($mode, ['bill', 'nominal', 'status', 'lockwait', 'deadlock'], true)) { fail('mode harus bill|nominal|status|lockwait|deadlock'); }
 $logId = (int)($opts['log-id'] ?? 0);
 if ($logId <= 0) { fail('log-id tidak valid'); }
 $cnf = $opts['cnf'] ?? '';
@@ -78,6 +122,14 @@ if ($mode === 'bill' && (empty($opts['switch-bill']) || !isset($opts['switch-cus
 }
 if ($mode === 'nominal' && (empty($opts['bill-id']) || !isset($opts['switch-total']))) {
     fail('mode=nominal butuh bill-id + switch-total');
+}
+if ($mode === 'status' && (empty($opts['switch-customer']) || empty($opts['switch-status']))) {
+    fail('mode=status butuh switch-customer + switch-status');
+}
+if ($mode === 'deadlock' && (empty($opts['switch-customer']) || empty($opts['bill-id'])
+    || empty($opts['peer-script']) || !is_readable($opts['peer-script'])
+    || empty($opts['peer-layanan']) || !isset($opts['peer-tagihan']) || empty($opts['deadlock-file']))) {
+    fail('mode=deadlock butuh switch-customer + bill-id + peer-script + peer-layanan + peer-tagihan + deadlock-file');
 }
 $holdSeconds = (int)($opts['hold-seconds'] ?? 5);
 $probeLwt = (int)($opts['probe-lock-wait-timeout'] ?? 0);
@@ -110,6 +162,7 @@ foreach (file($cnf, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
 if ($cfg['user'] === null) { fail('cnf tidak berisi user'); }
 
 $curlPid = null;
+$peerPid = null;
 try {
     if (!empty($cfg['socket'])) {
         $db = new mysqli('localhost', $cfg['user'], (string)$cfg['password'], $dbName, null, $cfg['socket']);
@@ -126,8 +179,199 @@ try {
     $row = $st->get_result()->fetch_assoc();
     $st->close();
     if (!$row) { $db->rollback(); fail("log $logId tidak ditemukan"); }
-    $trxRow = $db->query("SELECT trx_id FROM INFORMATION_SCHEMA.INNODB_TRX WHERE trx_mysql_thread_id = CONNECTION_ID()")->fetch_assoc();
-    $trxId = $trxRow ? (int)$trxRow['trx_id'] : 0;
+    // trx_id sendiri — HANYA untuk mode selain deadlock (temuan
+    // review #9b, A/B 4/4 25 Nov 2026): membaca INNODB_TRX di sini
+    // (sebelum peer di-spawn) berkorelasi sempurna dengan lookup trx
+    // peer yang mengembalikan 0 baris — transaksi peer (in_tx=1,
+    // UPDATE 1 baris) tidak terlihat di INNODB_TRX, sehingga
+    // orkestrator gagal di tahap ready. Mekanisme pastinya belum
+    // terjelaskan (bacaan I_S read-only seharusnya tidak memengaruhi
+    // koneksi lain); cabang deadlock mengambil trx_id-nya SENDIRI
+    // sesudah peer siap (lookup peer sudah selesai saat itu) dan
+    // memakai fallback PROCESSLIST bila lookup itu mengembalikan 0.
+    $trxId = 0;
+    if ($mode !== 'deadlock') {
+        $trxRow = $db->query("SELECT trx_id FROM INFORMATION_SCHEMA.INNODB_TRX WHERE trx_mysql_thread_id = CONNECTION_ID()")->fetch_assoc();
+        $trxId = $trxRow ? (int)$trxRow['trx_id'] : 0;
+    }
+
+    // ===== mode=deadlock: cabang tersendiri (alur berbeda dari mode lain) =====
+    if ($mode === 'deadlock') {
+        $custDl = (string)$opts['switch-customer'];
+        $billIdDl = (int)$opts['bill-id'];
+        $skipInvoice = isset($opts['skip-invoice-lock']);
+        $baseDir = dirname($respFile);
+        $tag = preg_replace('/\.apply\.json$/', '', basename($respFile));
+        $readyFile = $baseDir . '/' . $tag . '.peer-ready.json';
+        $goFile = $baseDir . '/' . $tag . '.peer-go';
+        $resultFile = $baseDir . '/' . $tag . '.peer-result.json';
+        $deadlockFile = (string)$opts['deadlock-file'];
+        $peerOut = $baseDir . '/' . $tag . '.peer-stdout';
+        $peerErr = $baseDir . '/' . $tag . '.peer-stderr';
+        foreach ([$readyFile, $goFile, $resultFile] as $f) {
+            if (file_exists($f)) { unlink($f); }
+        }
+        $killDl = function () use (&$curlPid, &$peerPid) {
+            if ($curlPid && file_exists("/proc/$curlPid")) { shell_exec('kill ' . (int)$curlPid . ' 2>/dev/null'); }
+            if ($peerPid && file_exists("/proc/$peerPid")) { shell_exec('kill ' . (int)$peerPid . ' 2>/dev/null'); }
+        };
+
+        // 1b. Peer memegang kunci pelanggan (UPDATE pelanggan) dan
+        //     menulis ready-file berisi trx_id-nya. Peer TIDAK menyentuh
+        //     tagihan sebelum go-file — jadi tidak ada siklus sebelum
+        //     apply TERBUKTI menunggu kunci pelanggan peer.
+        $peerCmd = 'php ' . escapeshellarg((string)$opts['peer-script'])
+            . ' --target ' . escapeshellarg($target)
+            . ' --cnf ' . escapeshellarg($cnf)
+            . ' --db-name ' . escapeshellarg($dbName)
+            . ' --customer ' . escapeshellarg($custDl)
+            . ' --bill-id ' . $billIdDl
+            . ' --layanan ' . escapeshellarg((string)$opts['peer-layanan'])
+            . ' --tagihan ' . escapeshellarg((string)$opts['peer-tagihan'])
+            . (!empty($opts['extra-customers']) ? ' --extra-customers ' . escapeshellarg((string)$opts['extra-customers']) : '')
+            . ' --ready-file ' . escapeshellarg($readyFile)
+            . ' --go-file ' . escapeshellarg($goFile)
+            . ' --result-file ' . escapeshellarg($resultFile)
+            . ($skipInvoice ? ' --skip-invoice-lock' : '')
+            . ' > ' . escapeshellarg($peerOut) . ' 2> ' . escapeshellarg($peerErr)
+            . ' & echo $!';
+        $peerPid = (int)trim((string)shell_exec($peerCmd));
+        if ($peerPid <= 0) { $db->rollback(); fail('gagal menjalankan deadlock-peer'); }
+        $peerTrxId = 0;
+        $deadline = microtime(true) + 15.0;
+        while (microtime(true) < $deadline) {
+            if (is_readable($readyFile)) {
+                $rj = json_decode((string)file_get_contents($readyFile), true);
+                if (is_array($rj) && !empty($rj['ready'])) { $peerTrxId = (int)($rj['trx_id'] ?? 0); break; }
+            }
+            if (!file_exists("/proc/$peerPid") && !is_readable($resultFile)) { break; }
+            usleep(100000);
+        }
+        if ($peerTrxId <= 0) {
+            $db->rollback();
+            $killDl();
+            $pr = is_readable($resultFile) ? (string)file_get_contents($resultFile) : '';
+            $pe = is_readable($peerErr) ? (string)file_get_contents($peerErr) : '';
+            fail('deadlock-peer tidak pernah siap (tidak memegang kunci pelanggan): result=' . substr($pr, 0, 200) . ' stderr=' . substr($pe, 0, 300));
+        }
+
+        // trx_id sendiri — baru dibaca DI SINI (sesudah peer siap),
+        // bukan sebelum spawn peer (lihat catatan di atas: bacaan
+        // INNODB_TRX pra-spawn berkorelasi dengan lookup peer yang
+        // gagal). Dipakai langkah 3 untuk membuktikan apply menunggu
+        // kunci log T lewat INNODB_LOCK_WAITS; bila 0, fallback
+        // PROCESSLIST di bawah yang bekerja.
+        $trxRow = $db->query("SELECT trx_id FROM INFORMATION_SCHEMA.INNODB_TRX WHERE trx_mysql_thread_id = CONNECTION_ID()")->fetch_assoc();
+        $trxId = $trxRow ? (int)$trxRow['trx_id'] : 0;
+
+        // 2. Jalankan apply di latar belakang (probe-apply.php).
+        $post = 'log_id=' . $logId;
+        if ($probeLwt > 0) { $post .= '&lock_wait_timeout=' . $probeLwt; }
+        $cmd = 'curl -s -m 90 -o ' . escapeshellarg($respFile)
+            . ' -w %{http_code} -X POST ' . escapeshellarg($probeUrl)
+            . ' -d ' . escapeshellarg($post)
+            . ' > ' . escapeshellarg($codeFile) . ' 2>/dev/null & echo $!';
+        $curlPid = (int)trim((string)shell_exec($cmd));
+        if ($curlPid <= 0) { $db->rollback(); $killDl(); fail('gagal menjalankan curl latar belakang'); }
+
+        // 3. Tunggu sampai apply TERBUKTI menunggu kunci log kita.
+        $blocked = false;
+        $deadline = microtime(true) + 15.0;
+        while (microtime(true) < $deadline) {
+            if ($trxId > 0) {
+                $w = $db->query("SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.INNODB_LOCK_WAITS WHERE blocking_trx_id = $trxId");
+                if ($w && (int)$w->fetch_assoc()['n'] >= 1) { $blocked = true; break; }
+            }
+            $p = $db->query("SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.PROCESSLIST WHERE INFO LIKE '%FOR UPDATE%' AND ID <> CONNECTION_ID() AND COMMAND <> 'Sleep'");
+            if ($p && (int)$p->fetch_assoc()['n'] >= 1) { $blocked = true; break; }
+            if (!file_exists("/proc/$curlPid")) { break; }
+            usleep(100000);
+        }
+        if (!$blocked) {
+            $db->rollback();
+            $killDl();
+            $resp = is_readable($respFile) ? file_get_contents($respFile) : '(tidak ada respons)';
+            fail('apply tidak pernah terblokir pada kunci log (probe mungkin error): ' . substr((string)$resp, 0, 300));
+        }
+
+        // 4. Lepas kunci log; apply maju (log, lalu tagihan) dan
+        //    berhenti pada kunci pelanggan yang dipegang peer.
+        $db->commit();
+
+        // 5. Tunggu sampai apply TERBUKTI menunggu kunci pelanggan peer.
+        //    Baru sesudah ini siklus boleh ditutup — deterministik.
+        $waitedOnPeer = false;
+        $applyTrxId = 0;
+        $deadline = microtime(true) + 15.0;
+        while (microtime(true) < $deadline) {
+            $w = $db->query("SELECT requesting_trx_id FROM INFORMATION_SCHEMA.INNODB_LOCK_WAITS WHERE blocking_trx_id = $peerTrxId LIMIT 1");
+            if ($w) {
+                $wr = $w->fetch_assoc();
+                if ($wr) { $waitedOnPeer = true; $applyTrxId = (int)$wr['requesting_trx_id']; break; }
+            }
+            if (!file_exists("/proc/$curlPid")) { break; }
+            usleep(100000);
+        }
+        if (!$waitedOnPeer) {
+            $killDl();
+            $resp = is_readable($respFile) ? file_get_contents($respFile) : '(tidak ada respons)';
+            fail('apply tidak pernah menunggu kunci pelanggan peer: ' . substr((string)$resp, 0, 300));
+        }
+
+        // 6. Go: peer meminta kunci tagihan -> siklus lengkap ->
+        //    InnoDB mendeteksi deadlock (seketika, tanpa timeout).
+        file_put_contents($goFile, "go\n");
+
+        // 7. Tunggu probe + peer selesai (maks 100 dtk).
+        $deadline = time() + 100;
+        while (file_exists("/proc/$curlPid") && time() < $deadline) { usleep(100000); }
+        if (file_exists("/proc/$curlPid")) {
+            $killDl();
+            fail('probe-apply tidak selesai dalam 100 dtk sesudah go');
+        }
+        $deadline = microtime(true) + 30.0;
+        while (!is_readable($resultFile) && microtime(true) < $deadline) { usleep(100000); }
+        if (!is_readable($resultFile)) {
+            $killDl();
+            fail('deadlock-peer tidak menulis result-file');
+        }
+
+        // 8. Tangkap LATEST DETECTED DEADLOCK (bukti 1213 otoritatif)
+        //    sebelum transaksi lain sempat menimpanya. Scratch idle,
+        //    jadi bagian ini adalah deadlock kita.
+        $dlText = '(tidak ada bagian LATEST DETECTED DEADLOCK)';
+        $st = $db->query("SHOW ENGINE INNODB STATUS");
+        if ($st) {
+            $row = $st->fetch_assoc();
+            $full = (string)($row['Status'] ?? '');
+            $start = strpos($full, 'LATEST DETECTED DEADLOCK');
+            if ($start !== false) {
+                $end = strpos($full, "\nTRANSACTIONS", $start);
+                $dlText = ($end !== false) ? substr($full, $start, $end - $start) : substr($full, $start);
+            }
+        }
+        file_put_contents($deadlockFile, $dlText . "\n");
+        $db->close();
+
+        $httpCode = is_readable($codeFile) ? trim((string)file_get_contents($codeFile)) : '';
+        $body = is_readable($respFile) ? (string)file_get_contents($respFile) : '';
+        $decoded = json_decode($body, true);
+        $peerRes = json_decode((string)file_get_contents($resultFile), true);
+        echo json_encode([
+            'ok' => true,
+            'blocked_detected' => true,
+            'apply_waited_on_peer' => $waitedOnPeer,
+            'apply_trx_id' => $applyTrxId,
+            'peer_trx_id' => $peerTrxId,
+            'http_code' => $httpCode,
+            'switch' => ['mode' => 'deadlock', 'skip_invoice_lock' => $skipInvoice],
+            'peer' => $peerRes,
+            'apply' => ($decoded['apply'] ?? null),
+            'deadlock_file' => $deadlockFile,
+            'raw' => substr($body, 0, 2000),
+        ]) . "\n";
+        exit(0);
+    }
 
     // 2. Jalankan apply di latar belakang (probe-apply.php).
     $post = 'log_id=' . $logId;
@@ -185,6 +429,26 @@ try {
         $up->close();
         $switch['bill'] = $bb;
         $switch['new_total'] = $nt;
+    } elseif ($mode === 'status') {
+        $sc = (string)$opts['switch-customer'];
+        $ss = (string)$opts['switch-status'];
+        // Pembalikan status pelanggan di tengah apply — persis yang
+        // dilakukan cron status (v2 cron/cronetter.php, wg
+        // cron/status.php: UPDATE pelanggan SET status_pembayaran =
+        // 'ISOLIR' ...) saat masa_aktif habis. UPDATE berjalan di dalam
+        // transaksi T yang memegang kunci log: apply yang terblokir pada
+        // kunci log belum bisa memperoleh kunci pelanggan, jadi
+        // perubahan ini mendarat SESUDAH baca pra-kunci apply (selesai
+        // sebelum apply terblokir — urutan program) dan SEBELUM baca
+        // status di bawah kunci pelanggan (perbaikan review #9).
+        // Bind string untuk id_pelanggan: kolomnya INT di v2 dan
+        // VARCHAR di wg; MySQL mengoersi string numerik untuk INT.
+        $up = $db->prepare("UPDATE pelanggan SET status_pembayaran = ? WHERE id_pelanggan = ?");
+        $up->bind_param('ss', $ss, $sc);
+        $up->execute();
+        $up->close();
+        $switch['customer'] = $sc;
+        $switch['new_status'] = $ss;
     } else { // lockwait: tahan kunci melewati timeout apply
         sleep($holdSeconds);
         $switch['held_seconds'] = $holdSeconds;
@@ -207,6 +471,9 @@ try {
     }
     if ($curlPid && file_exists("/proc/$curlPid")) {
         shell_exec('kill ' . (int)$curlPid . ' 2>/dev/null');
+    }
+    if ($peerPid && file_exists("/proc/$peerPid")) {
+        shell_exec('kill ' . (int)$peerPid . ' 2>/dev/null');
     }
     fail('exception: ' . $e->getMessage());
 }

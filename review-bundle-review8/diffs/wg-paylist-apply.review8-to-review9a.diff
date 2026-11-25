@@ -1,0 +1,85 @@
+--- orig/wg-paylist_apply.review8.php	2026-11-25 02:24:40.471970086 +0000
++++ fixed/wg-paylist_apply.php	2026-11-25 02:25:04.205969576 +0000
+@@ -35,6 +35,9 @@
+ // Urutan kunci: baris log dulu (FOR UPDATE), lalu baris payment
+ // (FOR UPDATE) — seragam di semua entrypoint; tidak ada entrypoint yang
+ // mengunci tagihan dulu lalu log, jadi tidak ada siklus deadlock baru.
++// Pemanggil mengunci baris pelanggan KETIGA sesudah helper ini kembali
++// (perbaikan review #9, P1 points race: status untuk poin dibaca di
++// bawah kunci pelanggan) — urutan penuh: log -> payment -> pelanggan.
+ //
+ // Membandingkan binding SEGAR dari baris log (matched_id_payment,
+ // matched_id_pelanggan, amount) dengan pilihan SELEKSI pemanggil (yang
+@@ -140,8 +143,14 @@
+     $namaMitra = $pay['nama_mitra'];
+     $tanggalBayar = date('Y-m-d H:i:s');
+ 
+-    // Nilai turunan (sama seperti status-handler): poin dari status
+-    // sebelumnya, masa aktif dari tabel pppoe menurut layanan.
++    // Nilai turunan (sama seperti status-handler): no_hp/router pelanggan
++    // untuk efek luar, masa aktif dari tabel pppoe menurut layanan.
++    // Poin TIDAK diturunkan di sini (perbaikan C2 review #9, P1 points
++    // race, 25 Nov 2026): poin diturunkan dari status_pembayaran yang
++    // dibaca ulang di bawah kunci baris pelanggan di dalam transaksi,
++    // agar mengikuti status SEBELUM pembayaran pada saat pelunasan
++    // (bukan status yang bisa sudah berubah sejak baca pra-kunci ini,
++    // mis. cron membalik UNPAID -> ISOLIR sehingga poin 10, bukan 5).
+     $stmt = $db->prepare("SELECT status_pembayaran, no_hp, router FROM pelanggan WHERE id_pelanggan = ?");
+     $stmt->bind_param('s', $idPelanggan);
+     $stmt->execute();
+@@ -149,14 +158,6 @@
+     $stmt->close();
+     if (!$pel) { $out['note'] = 'pelanggan tidak ditemukan'; return $out; }
+ 
+-    $poin = 0;
+-    $stmt = $db->prepare("SELECT poin FROM poin_status WHERE status_pembayaran = ?");
+-    $stmt->bind_param('s', $pel['status_pembayaran']);
+-    $stmt->execute();
+-    $pr = $stmt->get_result()->fetch_assoc();
+-    $stmt->close();
+-    if ($pr) $poin = (int)$pr['poin'];
+-
+     $masaPppoe = 30;
+     $stmt = $db->prepare("SELECT masa_aktif FROM pppoe WHERE name = ?");
+     $stmt->bind_param('s', $layanan);
+@@ -201,6 +202,40 @@
+         $tagihan = $paySegar['tagihan'];
+         $namaMitra = $paySegar['nama_mitra'];
+ 
++        // Kunci baris pelanggan dan turunkan poin dari status segar di
++        // bawah kuncinya (perbaikan C2 review #9, P1 points race,
++        // 25 Nov 2026): poin sebelumnya diturunkan dari status yang
++        // dibaca TANPA kunci sebelum transaksi — bila status berubah di
++        // antara baca itu dan kunci ini (mis. cron membalik UNPAID ->
++        // ISOLIR), poin diberikan dari status BASI (10, bukan 5). Poin
++        // WAJIB mengikuti status SEBELUM pembayaran; status yang dibaca
++        // di sini adalah status pada saat pelunasan, sebelum UPDATE di
++        // bawah mengubahnya ke PAID. Status PAID tidak ditolak: pelanggan
++        // bisa sah melunasi payment kedua selagi statusnya sudah PAID
++        // dari payment pertama — tanpa baris poin_status untuk PAID,
++        // $poin tetap 0. Urutan kunci: log -> payment -> pelanggan —
++        // seragam di semua situs apply; tidak ada entrypoint C2 lain
++        // yang mengunci pelanggan (re-match: log saja; matcher: tanpa
++        // kunci; hook kode-birth: log saja; klaim kode-birth: payment
++        // saja, autocommit), dan tidak ada transaksi lain di warganet
++        // yang memegang kunci payment sambil menunggu pelanggan (atau
++        // sebaliknya) — status-handler/cron autocommit per pernyataan,
++        // task/extend + task/servicechange + wa/autoreply hanya
++        // menyentuh pelanggan.
++        $pl = $db->prepare("SELECT status_pembayaran FROM pelanggan WHERE id_pelanggan = ? FOR UPDATE");
++        $pl->bind_param('s', $idPelanggan);
++        $pl->execute();
++        $pelSegar = $pl->get_result()->fetch_assoc();
++        $pl->close();
++        if (!$pelSegar) { throw new Exception('pelanggan tidak ditemukan (di bawah kunci)'); }
++        $poin = 0;
++        $ps = $db->prepare("SELECT poin FROM poin_status WHERE status_pembayaran = ?");
++        $ps->bind_param('s', $pelSegar['status_pembayaran']);
++        $ps->execute();
++        $prSegar = $ps->get_result()->fetch_assoc();
++        $ps->close();
++        if ($prSegar) $poin = (int)$prSegar['poin'];
++
+         // G4: cegah pemasukan ganda untuk idtrx yang sama
+         $stmt = $db->prepare("SELECT COUNT(*) AS n FROM pemasukan WHERE idtrx = ?");
+         $stmt->bind_param('s', $idtrx);

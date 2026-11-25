@@ -1,0 +1,259 @@
+[review8 10:59:17] review8 run 20261125-105917 (target=all)
+[review8 10:59:17] amounts: AMT_A=100823 (100000+fee+123), AMT_TWIN=100823 (99900+fee+223), AMT_T1=50451 (50000+fee+101), AMT_T2=50451 (49900+fee+201), AMT_A_NEW=101327 (100500+fee+123)
+[review8 10:59:17] F8-probe-sanity [v2] plain apply via probe-apply.php (no interference)
+  PASS: F8-sanity [v2] setup: log matched to bill (expected=910001, actual=910001)
+      probe-apply response: {"ok":true,"apply":{"log_id":855,"applied":true,"steps":["proforma 910001 -> PAID","pemasukan INV-TEST-910001 tercatat Rp 100000.00","pelanggan -> PAID, masa_aktif 0 -> 30, jatuhTempo 2026-12-25","poin +10 (status lama UNPAID)"]}}
+  PASS: F8-sanity [v2] probe ok (expected=True, actual=True)
+  PASS: F8-sanity [v2] apply applied=true (expected=True, actual=True)
+  PASS: F8-sanity [v2] bill PAID (expected=PAID, actual=PAID)
+  PASS: F8-sanity [v2] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F8-sanity [v2] log applied_at set (expected=1, actual=1)
+  PASS: F8-sanity [v2] customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: F8-sanity [v2] customer poin 0->10 (UNPAID) (expected=10, actual=10)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      855	f8s-v2-1	matched	900001	910001	1	ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> F8-probe-sanity [v2] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+[review8 10:59:18] F8-bill-switch [v2] binding switched to another customer's bill while the origin bill stays UNPAID
+  PASS: F8-bill-switch [v2] twin nominal sanity (B is a genuine candidate) (expected=100823, actual=100823)
+  PASS: F8-bill-switch [v2] setup: log matched to bill A (expected=910001, actual=910001)
+      orchestrator: {"ok":true,"blocked_detected":true,"http_code":"200","switch":{"mode":"bill","to_bill":910002,"to_customer":"900002"},"apply":{"log_id":856,"applied":false,"steps":["ditolak tanpa efek (binding basi): pilihan proforma 910001 (pelanggan 900001, Rp 100823) tidak lagi cocok dengan log (proforma 910002, pelanggan 900002, Rp 100823)"]},"raw":"{\"ok\":true,\"apply\":{\"log_id\":856,\"applied\":false,\"steps\":[\"ditolak tanpa efek (binding basi): pilihan proforma 910001 (pelanggan 900001, Rp 100823) tidak lagi cocok dengan log (proforma 910002, pelanggan 900002, Rp 100823)\"]}}"}
+  PASS: F8-bill-switch [v2] orchestration ok (expected=True, actual=True)
+  PASS: F8-bill-switch [v2] apply provably blocked on the lock first (expected=True, actual=True)
+  PASS: F8-bill-switch [v2] probe HTTP 200 (expected=200, actual=200)
+  PASS: F8-bill-switch [v2] apply applied=false (rejected) (expected=False, actual=False)
+  PASS: F8-bill-switch [v2] apply says rejected (binding basi) (matches /ditolak.*binding basi/: ditolak tanpa efek (binding basi): pilihan proforma 910001 (pelanggan 900001, Rp 100823) tidak lagi cocok dengan log (proforma 910002, pelanggan 900002, Rp 100823))
+  PASS: F8-bill-switch [v2] origin bill A still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-bill-switch [v2] other bill B still UNPAID (not settled either) (expected=UNPAID, actual=UNPAID)
+  PASS: F8-bill-switch [v2] pemasukan rows (none) (expected=0, actual=0)
+  PASS: F8-bill-switch [v2] customer A masa_aktif unchanged (0) (expected=0, actual=0)
+  PASS: F8-bill-switch [v2] customer A poin unchanged (0) (expected=0, actual=0)
+  PASS: F8-bill-switch [v2] customer A still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-bill-switch [v2] customer B masa_aktif unchanged (0) (expected=0, actual=0)
+  PASS: F8-bill-switch [v2] customer B poin unchanged (0) (expected=0, actual=0)
+  PASS: F8-bill-switch [v2] customer B still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-bill-switch [v2] log still matched (fresh binding kept) (expected=matched, actual=matched)
+  PASS: F8-bill-switch [v2] log still points at fresh bill B (expected=910002, actual=910002)
+  PASS: F8-bill-switch [v2] log still unapplied (expected=0, actual=0)
+  PASS: F8-bill-switch [v2] rejection recorded in apply_note (matches /^ditolak \(binding basi\)/: ditolak (binding basi): pilihan proforma 910001 (pelanggan 900001, Rp 100823) tidak lagi cocok dengan log (proforma 910002, pelanggan 900002, Rp 100823))
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      856	f8b-v2-1	matched	900002	910002	0	ditolak (binding basi): pilihan proforma 910001 (pelanggan 900001, Rp 100823) tidak lagi cocok dengan log (proforma 9100
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	UNPAID
+      910002	900002	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+      900002	UNPAID	0	0
+  ==> F8-bill-switch [v2] stale binding rejected: PASS (origin UNPAID, wrong customer not settled, no side effects, rejection noted)
+[review8 10:59:21] F8-nominal [v2] bill total changed mid-apply (expected nominal no longer matches the log amount)
+  PASS: F8-nominal [v2] new nominal sanity (differs from log amount) (expected=101327, actual=101327)
+      orchestrator: {"ok":true,"blocked_detected":true,"http_code":"200","switch":{"mode":"nominal","bill":910001,"new_total":100500},"apply":{"log_id":857,"applied":false,"steps":["ditolak tanpa efek (binding basi): nominal harapan proforma 910001 (Rp 101327) tidak sama dengan amount log (Rp 100823)"]},"raw":"{\"ok\":true,\"apply\":{\"log_id\":857,\"applied\":false,\"steps\":[\"ditolak tanpa efek (binding basi): nominal harapan proforma 910001 (Rp 101327) tidak sama dengan amount log (Rp 100823)\"]}}"}
+  PASS: F8-nominal [v2] orchestration ok (expected=True, actual=True)
+  PASS: F8-nominal [v2] apply provably blocked on the lock first (expected=True, actual=True)
+  PASS: F8-nominal [v2] apply applied=false (rejected) (expected=False, actual=False)
+  PASS: F8-nominal [v2] apply names the nominal mismatch (matches /nominal harapan/: ditolak tanpa efek (binding basi): nominal harapan proforma 910001 (Rp 101327) tidak sama dengan amount log (Rp 100823))
+  PASS: F8-nominal [v2] bill still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-nominal [v2] pemasukan rows (none) (expected=0, actual=0)
+  PASS: F8-nominal [v2] customer masa_aktif unchanged (0) (expected=0, actual=0)
+  PASS: F8-nominal [v2] customer poin unchanged (0) (expected=0, actual=0)
+  PASS: F8-nominal [v2] log still matched to the same bill (expected=910001, actual=910001)
+  PASS: F8-nominal [v2] log still unapplied (expected=0, actual=0)
+  PASS: F8-nominal [v2] rejection recorded in apply_note (matches /^ditolak \(binding basi\).*nominal harapan/: ditolak (binding basi): nominal harapan proforma 910001 (Rp 101327) tidak sama dengan amount log (Rp 100823))
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      857	f8n-v2-1	matched	900001	910001	0	ditolak (binding basi): nominal harapan proforma 910001 (Rp 101327) tidak sama dengan amount log (Rp 100823)
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+  ==> F8-nominal [v2] nominal change rejected: PASS (bill UNPAID, no side effects, nominal mismatch noted)
+[review8 10:59:23] F8-lockwait [v2] apply blocked past innodb_lock_wait_timeout (1205) -> rollback, no effects, no trace
+      orchestrator: {"ok":true,"blocked_detected":true,"http_code":"200","switch":{"mode":"lockwait","held_seconds":5},"apply":{"log_id":858,"applied":false,"steps":["GAGAL transaksi, rollback: Lock wait timeout exceeded; try restarting transaction"]},"raw":"{\"ok\":true,\"apply\":{\"log_id\":858,\"applied\":false,\"steps\":[\"GAGAL transaksi, rollback: Lock wait timeout exceeded; try restarting transaction\"]}}"}
+  PASS: F8-lockwait [v2] orchestration ok (expected=True, actual=True)
+  PASS: F8-lockwait [v2] apply provably blocked on the lock first (expected=True, actual=True)
+  PASS: F8-lockwait [v2] apply applied=false (expected=False, actual=False)
+  PASS: F8-lockwait [v2] apply reports lock wait timeout (1205) (matches /Lock wait timeout/: GAGAL transaksi, rollback: Lock wait timeout exceeded; try restarting transaction)
+  PASS: F8-lockwait [v2] bill still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-lockwait [v2] pemasukan rows (none) (expected=0, actual=0)
+  PASS: F8-lockwait [v2] customer masa_aktif unchanged (0) (expected=0, actual=0)
+  PASS: F8-lockwait [v2] customer poin unchanged (0) (expected=0, actual=0)
+  PASS: F8-lockwait [v2] log still matched to the same bill (expected=910001, actual=910001)
+  PASS: F8-lockwait [v2] log still unapplied (expected=0, actual=0)
+  PASS: F8-lockwait [v2] apply_note still NULL (rollback left no trace) (expected=, actual=)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      858	f8l-v2-1	matched	900001	910001	0	
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+  ==> F8-lockwait [v2] 1205 rollback: PASS (1205 -> full rollback, row stays matched + re-matchable, no trace)
+[review8 10:59:29] F8-probe-sanity [wg] plain apply via probe-apply.php (no interference)
+  PASS: F8-sanity [wg] setup: log matched to bill (expected=920001, actual=920001)
+      probe-apply response: {"ok":true,"apply":{"applied":true,"note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)"}}
+  PASS: F8-sanity [wg] probe ok (expected=True, actual=True)
+  PASS: F8-sanity [wg] apply applied=true (expected=True, actual=True)
+  PASS: F8-sanity [wg] bill PAID (expected=PAID, actual=PAID)
+  PASS: F8-sanity [wg] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: F8-sanity [wg] log applied_at set (expected=1, actual=1)
+  PASS: F8-sanity [wg] customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: F8-sanity [wg] customer poin 0->10 (UNPAID) (expected=10, actual=10)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      833	f8s-wg-1	matched	900001	920001	1	lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> F8-probe-sanity [wg] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+[review8 10:59:31] F8-bill-switch [wg] binding switched to another customer's bill while the origin bill stays UNPAID
+  PASS: F8-bill-switch [wg] twin nominal sanity (B is a genuine candidate) (expected=100823, actual=100823)
+  PASS: F8-bill-switch [wg] setup: log matched to bill A (expected=920001, actual=920001)
+      orchestrator: {"ok":true,"blocked_detected":true,"http_code":"200","switch":{"mode":"bill","to_bill":920002,"to_customer":"900002"},"apply":{"applied":false,"note":"ditolak tanpa efek (binding basi): pilihan payment 920001 (pelanggan 900001, Rp 100823) tidak lagi cocok dengan log (payment 920002, pelanggan 900002, Rp 100823)"},"raw":"{\"ok\":true,\"apply\":{\"applied\":false,\"note\":\"ditolak tanpa efek (binding basi): pilihan payment 920001 (pelanggan 900001, Rp 100823) tidak lagi cocok dengan log (payment 920002, pelanggan 900002, Rp 100823)\"}}"}
+  PASS: F8-bill-switch [wg] orchestration ok (expected=True, actual=True)
+  PASS: F8-bill-switch [wg] apply provably blocked on the lock first (expected=True, actual=True)
+  PASS: F8-bill-switch [wg] probe HTTP 200 (expected=200, actual=200)
+  PASS: F8-bill-switch [wg] apply applied=false (rejected) (expected=False, actual=False)
+  PASS: F8-bill-switch [wg] apply says rejected (binding basi) (matches /ditolak.*binding basi/: ditolak tanpa efek (binding basi): pilihan payment 920001 (pelanggan 900001, Rp 100823) tidak lagi cocok dengan log (payment 920002, pelanggan 900002, Rp 100823))
+  PASS: F8-bill-switch [wg] origin bill A still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-bill-switch [wg] other bill B still UNPAID (not settled either) (expected=UNPAID, actual=UNPAID)
+  PASS: F8-bill-switch [wg] pemasukan rows (none) (expected=0, actual=0)
+  PASS: F8-bill-switch [wg] customer A masa_aktif unchanged (0) (expected=0, actual=0)
+  PASS: F8-bill-switch [wg] customer A poin unchanged (0) (expected=0, actual=0)
+  PASS: F8-bill-switch [wg] customer A still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-bill-switch [wg] customer B masa_aktif unchanged (0) (expected=0, actual=0)
+  PASS: F8-bill-switch [wg] customer B poin unchanged (0) (expected=0, actual=0)
+  PASS: F8-bill-switch [wg] customer B still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-bill-switch [wg] log still matched (fresh binding kept) (expected=matched, actual=matched)
+  PASS: F8-bill-switch [wg] log still points at fresh bill B (expected=920002, actual=920002)
+  PASS: F8-bill-switch [wg] log still unapplied (expected=0, actual=0)
+  PASS: F8-bill-switch [wg] rejection recorded in apply_note (matches /^ditolak \(binding basi\)/: ditolak (binding basi): pilihan payment 920001 (pelanggan 900001, Rp 100823) tidak lagi cocok dengan log (payment 920002, pelanggan 900002, Rp 100823))
+  PASS: F8-bill-switch [wg] report rows (no WA attempted) (expected=0, actual=0)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      834	f8b-wg-1	matched	900002	920002	0	ditolak (binding basi): pilihan payment 920001 (pelanggan 900001, Rp 100823) tidak lagi cocok dengan log (payment 920002
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	UNPAID
+      920002	900002	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+      900002	UNPAID	0	0
+  ==> F8-bill-switch [wg] stale binding rejected: PASS (origin UNPAID, wrong customer not settled, no side effects, rejection noted)
+[review8 10:59:33] F8-nominal [wg] bill total changed mid-apply (expected nominal no longer matches the log amount)
+  PASS: F8-nominal [wg] new nominal sanity (differs from log amount) (expected=101327, actual=101327)
+      orchestrator: {"ok":true,"blocked_detected":true,"http_code":"200","switch":{"mode":"nominal","bill":920001,"new_total":100500},"apply":{"applied":false,"note":"ditolak tanpa efek (binding basi): nominal harapan payment 920001 (Rp 101327) tidak sama dengan amount log (Rp 100823)"},"raw":"{\"ok\":true,\"apply\":{\"applied\":false,\"note\":\"ditolak tanpa efek (binding basi): nominal harapan payment 920001 (Rp 101327) tidak sama dengan amount log (Rp 100823)\"}}"}
+  PASS: F8-nominal [wg] orchestration ok (expected=True, actual=True)
+  PASS: F8-nominal [wg] apply provably blocked on the lock first (expected=True, actual=True)
+  PASS: F8-nominal [wg] apply applied=false (rejected) (expected=False, actual=False)
+  PASS: F8-nominal [wg] apply names the nominal mismatch (matches /nominal harapan/: ditolak tanpa efek (binding basi): nominal harapan payment 920001 (Rp 101327) tidak sama dengan amount log (Rp 100823))
+  PASS: F8-nominal [wg] bill still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-nominal [wg] pemasukan rows (none) (expected=0, actual=0)
+  PASS: F8-nominal [wg] customer masa_aktif unchanged (0) (expected=0, actual=0)
+  PASS: F8-nominal [wg] customer poin unchanged (0) (expected=0, actual=0)
+  PASS: F8-nominal [wg] log still matched to the same bill (expected=920001, actual=920001)
+  PASS: F8-nominal [wg] log still unapplied (expected=0, actual=0)
+  PASS: F8-nominal [wg] rejection recorded in apply_note (matches /^ditolak \(binding basi\).*nominal harapan/: ditolak (binding basi): nominal harapan payment 920001 (Rp 101327) tidak sama dengan amount log (Rp 100823))
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      835	f8n-wg-1	matched	900001	920001	0	ditolak (binding basi): nominal harapan payment 920001 (Rp 101327) tidak sama dengan amount log (Rp 100823)
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+  ==> F8-nominal [wg] nominal change rejected: PASS (bill UNPAID, no side effects, nominal mismatch noted)
+[review8 10:59:35] F8-lockwait [wg] apply blocked past innodb_lock_wait_timeout (1205) -> rollback, no effects, no trace
+      orchestrator: {"ok":true,"blocked_detected":true,"http_code":"200","switch":{"mode":"lockwait","held_seconds":5},"apply":{"applied":false,"note":"gagal: Lock wait timeout exceeded; try restarting transaction"},"raw":"{\"ok\":true,\"apply\":{\"applied\":false,\"note\":\"gagal: Lock wait timeout exceeded; try restarting transaction\"}}"}
+  PASS: F8-lockwait [wg] orchestration ok (expected=True, actual=True)
+  PASS: F8-lockwait [wg] apply provably blocked on the lock first (expected=True, actual=True)
+  PASS: F8-lockwait [wg] apply applied=false (expected=False, actual=False)
+  PASS: F8-lockwait [wg] apply reports lock wait timeout (1205) (matches /Lock wait timeout/: gagal: Lock wait timeout exceeded; try restarting transaction)
+  PASS: F8-lockwait [wg] bill still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-lockwait [wg] pemasukan rows (none) (expected=0, actual=0)
+  PASS: F8-lockwait [wg] customer masa_aktif unchanged (0) (expected=0, actual=0)
+  PASS: F8-lockwait [wg] customer poin unchanged (0) (expected=0, actual=0)
+  PASS: F8-lockwait [wg] log still matched to the same bill (expected=920001, actual=920001)
+  PASS: F8-lockwait [wg] log still unapplied (expected=0, actual=0)
+  PASS: F8-lockwait [wg] apply_note still NULL (rollback left no trace) (expected=, actual=)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      836	f8l-wg-1	matched	900001	920001	0	
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+  ==> F8-lockwait [wg] 1205 rollback: PASS (1205 -> full rollback, row stays matched + re-matchable, no trace)
+[review8 10:59:42] F8-topup-switch [wg] top-up binding switched to another mitra while the origin top-up stays UNPAID
+  PASS: F8-topup-switch [wg] twin nominal sanity (T2 is a genuine candidate) (expected=50451, actual=50451)
+  PASS: F8-topup-switch [wg] setup: log matched to top-up T1 (expected=920101, actual=920101)
+      orchestrator: {"ok":true,"blocked_detected":true,"http_code":"200","switch":{"mode":"bill","to_bill":920102,"to_customer":"6282222222222"},"apply":{"applied":false,"note":"ditolak tanpa efek (binding basi): pilihan payment 920101 (pelanggan 6281111111111, Rp 50451) tidak lagi cocok dengan log (payment 920102, pelanggan 6282222222222, Rp 50451)"},"raw":"{\"ok\":true,\"apply\":{\"applied\":false,\"note\":\"ditolak tanpa efek (binding basi): pilihan payment 920101 (pelanggan 6281111111111, Rp 50451) tidak lagi cocok dengan log (payment 920102, pelanggan 6282222222222, Rp 50451)\"}}"}
+  PASS: F8-topup-switch [wg] orchestration ok (expected=True, actual=True)
+  PASS: F8-topup-switch [wg] apply provably blocked on the lock first (expected=True, actual=True)
+  PASS: F8-topup-switch [wg] apply applied=false (rejected) (expected=False, actual=False)
+  PASS: F8-topup-switch [wg] apply says rejected (binding basi) (matches /ditolak.*binding basi/: ditolak tanpa efek (binding basi): pilihan payment 920101 (pelanggan 6281111111111, Rp 50451) tidak lagi cocok dengan log (payment 920102, pelanggan 6282222222222, Rp 50451))
+  PASS: F8-topup-switch [wg] origin top-up T1 still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-topup-switch [wg] other top-up T2 still UNPAID (expected=UNPAID, actual=UNPAID)
+  PASS: F8-topup-switch [wg] mitra M1 saldo unchanged (10000.00) (expected=10000.00, actual=10000.00)
+  PASS: F8-topup-switch [wg] mitra M2 saldo unchanged (20000.00) (expected=20000.00, actual=20000.00)
+  PASS: F8-topup-switch [wg] saldo_history rows (none) (expected=0, actual=0)
+  PASS: F8-topup-switch [wg] pemasukan_hotspot rows (none) (expected=0, actual=0)
+  PASS: F8-topup-switch [wg] pemasukan rows (none) (expected=0, actual=0)
+  PASS: F8-topup-switch [wg] log still matched (fresh binding kept) (expected=matched, actual=matched)
+  PASS: F8-topup-switch [wg] log still points at fresh top-up T2 (expected=920102, actual=920102)
+  PASS: F8-topup-switch [wg] log still unapplied (expected=0, actual=0)
+  PASS: F8-topup-switch [wg] rejection recorded in apply_note (matches /^ditolak \(binding basi\)/: ditolak (binding basi): pilihan payment 920101 (pelanggan 6281111111111, Rp 50451) tidak lagi cocok dengan log (payment 920102, pelanggan 6282222222222, Rp 50451))
+  PASS: F8-topup-switch [wg] report rows (none) (expected=0, actual=0)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied	note
+      837	f8u-wg-1	matched	6282222222222	920102	0	ditolak (binding basi): pilihan payment 920101 (pelanggan 6281111111111, Rp 50451) tidak lagi cocok dengan log (payment 
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920101	6281111111111	UNPAID
+      920102	6282222222222	UNPAID
+      pemasukan_rows
+      0
+  ==> F8-topup-switch [wg] stale top-up rejected: PASS (both top-ups UNPAID, both mitra saldos unchanged, rejection noted)
+
+==================== SUMMARY ====================
+  F8-probe-sanity [v2] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+  F8-bill-switch [v2] stale binding rejected: PASS (origin UNPAID, wrong customer not settled, no side effects, rejection noted)
+  F8-nominal [v2] nominal change rejected: PASS (bill UNPAID, no side effects, nominal mismatch noted)
+  F8-lockwait [v2] 1205 rollback: PASS (1205 -> full rollback, row stays matched + re-matchable, no trace)
+  F8-probe-sanity [wg] plain apply: PASS (probe drives the real apply; normal settlement unchanged)
+  F8-bill-switch [wg] stale binding rejected: PASS (origin UNPAID, wrong customer not settled, no side effects, rejection noted)
+  F8-nominal [wg] nominal change rejected: PASS (bill UNPAID, no side effects, nominal mismatch noted)
+  F8-lockwait [wg] 1205 rollback: PASS (1205 -> full rollback, row stays matched + re-matchable, no trace)
+  F8-topup-switch [wg] stale top-up rejected: PASS (both top-ups UNPAID, both mitra saldos unchanged, rejection noted)
+-------------------------------------------------
+assertions: PASS=121 FAIL=0
+full log: /home/warganet/paylist-contract-c2/results/run-review8-20261125-105917.log
+actor responses: /home/warganet/paylist-contract-c2/results/run-review8-20261125-105917/
+RESULT: ALL SCENARIOS BEHAVED AS SPECIFIED

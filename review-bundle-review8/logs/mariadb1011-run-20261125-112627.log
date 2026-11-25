@@ -1,0 +1,954 @@
+[run 11:26:27] contract run 20261125-112627 (target=all, rounds=3, parallel=12)
+[run 11:26:27] amounts: AMT_A=100823 (100000+fee+123), AMT_B=151095 (150000+fee+45), AMT_TOPUP=50427 (50000+fee+77)
+[run 11:26:27] S1 [v2] retry after lost ACK (key=s1-v2-retry, amount=100823)
+      fire-and-forget POST landed (log row present, ACK never read)
+      retry response: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001}}
+  PASS: S1 [v2] retry flagged duplicate (expected=True, actual=True)
+  PASS: S1 [v2] retry reports stored match (expected=matched, actual=matched)
+  PASS: S1 [v2] log rows for key (expected=1, actual=1)
+  PASS: S1 [v2] bills PAID (expected=1, actual=1)
+  PASS: S1 [v2] pemasukan rows (expected=1, actual=1)
+  PASS: S1 [v2] applied log rows (expected=1, actual=1)
+  PASS: S1 [v2] customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: S1 [v2] customer poin 0->10 (UNPAID) (expected=10, actual=10)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      2	s1-v2-retry	matched	900001	910001	1
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> S1 [v2] retry/lost-ACK: PASS (2 POSTs, 1 business effect)
+[run 11:26:30] S2 [v2] 12 concurrent POSTs, same key, 3 rounds
+  PASS: S2 [v2] round 1 duplicate responses (expected=11, actual=11)
+  PASS: S2 [v2] round 1 non-duplicate responses (expected=1, actual=1)
+  PASS: S2 [v2] round 1 log rows (expected=1, actual=1)
+  PASS: S2 [v2] round 1 bills PAID (expected=1, actual=1)
+  PASS: S2 [v2] round 1 pemasukan rows (expected=1, actual=1)
+  PASS: S2 [v2] round 2 duplicate responses (expected=11, actual=11)
+  PASS: S2 [v2] round 2 non-duplicate responses (expected=1, actual=1)
+  PASS: S2 [v2] round 2 log rows (expected=1, actual=1)
+  PASS: S2 [v2] round 2 bills PAID (expected=1, actual=1)
+  PASS: S2 [v2] round 2 pemasukan rows (expected=1, actual=1)
+  PASS: S2 [v2] round 3 duplicate responses (expected=11, actual=11)
+  PASS: S2 [v2] round 3 non-duplicate responses (expected=1, actual=1)
+  PASS: S2 [v2] round 3 log rows (expected=1, actual=1)
+  PASS: S2 [v2] round 3 bills PAID (expected=1, actual=1)
+  PASS: S2 [v2] round 3 pemasukan rows (expected=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      28	s2-v2-r3	matched	900001	910001	1
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> S2 [v2] concurrent POST: PASS (12 POSTs x 3 rounds, 1 effect each)
+[run 11:26:31] S3 [v2] POST, restart whole test stack, re-POST same key
+      first POST response: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001,"apply":"ok"}}
+  PASS: S3 [v2] first POST applied (expected=1, actual=1)
+[run 11:26:32] S3 [v2] restarting stack (PHP workers + scratch MariaDB)...
+[run 11:26:37] S3 [v2] stack back up; re-POSTing same key
+      re-POST response: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001}}
+  PASS: S3 [v2] re-POST flagged duplicate (expected=True, actual=True)
+  PASS: S3 [v2] log rows for key after restart (expected=1, actual=1)
+  PASS: S3 [v2] bills PAID after restart (expected=1, actual=1)
+  PASS: S3 [v2] pemasukan rows after restart (expected=1, actual=1)
+  PASS: S3 [v2] applied_at survived restart (expected=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      40	s3-v2-restart	matched	900001	910001	1
+      41	smoke-v2-1	logged	NULL	NULL	0
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> S3 [v2] restart durability: PASS (1 effect across restart)
+[run 11:26:37] S4 [v2] negative control: 2 keys, 2 payments -> 2 effects
+      resp A: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001,"apply":"ok"}}
+      resp B: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900002,"proforma":910002,"apply":"ok"}}
+  PASS: S4 [v2] bills PAID (expected=2, actual=2)
+  PASS: S4 [v2] pemasukan rows (expected=2, actual=2)
+  PASS: S4 [v2] log rows (expected=2, actual=2)
+  PASS: S4 [v2] applied log rows (expected=2, actual=2)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      43	s4-v2-a	matched	900001	910001	1
+      44	s4-v2-b	matched	900002	910002	1
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      910002	900002	PAID
+      pemasukan_rows
+      2
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      900002	PAID	30	10
+  ==> S4 [v2] negative control: PASS (2 keys -> 2 effects, dedupe not over-broad)
+[run 11:26:38] S5a/C1 [v2] two candidates, same nominal (ambiguous?)
+      resp 1st key: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"ambiguous","candidates":2}}
+      resp retry same key: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"ambiguous"}}
+      resp 2nd key, same amount: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"ambiguous","candidates":2}}
+  PASS: S5a [v2] 1st POST match=ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: S5a [v2] retry still ambiguous (stored) (expected=ambiguous, actual=ambiguous)
+  PASS: S5a [v2] 2nd key also ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: S5a [v2] bills PAID (none must settle) (expected=0, actual=0)
+  PASS: S5a [v2] pemasukan rows (expected=0, actual=0)
+  PASS: S5a [v2] ambiguous log rows (expected=2, actual=2)
+  PASS: S5a [v2] ambiguous rows carry candidate note (C1) (expected=2, actual=2)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      45	s5a-v2-1	ambiguous	NULL	NULL	0
+      47	s5a-v2-2	ambiguous	NULL	NULL	0
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	UNPAID
+      910002	900002	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+      900002	UNPAID	0	0
+  ==> S5a/C1 [v2] ambiguous: DOCUMENTED: 2 candidates -> ambiguous, neither settles; rows carry candidate note (C1)
+[run 11:26:38] S5b/C2 [v2] payment arrives before kode_unik exists
+      resp before kode exists: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"logged"}}
+  PASS: S5b [v2] early POST match=logged (expected=logged, actual=logged)
+      resp retry same key after kode born: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"logged"}}
+  PASS: S5b [v2] retry still logged (no re-match) (expected=logged, actual=logged)
+  PASS: S5b [v2] original row never applied (expected=0, actual=0)
+      resp NEW key, same amount, after kode born: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001,"apply":"ok"}}
+  PASS: S5b [v2] new key matches (proves it would have matched) (expected=matched, actual=matched)
+  PASS: S5b [v2] bills PAID (only via the new key) (expected=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      48	s5b-v2-early	logged	NULL	NULL	0
+      50	s5b-v2-late	matched	900001	910001	1
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> S5b/C2 [v2] early payment: DOCUMENTED: logged, never re-matched; settles only if re-sent under a new key
+[run 11:26:39] admin session fixture ready (sess c2harnessadmin00000000000000001)
+[run 11:26:39] S5b-R1 [v2] early payment, then operator re-match
+  PASS: R1 [v2] early POST match=logged (expected=logged, actual=logged)
+      rematch response: {"ok":true,"log_id":51,"before":"logged","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"proforma":910001,"applied_at":"2026-11-25 04:26:39","apply_note":"ok: proforma 910001 PAID; pemasukan INV-TEST-910001 | mt: dilewati (konfigurasi router kosong)","rematch_count":1,"last_rematch_at":"2026-11-25 04:26:39","rematched_by":"admin"}
+  PASS: R1 [v2] rematch ok (expected=True, actual=True)
+  PASS: R1 [v2] rematch before=logged (expected=logged, actual=logged)
+  PASS: R1 [v2] rematch after=matched (expected=matched, actual=matched)
+  PASS: R1 [v2] rematch applied (expected=True, actual=True)
+  PASS: R1 [v2] bills PAID (expected=1, actual=1)
+  PASS: R1 [v2] pemasukan rows (expected=1, actual=1)
+  PASS: R1 [v2] applied_at set (expected=1, actual=1)
+  PASS: R1 [v2] rematch_count=1 (expected=1, actual=1)
+  PASS: R1 [v2] rematched_by=admin (expected=admin, actual=admin)
+  PASS: R1 [v2] dedupe_key unchanged (expected=r1-v2-early, actual=r1-v2-early)
+  PASS: R1 [v2] retry flagged duplicate (expected=True, actual=True)
+  PASS: R1 [v2] retry reports stored matched (expected=matched, actual=matched)
+  PASS: R1 [v2] still 1 effect after retry (expected=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      51	r1-v2-early	matched	900001	910001	1
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> S5b-R1 [v2] operator re-match: PASS (logged -> matched + applied, exactly 1 effect)
+[run 11:26:40] S5b-R2 [v2] re-match with no matching candidate (stays logged)
+      rematch response: {"ok":true,"log_id":53,"before":"logged","after":"logged","applied":false,"note":"tetap logged \u2014 tidak ada kandidat yang cocok","candidates":0,"applied_at":null,"apply_note":null,"rematch_count":1,"last_rematch_at":"2026-11-25 04:26:40","rematched_by":"admin"}
+  PASS: R2 [v2] rematch ok (expected=True, actual=True)
+  PASS: R2 [v2] rematch after=logged (expected=logged, actual=logged)
+  PASS: R2 [v2] rematch applied=false (expected=False, actual=False)
+  PASS: R2 [v2] bills PAID (expected=0, actual=0)
+  PASS: R2 [v2] pemasukan rows (expected=0, actual=0)
+  PASS: R2 [v2] rematch_count=1 (attempt audited) (expected=1, actual=1)
+  PASS: R2 [v2] row still logged (expected=logged, actual=logged)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      53	r2-v2-early	logged	NULL	NULL	0
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+  ==> S5b-R2 [v2] re-match no-op: PASS (stays logged, attempt audited, 0 effects)
+[run 11:26:41] S5b-R3 [v2] 12 concurrent re-match calls, one row
+  PASS: R3 [v2] exactly one caller applied (expected=1, actual=1)
+  PASS: R3 [v2] bills PAID (expected=1, actual=1)
+  PASS: R3 [v2] pemasukan rows (expected=1, actual=1)
+  PASS: R3 [v2] applied log rows (expected=1, actual=1)
+  PASS: R3 [v2] rematch_count=1 (expected=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      54	r3-v2-early	matched	900001	910001	1
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> S5b-R3 [v2] concurrent re-match: PASS (12 callers, 1 effect)
+[run 11:26:41] S5b-R4 [v2] re-match racing a fresh notify, 3 rounds
+  PASS: R4 [v2] round 1 bills PAID (expected=1, actual=1)
+  PASS: R4 [v2] round 1 pemasukan rows (expected=1, actual=1)
+  PASS: R4 [v2] round 1 applied log rows (expected=1, actual=1)
+  PASS: R4 [v2] round 1 log rows (expected=2, actual=2)
+  PASS: R4 [v2] round 2 bills PAID (expected=1, actual=1)
+  PASS: R4 [v2] round 2 pemasukan rows (expected=1, actual=1)
+  PASS: R4 [v2] round 2 applied log rows (expected=1, actual=1)
+  PASS: R4 [v2] round 2 log rows (expected=2, actual=2)
+  PASS: R4 [v2] round 3 bills PAID (expected=1, actual=1)
+  PASS: R4 [v2] round 3 pemasukan rows (expected=1, actual=1)
+  PASS: R4 [v2] round 3 applied log rows (expected=1, actual=1)
+  PASS: R4 [v2] round 3 log rows (expected=2, actual=2)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      59	r4-v2-r3-early	matched	900001	910001	1
+      60	r4-v2-r3-new	matched	900001	910001	0
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> S5b-R4 [v2] re-match vs notify: PASS (race, exactly 1 effect each round)
+[run 11:26:42] S5b-R5 [v2] re-match with two candidates (ambiguous, no settle)
+      rematch response: {"ok":true,"log_id":61,"before":"logged","after":"ambiguous","applied":false,"note":"re-match: 2 kandidat (ambiguous)","candidates":2,"applied_at":null,"apply_note":"ambiguous: 2 kandidat \u2014 perlu keputusan operator","rematch_count":1,"last_rematch_at":"2026-11-25 04:26:43","rematched_by":"admin"}
+  PASS: R5 [v2] rematch ok (expected=True, actual=True)
+  PASS: R5 [v2] rematch after=ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: R5 [v2] rematch applied=false (expected=False, actual=False)
+  PASS: R5 [v2] candidates=2 (expected=2, actual=2)
+  PASS: R5 [v2] bills PAID (expected=0, actual=0)
+  PASS: R5 [v2] pemasukan rows (expected=0, actual=0)
+  PASS: R5 [v2] rematch_count=1 (expected=1, actual=1)
+  PASS: R5 [v2] ambiguous note names candidates (C1) (matches /ambiguous: 2 kandidat/: ambiguous: 2 kandidat — perlu keputusan operator)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      61	r5-v2-early	ambiguous	NULL	NULL	0
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	UNPAID
+      910002	900002	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+      900002	UNPAID	0	0
+  ==> S5b-R5 [v2] re-match ambiguous: PASS (ambiguous, 0 effects, operator resolves)
+[run 11:26:43] S5b-R6 [v2] kode-birth hook auto-matches the waiting payment
+  PASS: R6 [v2] early POST logged (expected=logged, actual=logged)
+      hook response: {"ok":true,"hook":{"proforma":910001,"kode_unik":123,"expected":100823,"checked":1,"applied":1}}
+  PASS: R6 [v2] hook probe ok (expected=True, actual=True)
+  PASS: R6 [v2] hook checked 1 waiting row (expected=1, actual=1)
+  PASS: R6 [v2] hook applied 1 (expected=1, actual=1)
+  PASS: R6 [v2] row matched (expected=matched, actual=matched)
+  PASS: R6 [v2] applied_at set (expected=1, actual=1)
+  PASS: R6 [v2] rematched_by=kode-birth (expected=kode-birth, actual=kode-birth)
+  PASS: R6 [v2] rematch_count=1 (expected=1, actual=1)
+  PASS: R6 [v2] bills PAID (expected=1, actual=1)
+  PASS: R6 [v2] pemasukan rows (expected=1, actual=1)
+  PASS: R6 [v2] 2nd hook call checks 0 rows (expected=0, actual=0)
+  PASS: R6 [v2] still 1 effect after 2nd hook (expected=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      62	r6-v2-early	matched	900001	910001	1
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> S5b-R6 [v2] kode-birth hook: PASS (waiting payment auto-settled exactly once)
+[run 11:26:44] S5b-R7 [v2] rematch guards (applied / nonexistent / auth)
+  PASS: R7 [v2] setup: bill PAID (expected=1, actual=1)
+      rematch applied-row response: {"ok":false,"log_id":63,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+  PASS: R7 [v2] applied row: ok=false (expected=False, actual=False)
+  PASS: R7 [v2] applied row: after=matched (expected=matched, actual=matched)
+  PASS: R7 [v2] applied row: applied=false (expected=False, actual=False)
+  PASS: R7 [v2] applied row: reason given (matches /sudah diterapkan/: sudah diterapkan — tidak ada yang dicocokkan ulang)
+  PASS: R7 [v2] applied row: rematch_count stays 0 (expected=0, actual=0)
+  PASS: R7 [v2] applied row: pemasukan stays 1 (expected=1, actual=1)
+  PASS: R7 [v2] nonexistent id: ok=false (expected=False, actual=False)
+  PASS: R7 [v2] nonexistent id: reason given (matches /tidak ditemukan/: log tidak ditemukan)
+  PASS: R7 [v2] no session -> 401 (expected=401, actual=401)
+  PASS: R7 [v2] session, no CSRF -> 403 (expected=403, actual=403)
+  PASS: R7 [v2] session, wrong CSRF -> 403 (expected=403, actual=403)
+  PASS: R7 [v2] device secret alone -> 401 (expected=401, actual=401)
+  PASS: R7 [v2] GET -> 405 (expected=405, actual=405)
+  PASS: R7 [v2] pemasukan still 1 after all guards (expected=1, actual=1)
+  PASS: R7 [v2] rematch_count still 0 after all guards (expected=0, actual=0)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      63	r7-v2-1	matched	900001	910001	1
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> S5b-R7 [v2] rematch guards: PASS (no-op + auth guards hold, 0 effects)
+[run 11:26:45] S5b-R8 [v2] C3 loser: marked + operator re-matches it to its own bill
+  PASS: R8 [v2] race: bills PAID (exactly one) (expected=1, actual=1)
+  PASS: R8 [v2] race: applied log rows (exactly one) (expected=1, actual=1)
+      R8 [v2] loser: id=65 status=matched note=kalah berebut: proforma 910001 sudah dilunasi notifikasi log #64 — cocokkan ulang manual bila pembayaran ini untuk tagihan lain
+  PASS: R8 [v2] loser row marked with winner (C3) (expected=1, actual=1)
+      rematch loser response: {"ok":true,"log_id":65,"before":"matched","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"proforma":910050,"applied_at":"2026-11-25 04:26:45","apply_note":"ok: proforma 910050 PAID; pemasukan INV-TEST-910050 | mt: dilewati (konfigurasi router kosong)","rematch_count":1,"last_rematch_at":"2026-11-25 04:26:45","rematched_by":"admin"}
+  PASS: R8 [v2] rematch loser ok (expected=True, actual=True)
+  PASS: R8 [v2] rematch loser after=matched (expected=matched, actual=matched)
+  PASS: R8 [v2] rematch loser applied=true (expected=True, actual=True)
+  PASS: R8 [v2] bills PAID now 2 (expected=2, actual=2)
+  PASS: R8 [v2] pemasukan rows now 2 (expected=2, actual=2)
+  PASS: R8 [v2] loser rematch_count=1 (expected=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      64	r8-v2-A	matched	900001	910001	1
+      65	r8-v2-B	matched	900001	910050	1
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      910050	900001	PAID
+      pemasukan_rows
+      2
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	60	10
+  ==> S5b-R8 [v2] C3 loser rematch: PASS (loser marked with winner; operator re-match settles its own bill)
+[run 11:26:46] S5b-R9 [v2] C6: same-customer twin nominals stay ambiguous
+  PASS: R9 [v2] twin nominal sanity (99900+223) (expected=100823, actual=100823)
+      resp twin-nominal payment: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"ambiguous","candidates":2}}
+  PASS: R9 [v2] twin nominals -> ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: R9 [v2] bills PAID (none settles) (expected=0, actual=0)
+  PASS: R9 [v2] pemasukan rows (expected=0, actual=0)
+  PASS: R9 [v2] ambiguous note names candidates (C1) (matches /ambiguous: 2 kandidat/: ambiguous: 2 kandidat — perlu keputusan operator)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      76	r9-v2-1	ambiguous	NULL	NULL	0
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	UNPAID
+      910002	900001	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+  ==> S5b-R9 [v2] C6 twin nominals: PASS (same-customer twins ambiguous, nothing settles; v2New unified with warganet)
+[run 11:26:46] S5c/C3 [v2] two senders (different keys) racing on ONE candidate
+  PASS: S5c [v2] log rows (one per sender) (expected=2, actual=2)
+  PASS: S5c [v2] bills PAID (exactly one) (expected=1, actual=1)
+  PASS: S5c [v2] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: S5c [v2] applied log rows (exactly one) (expected=1, actual=1)
+  PASS: S5c [v2] exactly one unapplied (loser) row (expected=1, actual=1)
+  PASS: S5c [v2] loser status is a known interleaving (logged)
+      S5c [v2] observed interleaving: loser ended 'logged'
+  PASS: S5c [v2] loser row marked with winner (C3) (expected=1, actual=1)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      77	s5c-v2-B	matched	900001	910001	1
+      79	s5c-v2-A	logged	NULL	NULL	0
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+  ==> S5c/C3 [v2] sender race: DOCUMENTED: 1 effect (atomic claim holds); loser 'logged', marked with winner, re-matchable (C3)
+[run 11:26:47] S5c-2 [v2] two senders, two DIFFERENT candidates (race control)
+  PASS: S5c-2 [v2] bills PAID (expected=2, actual=2)
+  PASS: S5c-2 [v2] pemasukan rows (expected=2, actual=2)
+  PASS: S5c-2 [v2] applied log rows (expected=2, actual=2)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      89	s5c2-v2-A	matched	900001	910001	1
+      92	s5c2-v2-B	matched	900002	910002	1
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      910002	900002	PAID
+      pemasukan_rows
+      2
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      900002	PAID	30	10
+  ==> S5c-2 [v2] race control: PASS (2 independent candidates settle concurrently)
+[run 11:26:47] S5d/C6 [v2] older UNPAID bill + newer UNPAID bill, same customer
+      resp older-bill amount: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910001,"apply":"ok"}}
+  PASS: S5d [v2] older bill MATCHES (C6 unified) (expected=matched, actual=matched)
+  PASS: S5d [v2] older bill PAID (expected=PAID, actual=PAID)
+      resp newer-bill amount: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"proforma":910002,"apply":"ok"}}
+  PASS: S5d [v2] newer bill also matches (expected=matched, actual=matched)
+  PASS: S5d [v2] newer bill PAID (expected=PAID, actual=PAID)
+  PASS: S5d [v2] pemasukan rows (expected=2, actual=2)
+      -- v2 evidence: qris_notif_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      101	s5d-v2-old	matched	900001	910001	1
+      102	s5d-v2-new	matched	900001	910002	1
+      -- v2 evidence: proforma + pemasukan + pelanggan
+      id	id_pelanggan	status
+      910001	900001	PAID
+      910002	900001	PAID
+      pemasukan_rows
+      2
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	60	10
+  ==> S5d/C6 [v2] unified all-UNPAID: C6 UNIFIED: matcher sees ALL UNPAID bills (was: latest-only); older bill settles
+[run 11:26:48] S1 [wg] retry after lost ACK (key=s1-wg-retry, amount=100823)
+      fire-and-forget POST landed (log row present, ACK never read)
+      retry response: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920001}}
+  PASS: S1 [wg] retry flagged duplicate (expected=True, actual=True)
+  PASS: S1 [wg] retry reports stored match (expected=matched, actual=matched)
+  PASS: S1 [wg] log rows for key (expected=1, actual=1)
+  PASS: S1 [wg] bills PAID (expected=1, actual=1)
+  PASS: S1 [wg] pemasukan rows (expected=1, actual=1)
+  PASS: S1 [wg] applied log rows (expected=1, actual=1)
+  PASS: S1 [wg] customer masa_aktif 0->30 (expected=30, actual=30)
+  PASS: S1 [wg] customer poin 0->10 (UNPAID) (expected=10, actual=10)
+  PASS: S1 [wg] report rows (WA attempt recorded) (expected=1, actual=1)
+  PASS: S1 [wg] report status names dead proxy (matches /FAILED: curl:.*59999/: FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not connect to server)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      3	s1-wg-retry	matched	900001	920001	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      report_rows
+      1
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S1 [wg] retry/lost-ACK: PASS (2 POSTs, 1 business effect)
+[run 11:26:51] S2 [wg] 12 concurrent POSTs, same key, 3 rounds
+  PASS: S2 [wg] round 1 duplicate responses (expected=11, actual=11)
+  PASS: S2 [wg] round 1 non-duplicate responses (expected=1, actual=1)
+  PASS: S2 [wg] round 1 log rows (expected=1, actual=1)
+  PASS: S2 [wg] round 1 bills PAID (expected=1, actual=1)
+  PASS: S2 [wg] round 1 pemasukan rows (expected=1, actual=1)
+  PASS: S2 [wg] round 2 duplicate responses (expected=11, actual=11)
+  PASS: S2 [wg] round 2 non-duplicate responses (expected=1, actual=1)
+  PASS: S2 [wg] round 2 log rows (expected=1, actual=1)
+  PASS: S2 [wg] round 2 bills PAID (expected=1, actual=1)
+  PASS: S2 [wg] round 2 pemasukan rows (expected=1, actual=1)
+  PASS: S2 [wg] round 3 duplicate responses (expected=11, actual=11)
+  PASS: S2 [wg] round 3 non-duplicate responses (expected=1, actual=1)
+  PASS: S2 [wg] round 3 log rows (expected=1, actual=1)
+  PASS: S2 [wg] round 3 bills PAID (expected=1, actual=1)
+  PASS: S2 [wg] round 3 pemasukan rows (expected=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      29	s2-wg-r3	matched	900001	920001	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      report_rows
+      1
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S2 [wg] concurrent POST: PASS (12 POSTs x 3 rounds, 1 effect each)
+[run 11:26:52] S3 [wg] POST, restart whole test stack, re-POST same key
+      first POST response: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920001,"apply":"ok"}}
+  PASS: S3 [wg] first POST applied (expected=1, actual=1)
+[run 11:26:52] S3 [wg] restarting stack (PHP workers + scratch MariaDB)...
+[run 11:26:57] S3 [wg] stack back up; re-POSTing same key
+      re-POST response: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920001}}
+  PASS: S3 [wg] re-POST flagged duplicate (expected=True, actual=True)
+  PASS: S3 [wg] log rows for key after restart (expected=1, actual=1)
+  PASS: S3 [wg] bills PAID after restart (expected=1, actual=1)
+  PASS: S3 [wg] pemasukan rows after restart (expected=1, actual=1)
+  PASS: S3 [wg] applied_at survived restart (expected=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      41	s3-wg-restart	matched	900001	920001	1
+      42	smoke-wg-1	logged	NULL	NULL	0
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      report_rows
+      1
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S3 [wg] restart durability: PASS (1 effect across restart)
+[run 11:26:57] S4 [wg] negative control: 2 keys, 2 payments -> 2 effects
+      resp A: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920001,"apply":"ok"}}
+      resp B: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900002,"payment":920002,"apply":"ok"}}
+  PASS: S4 [wg] bills PAID (expected=2, actual=2)
+  PASS: S4 [wg] pemasukan rows (expected=2, actual=2)
+  PASS: S4 [wg] log rows (expected=2, actual=2)
+  PASS: S4 [wg] applied log rows (expected=2, actual=2)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      44	s4-wg-a	matched	900001	920001	1
+      45	s4-wg-b	matched	900002	920002	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      920002	900002	PAID
+      pemasukan_rows
+      2
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      900002	PAID	30	10
+      report_rows
+      2
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S4 [wg] negative control: PASS (2 keys -> 2 effects, dedupe not over-broad)
+[run 11:26:58] S5a/C1 [wg] two candidates, same nominal (ambiguous?)
+      resp 1st key: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"ambiguous","candidates":2}}
+      resp retry same key: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"ambiguous"}}
+      resp 2nd key, same amount: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"ambiguous","candidates":2}}
+  PASS: S5a [wg] 1st POST match=ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: S5a [wg] retry still ambiguous (stored) (expected=ambiguous, actual=ambiguous)
+  PASS: S5a [wg] 2nd key also ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: S5a [wg] bills PAID (none must settle) (expected=0, actual=0)
+  PASS: S5a [wg] pemasukan rows (expected=0, actual=0)
+  PASS: S5a [wg] ambiguous log rows (expected=2, actual=2)
+  PASS: S5a [wg] ambiguous rows carry candidate note (C1) (expected=2, actual=2)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      46	s5a-wg-1	ambiguous	NULL	NULL	0
+      48	s5a-wg-2	ambiguous	NULL	NULL	0
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	UNPAID
+      920002	900002	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+      900002	UNPAID	0	0
+      report_rows
+      0
+  ==> S5a/C1 [wg] ambiguous: DOCUMENTED: 2 candidates -> ambiguous, neither settles; rows carry candidate note (C1)
+[run 11:26:58] S5b/C2 [wg] payment arrives before kode_unik exists
+      resp before kode exists: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"logged"}}
+  PASS: S5b [wg] early POST match=logged (expected=logged, actual=logged)
+      resp retry same key after kode born: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"logged"}}
+  PASS: S5b [wg] retry still logged (no re-match) (expected=logged, actual=logged)
+  PASS: S5b [wg] original row never applied (expected=0, actual=0)
+      resp NEW key, same amount, after kode born: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920001,"apply":"ok"}}
+  PASS: S5b [wg] new key matches (proves it would have matched) (expected=matched, actual=matched)
+  PASS: S5b [wg] bills PAID (only via the new key) (expected=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      49	s5b-wg-early	logged	NULL	NULL	0
+      51	s5b-wg-late	matched	900001	920001	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      report_rows
+      1
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S5b/C2 [wg] early payment: DOCUMENTED: logged, never re-matched; settles only if re-sent under a new key
+[run 11:26:59] admin session fixture ready (sess c2harnessadmin00000000000000001)
+[run 11:26:59] S5b-R1 [wg] early payment, then operator re-match
+  PASS: R1 [wg] early POST match=logged (expected=logged, actual=logged)
+      rematch response: {"ok":true,"log_id":52,"before":"logged","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"payment":920001,"applied_at":"2026-11-25 04:26:59","apply_note":"lunas via Paylist (payment 920001, idtrx TRX-TEST-920001)","rematch_count":1,"last_rematch_at":"2026-11-25 04:26:59","rematched_by":"admin"}
+  PASS: R1 [wg] rematch ok (expected=True, actual=True)
+  PASS: R1 [wg] rematch before=logged (expected=logged, actual=logged)
+  PASS: R1 [wg] rematch after=matched (expected=matched, actual=matched)
+  PASS: R1 [wg] rematch applied (expected=True, actual=True)
+  PASS: R1 [wg] bills PAID (expected=1, actual=1)
+  PASS: R1 [wg] pemasukan rows (expected=1, actual=1)
+  PASS: R1 [wg] applied_at set (expected=1, actual=1)
+  PASS: R1 [wg] rematch_count=1 (expected=1, actual=1)
+  PASS: R1 [wg] rematched_by=admin (expected=admin, actual=admin)
+  PASS: R1 [wg] dedupe_key unchanged (expected=r1-wg-early, actual=r1-wg-early)
+  PASS: R1 [wg] retry flagged duplicate (expected=True, actual=True)
+  PASS: R1 [wg] retry reports stored matched (expected=matched, actual=matched)
+  PASS: R1 [wg] still 1 effect after retry (expected=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      52	r1-wg-early	matched	900001	920001	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      report_rows
+      1
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S5b-R1 [wg] operator re-match: PASS (logged -> matched + applied, exactly 1 effect)
+[run 11:27:00] S5b-R2 [wg] re-match with no matching candidate (stays logged)
+      rematch response: {"ok":true,"log_id":54,"before":"logged","after":"logged","applied":false,"note":"tetap logged \u2014 tidak ada kandidat yang cocok","candidates":0,"applied_at":null,"apply_note":null,"rematch_count":1,"last_rematch_at":"2026-11-25 04:27:00","rematched_by":"admin"}
+  PASS: R2 [wg] rematch ok (expected=True, actual=True)
+  PASS: R2 [wg] rematch after=logged (expected=logged, actual=logged)
+  PASS: R2 [wg] rematch applied=false (expected=False, actual=False)
+  PASS: R2 [wg] bills PAID (expected=0, actual=0)
+  PASS: R2 [wg] pemasukan rows (expected=0, actual=0)
+  PASS: R2 [wg] rematch_count=1 (attempt audited) (expected=1, actual=1)
+  PASS: R2 [wg] row still logged (expected=logged, actual=logged)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      54	r2-wg-early	logged	NULL	NULL	0
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+      report_rows
+      0
+  ==> S5b-R2 [wg] re-match no-op: PASS (stays logged, attempt audited, 0 effects)
+[run 11:27:00] S5b-R3 [wg] 12 concurrent re-match calls, one row
+  PASS: R3 [wg] exactly one caller applied (expected=1, actual=1)
+  PASS: R3 [wg] bills PAID (expected=1, actual=1)
+  PASS: R3 [wg] pemasukan rows (expected=1, actual=1)
+  PASS: R3 [wg] applied log rows (expected=1, actual=1)
+  PASS: R3 [wg] rematch_count=1 (expected=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      55	r3-wg-early	matched	900001	920001	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      report_rows
+      1
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S5b-R3 [wg] concurrent re-match: PASS (12 callers, 1 effect)
+[run 11:27:01] S5b-R4 [wg] re-match racing a fresh notify, 3 rounds
+  PASS: R4 [wg] round 1 bills PAID (expected=1, actual=1)
+  PASS: R4 [wg] round 1 pemasukan rows (expected=1, actual=1)
+  PASS: R4 [wg] round 1 applied log rows (expected=1, actual=1)
+  PASS: R4 [wg] round 1 log rows (expected=2, actual=2)
+  PASS: R4 [wg] round 2 bills PAID (expected=1, actual=1)
+  PASS: R4 [wg] round 2 pemasukan rows (expected=1, actual=1)
+  PASS: R4 [wg] round 2 applied log rows (expected=1, actual=1)
+  PASS: R4 [wg] round 2 log rows (expected=2, actual=2)
+  PASS: R4 [wg] round 3 bills PAID (expected=1, actual=1)
+  PASS: R4 [wg] round 3 pemasukan rows (expected=1, actual=1)
+  PASS: R4 [wg] round 3 applied log rows (expected=1, actual=1)
+  PASS: R4 [wg] round 3 log rows (expected=2, actual=2)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      60	r4-wg-r3-early	matched	900001	920001	1
+      61	r4-wg-r3-new	matched	900001	920001	0
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      report_rows
+      1
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S5b-R4 [wg] re-match vs notify: PASS (race, exactly 1 effect each round)
+[run 11:27:02] S5b-R5 [wg] re-match with two candidates (ambiguous, no settle)
+      rematch response: {"ok":true,"log_id":62,"before":"logged","after":"ambiguous","applied":false,"note":"re-match: 2 kandidat (ambiguous)","candidates":2,"applied_at":null,"apply_note":"ambiguous: 2 kandidat \u2014 perlu keputusan operator","rematch_count":1,"last_rematch_at":"2026-11-25 04:27:03","rematched_by":"admin"}
+  PASS: R5 [wg] rematch ok (expected=True, actual=True)
+  PASS: R5 [wg] rematch after=ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: R5 [wg] rematch applied=false (expected=False, actual=False)
+  PASS: R5 [wg] candidates=2 (expected=2, actual=2)
+  PASS: R5 [wg] bills PAID (expected=0, actual=0)
+  PASS: R5 [wg] pemasukan rows (expected=0, actual=0)
+  PASS: R5 [wg] rematch_count=1 (expected=1, actual=1)
+  PASS: R5 [wg] ambiguous note names candidates (C1) (matches /ambiguous: 2 kandidat/: ambiguous: 2 kandidat — perlu keputusan operator)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      62	r5-wg-early	ambiguous	NULL	NULL	0
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	UNPAID
+      920002	900002	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+      900002	UNPAID	0	0
+      report_rows
+      0
+  ==> S5b-R5 [wg] re-match ambiguous: PASS (ambiguous, 0 effects, operator resolves)
+[run 11:27:03] S5b-R6 [wg] kode-birth hook auto-matches the waiting payment
+  PASS: R6 [wg] early POST logged (expected=logged, actual=logged)
+      hook response: {"ok":true,"hook":{"payment":920001,"kode_unik":123,"expected":100823,"checked":1,"applied":1}}
+  PASS: R6 [wg] hook probe ok (expected=True, actual=True)
+  PASS: R6 [wg] hook checked 1 waiting row (expected=1, actual=1)
+  PASS: R6 [wg] hook applied 1 (expected=1, actual=1)
+  PASS: R6 [wg] row matched (expected=matched, actual=matched)
+  PASS: R6 [wg] applied_at set (expected=1, actual=1)
+  PASS: R6 [wg] rematched_by=kode-birth (expected=kode-birth, actual=kode-birth)
+  PASS: R6 [wg] rematch_count=1 (expected=1, actual=1)
+  PASS: R6 [wg] bills PAID (expected=1, actual=1)
+  PASS: R6 [wg] pemasukan rows (expected=1, actual=1)
+  PASS: R6 [wg] 2nd hook call checks 0 rows (expected=0, actual=0)
+  PASS: R6 [wg] still 1 effect after 2nd hook (expected=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      63	r6-wg-early	matched	900001	920001	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      report_rows
+      1
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S5b-R6 [wg] kode-birth hook: PASS (waiting payment auto-settled exactly once)
+[run 11:27:04] S5b-R7 [wg] rematch guards (applied / nonexistent / auth)
+  PASS: R7 [wg] setup: bill PAID (expected=1, actual=1)
+      rematch applied-row response: {"ok":false,"log_id":64,"before":"matched","after":"matched","applied":false,"note":"sudah diterapkan \u2014 tidak ada yang dicocokkan ulang"}
+  PASS: R7 [wg] applied row: ok=false (expected=False, actual=False)
+  PASS: R7 [wg] applied row: after=matched (expected=matched, actual=matched)
+  PASS: R7 [wg] applied row: applied=false (expected=False, actual=False)
+  PASS: R7 [wg] applied row: reason given (matches /sudah diterapkan/: sudah diterapkan — tidak ada yang dicocokkan ulang)
+  PASS: R7 [wg] applied row: rematch_count stays 0 (expected=0, actual=0)
+  PASS: R7 [wg] applied row: pemasukan stays 1 (expected=1, actual=1)
+  PASS: R7 [wg] nonexistent id: ok=false (expected=False, actual=False)
+  PASS: R7 [wg] nonexistent id: reason given (matches /tidak ditemukan/: log tidak ditemukan)
+  PASS: R7 [wg] no session -> 401 (expected=401, actual=401)
+  PASS: R7 [wg] session, no CSRF -> 403 (expected=403, actual=403)
+  PASS: R7 [wg] session, wrong CSRF -> 403 (expected=403, actual=403)
+  PASS: R7 [wg] device secret alone -> 401 (expected=401, actual=401)
+  PASS: R7 [wg] GET -> 405 (expected=405, actual=405)
+  PASS: R7 [wg] pemasukan still 1 after all guards (expected=1, actual=1)
+  PASS: R7 [wg] rematch_count still 0 after all guards (expected=0, actual=0)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      64	r7-wg-1	matched	900001	920001	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      report_rows
+      1
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S5b-R7 [wg] rematch guards: PASS (no-op + auth guards hold, 0 effects)
+[run 11:27:05] S5b-R8 [wg] C3 loser: marked + operator re-matches it to its own bill
+  PASS: R8 [wg] race: bills PAID (exactly one) (expected=1, actual=1)
+  PASS: R8 [wg] race: applied log rows (exactly one) (expected=1, actual=1)
+      R8 [wg] loser: id=65 status=matched note=kalah berebut: payment 920001 sudah dilunasi notifikasi log #66 — cocokkan ulang manual bila pembayaran ini untuk tagihan lain
+  PASS: R8 [wg] loser row marked with winner (C3) (expected=1, actual=1)
+      rematch loser response: {"ok":true,"log_id":65,"before":"matched","after":"matched","applied":true,"note":"cocok + dilunasi","candidates":1,"id_pelanggan":900001,"payment":920050,"applied_at":"2026-11-25 04:27:05","apply_note":"lunas via Paylist (payment 920050, idtrx TRX-TEST-920050)","rematch_count":1,"last_rematch_at":"2026-11-25 04:27:05","rematched_by":"admin"}
+  PASS: R8 [wg] rematch loser ok (expected=True, actual=True)
+  PASS: R8 [wg] rematch loser after=matched (expected=matched, actual=matched)
+  PASS: R8 [wg] rematch loser applied=true (expected=True, actual=True)
+  PASS: R8 [wg] bills PAID now 2 (expected=2, actual=2)
+  PASS: R8 [wg] pemasukan rows now 2 (expected=2, actual=2)
+  PASS: R8 [wg] loser rematch_count=1 (expected=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      65	r8-wg-A	matched	900001	920050	1
+      66	r8-wg-B	matched	900001	920001	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      920050	900001	PAID
+      pemasukan_rows
+      2
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	60	10
+      report_rows
+      2
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S5b-R8 [wg] C3 loser rematch: PASS (loser marked with winner; operator re-match settles its own bill)
+[run 11:27:06] S5b-R9 [wg] C6: same-customer twin nominals stay ambiguous
+  PASS: R9 [wg] twin nominal sanity (99900+223) (expected=100823, actual=100823)
+      resp twin-nominal payment: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"ambiguous","candidates":2}}
+  PASS: R9 [wg] twin nominals -> ambiguous (expected=ambiguous, actual=ambiguous)
+  PASS: R9 [wg] bills PAID (none settles) (expected=0, actual=0)
+  PASS: R9 [wg] pemasukan rows (expected=0, actual=0)
+  PASS: R9 [wg] ambiguous note names candidates (C1) (matches /ambiguous: 2 kandidat/: ambiguous: 2 kandidat — perlu keputusan operator)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      77	r9-wg-1	ambiguous	NULL	NULL	0
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	UNPAID
+      920002	900001	UNPAID
+      pemasukan_rows
+      0
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	UNPAID	0	0
+      report_rows
+      0
+  ==> S5b-R9 [wg] C6 twin nominals: PASS (same-customer twins ambiguous, nothing settles; v2New unified with warganet)
+[run 11:27:06] S5c/C3 [wg] two senders (different keys) racing on ONE candidate
+  PASS: S5c [wg] log rows (one per sender) (expected=2, actual=2)
+  PASS: S5c [wg] bills PAID (exactly one) (expected=1, actual=1)
+  PASS: S5c [wg] pemasukan rows (exactly one) (expected=1, actual=1)
+  PASS: S5c [wg] applied log rows (exactly one) (expected=1, actual=1)
+  PASS: S5c [wg] exactly one unapplied (loser) row (expected=1, actual=1)
+  PASS: S5c [wg] loser status is a known interleaving (matched)
+      S5c [wg] observed interleaving: loser ended 'matched'
+  PASS: S5c [wg] loser row marked with winner (C3) (expected=1, actual=1)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      78	s5c-wg-A	matched	900001	920001	0
+      79	s5c-wg-B	matched	900001	920001	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      pemasukan_rows
+      1
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      report_rows
+      1
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S5c/C3 [wg] sender race: DOCUMENTED: 1 effect (atomic claim holds); loser 'matched', marked with winner, re-matchable (C3)
+[run 11:27:07] S5c-2 [wg] two senders, two DIFFERENT candidates (race control)
+  PASS: S5c-2 [wg] bills PAID (expected=2, actual=2)
+  PASS: S5c-2 [wg] pemasukan rows (expected=2, actual=2)
+  PASS: S5c-2 [wg] applied log rows (expected=2, actual=2)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      90	s5c2-wg-A	matched	900001	920001	1
+      92	s5c2-wg-B	matched	900002	920002	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      920002	900002	PAID
+      pemasukan_rows
+      2
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	30	10
+      900002	PAID	30	10
+      report_rows
+      2
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S5c-2 [wg] race control: PASS (2 independent candidates settle concurrently)
+[run 11:27:08] S5d/C6 [wg] older UNPAID bill + newer UNPAID bill, same customer
+      resp older-bill amount: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920001,"apply":"ok"}}
+  PASS: S5d [wg] older bill MATCHES (all-UNPAID matcher) (expected=matched, actual=matched)
+  PASS: S5d [wg] older bill PAID (expected=PAID, actual=PAID)
+      resp newer-bill amount: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":900001,"payment":920002,"apply":"ok"}}
+  PASS: S5d [wg] newer bill also matches (expected=matched, actual=matched)
+  PASS: S5d [wg] newer bill PAID (expected=PAID, actual=PAID)
+  PASS: S5d [wg] pemasukan rows (expected=2, actual=2)
+      -- wg evidence: paylist_log
+      id	dedupe_key	match_status	matched_id_pelanggan	matched_bill	applied
+      102	s5d-wg-old	matched	900001	920001	1
+      103	s5d-wg-new	matched	900001	920002	1
+      -- wg evidence: payment + pemasukan + pelanggan
+      id	id_pelanggan	status
+      920001	900001	PAID
+      920002	900001	PAID
+      pemasukan_rows
+      2
+      id_pelanggan	status_pembayaran	masa_aktif	poin
+      900001	PAID	60	10
+      report_rows
+      2
+      target	status
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+      	FAILED: curl: Failed to connect to 127.0.0.1 port 59999 after 0 ms: Could not co
+  ==> S5d/C6 [wg] all-UNPAID: DOCUMENTED: matcher sees ALL UNPAID bills; older bill settles (same rule as v2New since C6)
+[run 11:27:08] S6 [wg] top-up branch: POST + retry (key=s6-wg-topup, amount=50427)
+      resp 1st: {"ok":true,"duplicate":false,"mode":"observasi","match":{"status":"matched","id_pelanggan":6281234567890,"payment":920099,"apply":"ok"}}
+      resp retry: {"ok":true,"duplicate":true,"mode":"observasi","match":{"status":"matched","id_pelanggan":6281234567890,"payment":920099}}
+  PASS: S6 [wg] 1st POST matched (expected=matched, actual=matched)
+  PASS: S6 [wg] retry flagged duplicate (expected=True, actual=True)
+  PASS: S6 [wg] payment PAID (expected=PAID, actual=PAID)
+  PASS: S6 [wg] mitra saldo credited once (50000) (expected=50000.00, actual=50000.00)
+  PASS: S6 [wg] saldo_history rows (expected=1, actual=1)
+  PASS: S6 [wg] pemasukan_hotspot rows (expected=1, actual=1)
+  PASS: S6 [wg] applied log rows (expected=1, actual=1)
+      id	nama_pelanggan	status
+      920099	Mitra Uji	PAID
+      id_mitra	saldo
+      990001	50000.00
+      history
+      1
+      hotspot
+      1
+  ==> S6 [wg] top-up retry: PASS (2 POSTs, 1 credit of Rp50.000)
+
+==================== SUMMARY ====================
+  S1 [v2] retry/lost-ACK: PASS (2 POSTs, 1 business effect)
+  S2 [v2] concurrent POST: PASS (12 POSTs x 3 rounds, 1 effect each)
+  S3 [v2] restart durability: PASS (1 effect across restart)
+  S4 [v2] negative control: PASS (2 keys -> 2 effects, dedupe not over-broad)
+  S5a/C1 [v2] ambiguous: DOCUMENTED: 2 candidates -> ambiguous, neither settles; rows carry candidate note (C1)
+  S5b/C2 [v2] early payment: DOCUMENTED: logged, never re-matched; settles only if re-sent under a new key
+  S5b-R1 [v2] operator re-match: PASS (logged -> matched + applied, exactly 1 effect)
+  S5b-R2 [v2] re-match no-op: PASS (stays logged, attempt audited, 0 effects)
+  S5b-R3 [v2] concurrent re-match: PASS (12 callers, 1 effect)
+  S5b-R4 [v2] re-match vs notify: PASS (race, exactly 1 effect each round)
+  S5b-R5 [v2] re-match ambiguous: PASS (ambiguous, 0 effects, operator resolves)
+  S5b-R6 [v2] kode-birth hook: PASS (waiting payment auto-settled exactly once)
+  S5b-R7 [v2] rematch guards: PASS (no-op + auth guards hold, 0 effects)
+  S5b-R8 [v2] C3 loser rematch: PASS (loser marked with winner; operator re-match settles its own bill)
+  S5b-R9 [v2] C6 twin nominals: PASS (same-customer twins ambiguous, nothing settles; v2New unified with warganet)
+  S5c/C3 [v2] sender race: DOCUMENTED: 1 effect (atomic claim holds); loser 'logged', marked with winner, re-matchable (C3)
+  S5c-2 [v2] race control: PASS (2 independent candidates settle concurrently)
+  S5d/C6 [v2] unified all-UNPAID: C6 UNIFIED: matcher sees ALL UNPAID bills (was: latest-only); older bill settles
+  S1 [wg] retry/lost-ACK: PASS (2 POSTs, 1 business effect)
+  S2 [wg] concurrent POST: PASS (12 POSTs x 3 rounds, 1 effect each)
+  S3 [wg] restart durability: PASS (1 effect across restart)
+  S4 [wg] negative control: PASS (2 keys -> 2 effects, dedupe not over-broad)
+  S5a/C1 [wg] ambiguous: DOCUMENTED: 2 candidates -> ambiguous, neither settles; rows carry candidate note (C1)
+  S5b/C2 [wg] early payment: DOCUMENTED: logged, never re-matched; settles only if re-sent under a new key
+  S5b-R1 [wg] operator re-match: PASS (logged -> matched + applied, exactly 1 effect)
+  S5b-R2 [wg] re-match no-op: PASS (stays logged, attempt audited, 0 effects)
+  S5b-R3 [wg] concurrent re-match: PASS (12 callers, 1 effect)
+  S5b-R4 [wg] re-match vs notify: PASS (race, exactly 1 effect each round)
+  S5b-R5 [wg] re-match ambiguous: PASS (ambiguous, 0 effects, operator resolves)
+  S5b-R6 [wg] kode-birth hook: PASS (waiting payment auto-settled exactly once)
+  S5b-R7 [wg] rematch guards: PASS (no-op + auth guards hold, 0 effects)
+  S5b-R8 [wg] C3 loser rematch: PASS (loser marked with winner; operator re-match settles its own bill)
+  S5b-R9 [wg] C6 twin nominals: PASS (same-customer twins ambiguous, nothing settles; v2New unified with warganet)
+  S5c/C3 [wg] sender race: DOCUMENTED: 1 effect (atomic claim holds); loser 'matched', marked with winner, re-matchable (C3)
+  S5c-2 [wg] race control: PASS (2 independent candidates settle concurrently)
+  S5d/C6 [wg] all-UNPAID: DOCUMENTED: matcher sees ALL UNPAID bills; older bill settles (same rule as v2New since C6)
+  S6 [wg] top-up retry: PASS (2 POSTs, 1 credit of Rp50.000)
+-------------------------------------------------
+assertions: PASS=305 FAIL=0
+full log: /home/warganet/paylist-contract-m1011/results/run-20261125-112627.log
+RESULT: ALL SCENARIOS BEHAVED AS SPECIFIED

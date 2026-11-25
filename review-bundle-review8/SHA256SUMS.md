@@ -1,4 +1,7 @@
 # sha256 manifest — C2 review #8 bundle (generated 2026-11-24T03:26:06Z)
+# regenerated 2026-11-25: review #9 follow-ups (a)–(d) folded in (new diffs,
+# runners, logs, notes); review #8 entries kept verbatim, except
+# runners/stale-orchestrator.php, updated to the post-(b) version
 # originals verified byte-identical to production 23 Nov 2026, re-verified 24 Nov 2026 (zero drift)
 # patched = review #8 state: C2 (review #7) + birth-fix 24 Nov 07:54 + stale-binding fix 24 Nov 10:16
 
@@ -46,6 +49,17 @@ member/payment.php (deV2, birth-fix 24 Nov 07:52): fbc1fee093055ac3c9e4b0125898f
 bayar.php (deV2, birth-fix 24 Nov 07:52): 4ff18fc64ba215ce86bafdeeac68eb0e4ba0340280e5aaa4761cefabb1f17f9a
 bayarQR/qris_apply.php (deV2, review8 stale-binding fix 24 Nov 10:14): 99a99e487918f9e800d8f2969a8ce9ded71f8da6f0b57d975cb2a6390625d9bd
 
+## deV2 deployed (review #9a, verified live 25 Nov 09:46)
+bayarQR/qris_apply.php (deV2, review9a points-race fix 25 Nov 09:46): aecf9db69d0799f8dda311cad73473aea2a165be84b02d9e24f08c47b0432057
+member/payment.php (deV2, unchanged since birth-fix): fbc1fee093055ac3c9e4b0125898f219d5074fa16d231600305de3711b0e67c7
+bayar.php (deV2, unchanged since birth-fix): 4ff18fc64ba215ce86bafdeeac68eb0e4ba0340280e5aaa4761cefabb1f17f9a
+
+## review #9a fixed files (c2-impl source tree: review9-points/fixed/)
+aecf9db69d0799f8dda311cad73473aea2a165be84b02d9e24f08c47b0432057  review9-points/fixed/v2-qris_apply.php
+b05bc1d5fc194f8c6fc6e2b721ec62a296b0d7c2e9ad2b5d7aaa5db350b1403c  review9-points/fixed/wg-paylist_apply.php
+c8ae8cf34a106ccbaa2afcbd9caf21e9ff0d0ae76cbe0562f476342bbdadcf64  review9-points/fixed/stale-orchestrator.php (review9a state; bundle runners/ copy is the later post-(b) version, see below)
+00a6ff19da3b690d3005c24973edb011a45812415e2dd0b32b0c7c08b10911e0  review9-points/fixed/run-review9a.sh
+
 ## bundle diffs (this directory)
 f057c52afd33d531075d1dd1bd79976be486e86dfb9c8a515c8f50df4d7f3215  dev2-member-payment.diff
 d4a8353a5dc53f24c5b181862b381373c28c8a2995cd49773e259f0d9f439038  v2-bayar.diff
@@ -68,6 +82,11 @@ ece2bb62848eb4356f6b78d61cf63a9550fa55d02fd6aa7bde07235ea29a82ee  incremental/v2
 dc91e9cdc011d99b44dd654e01ac30fa58af55431edba4c575763e6c9f927d36  incremental/v2-qris-apply.review7-to-review8.diff
 97a3efc200f68092ffd1df8e76e297855f462fb49569964d849b786a91ccd12c  incremental/wg-checkout.c2-to-birthfix.diff
 40c08b5312defa23e6698579a0faf979f053f32392e64074eeace0d282f393e7  incremental/wg-paylist-apply.review7-to-review8.diff
+fe8300e3316d9e09239c5e413706e95b8827fe7f9bf57a42acf12656863d4acd  v2-qris-apply.prod-to-review9a.diff
+3cdbcf24c929d9ad82b7e52d7a7f7bb5ea4b3043912234fe2e8c117f209292ce  v2-qris-apply.review8-to-review9a.diff
+ea31acd32ab02c4fc16f58f208dd3bc2c5a5ffd11fc2965b6cba2330dc66e1dc  wg-paylist-apply.prod-to-review9a.diff
+01bd0013901b89e00743d84c883b81663a29fcddf1b4e63f99cd0a7636973913  wg-paylist-apply.review8-to-review9a.diff
+af9aec8c5ba70f2b99a638272fb46c9b489b1eaa7e9df345bf0669756fd31b5d  stale-orchestrator.review8-to-review9a.diff
 
 ## test logs & runners (this directory)
 d862ae0843f5cd3de8d9dec7886e426f60fe8a1412b05471fccf41b5adcc66c4  logs/run-20261124-101010.log
@@ -76,11 +95,33 @@ d862ae0843f5cd3de8d9dec7886e426f60fe8a1412b05471fccf41b5adcc66c4  logs/run-20261
 c6622841110b00c2df5f7e14f02a4dcde68adcd2adf5d4c1bbfdca7e92635a89  logs/run-review7-20261124-101938.log
 b3b62a6281cee20c42d040dda5d33df6eee4641e1d6ab13175d47131a059cea8  logs/run-review7-20261124-102117.log
 88bf0607cf3a46a75a846f2201df1f844a9aca1a93f51d7ea585e73e141f8f50  logs/run-review8-20261124-100935.log
+64c9c07b09d6afdc6bf95ddf21385fe2420cfe7fa8c4234bf96008ff4b45900b  logs/run-20261125-105719.log
+7d7bb0e49ec44e9595d146eafcdbabc0ade831defb903bf3a1dfd7e0ab7c86a2  logs/run-review7-20261125-105835.log
+46ee73e4ab5e1c8e4283a9daad2fada4ae8198b66a84d6a75cd76bbac71d4b15  logs/run-review8-20261125-105917.log
+1399f076e11327217197966b53d136dd3a436508d8fc5099667c13562af0bdc2  logs/run-birth-20261125-110456.log
+dc92d1abdfd8c72791ce7b0ed174a397ac14eba3fde5e19cac24b0f647670e00  logs/run-review9a-20261125-105944.log
+d76ea58de1941ffd4e02bd4c845563652266a9de4d64288e4d27b4e040b6c133  logs/run-review9b-20261125-114407.log
+5f78a89a71f4c18b201dda4d5984cfc50877cdfe2b52c2a60a36cf9b03a6a140  logs/mariadb105-run-review9b-20261125-114343.log
+e7f2ed923c17f7e05cae0457bc164a508802deddf8d275491b84c2777675877d  logs/mariadb1011-run-review9b-20261125-114358.log
+e3f1b67b7e6dd1a2c76bd98e3de07b878bff0a61792e8a0729fc4cdc1373ee53  logs/mariadb105-run-20261125-112113.log
+c3ba798d30c867b85acf451258c73539cbba52eae31617bf5c5cd0327a2c182f  logs/mariadb1011-run-20261125-112627.log
 94f75836208fa57791ef7bdc548e3ba59376f718b5c77a6ee8294230f8891631  runners/run-birth.sh
 e9ff9e613befd3ba24920c88f7d0beb4859a9e39c8aede2e834c59d9ec684499  runners/run-contract.sh
 b38eb06da945d06424101fa023fe51253296aaedb11a2fd6d9001c2a589805f2  runners/run-review7.sh
 2cf23c5487b1bc5265f72650c5f5a9d7fee5305f4a480ec81e7f534c6aff1b56  runners/run-review8.sh
+00a6ff19da3b690d3005c24973edb011a45812415e2dd0b32b0c7c08b10911e0  runners/run-review9a.sh
+d06d370935a8ecd6b1b486d3aced59b6d24fe089eebf0df31ac136ab2736206f  runners/run-review9b.sh
+e9f453a2a672a04817877e7bfb15a3021cff3e74d7761e5bdccfcb43651afc18  runners/deadlock-peer.php
 c9a2d585f8a4443a8f7d17dce0c2739735e5e7427445baf841641adb347f288f  runners/schema-v2.sql
 a2d1828c081a1ef972fb11d6aa20ddfa3a38e13dbc5c6b8a5ee26790c6eb7c37  runners/schema-wg.sql
 a49342147a94c0653dfb775e9e9ca8ebdb312123c73bc1380749dc48d0b4249b  runners/setup-scratch.sh
-c8f9d2f3d42800e0049f2c85cbf2f80f6cad68a587be3045323a49c7f6dc3052  runners/stale-orchestrator.php
+0e2b726516ce5c2e33610e82704f57efdc5950ad6c4b8e3e8bff0745f13bfa2b  runners/stale-orchestrator.php (post-(b): status + deadlock modes; verified identical to /home/warganet/c2-harness/tests/server-contract/stale-orchestrator.php)
+
+## notes (this directory)
+37ab4aec04b76359805b348897a212a537676d25f96acb51615fb1f50810347c  notes/review9-points.md
+0e04105619b882a7160d817ed7707ee9b11a7fe028a4c00fb561f84d0ef7b0fb  notes/review9-deadlock.md (section 3.3 corrected 25 Nov 2026; see README-review8.md)
+2ded6b179dc9137b1ae359eba34ca9dedac163d0320e04951f73181be6ce5064  notes/review9-mariadb.md
+36a08014f3b758e6304031834b063912d196395e495cb96ebb6855486f959375  notes/review9-bakmove.md
+5dda9d19a3503a11d9abeca28bdb46e76128c05a9141ae58c67c3fbdded7fb5c  notes/review9-staged.md
+98732b5529543c1076033c948c36ecd5f3141d6accbde98bb57cada2b1408367  notes/mariadb105-REPORT.md
+8f5eb0d49ba4adf4b5826993e006adc1a42cd7076a8490cf490461f98794cc27  notes/mariadb1011-REPORT.md
