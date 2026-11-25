@@ -30,6 +30,7 @@ import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.RejectedExecutionHandler
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ThreadFactory
@@ -49,7 +50,12 @@ interface CaptureLogSink : CaptureLogger {
 
 /** Durable capture counters (design §8.3 "Measured, not assumed"). */
 data class CaptureCounters(
-    val accepted: Long = 0,
+    /**
+     * Snapshots handed to [CaptureCoordinator.capture] — RECEIVED,
+     * not accepted: a received snapshot is only in the in-memory
+     * executor queue. The accepted (durable) count is [staged].
+     */
+    val received: Long = 0,
     val staged: Long = 0,
     val enqueued: Long = 0,
     val parked: Long = 0,
@@ -72,10 +78,38 @@ data class CaptureCounters(
     val captureLogFailures: Long = 0,
     /** Notifications dropped: no consenting route (D5, F15). */
     val noConsent: Long = 0,
+    /**
+     * Sweep/control tasks executed inline on the caller thread
+     * after queue saturation (last resort — the queue held no
+     * notification to evict; never a silent drop).
+     */
+    val controlInline: Long = 0,
 )
 
 /**
  * The capture executor owner (design §8.3 C21, Stage D).
+ *
+ * Acceptance boundary (Stage D audit, PR #5 review 6049617822 —
+ * normative; do not weaken it):
+ *
+ * - RECEIVED: [capture] returned [CaptureReceipt.QUEUED]. The
+ *   snapshot is in the in-memory executor queue. It is NOT durable:
+ *   a process death here loses it unless it is still posted in the
+ *   shade (see rescan below). The listener callback returning is
+ *   NOT an acceptance ack — Android's `NotificationListenerService`
+ *   has no ack semantics; the callback returning only means the
+ *   snapshot was received into the queue (or overflow-dropped with
+ *   a durable record).
+ * - ACCEPTED (durable): [EventRepository.stageCapture] returned
+ *   without throwing — the event row + staging row are committed in
+ *   one Room transaction. Only from this point does the capture
+ *   survive process death; [sweepOrphanedStaging] re-promotes
+ *   orphaned staging rows after a restart. The accepted count is
+ *   [CaptureCounters.staged]; [CaptureCounters.received] counts
+ *   queue receipts.
+ * - ENQUEUED: the staged capture reached exactly one target store
+ *   (legacy `saveQueueSync` + readback, or Room delivery insert +
+ *   staging delete in one transaction).
  *
  * The listener callback never acquires a lock and never touches a
  * store: it builds a [NotificationSnapshot] and hands it to
@@ -99,12 +133,29 @@ data class CaptureCounters(
  * and [sweepOrphanedStaging] re-promotes it through the same
  * mode gate (idempotent by `dedupe_key` / `legacy_qkey`).
  *
- * Loss window (design §8.3, stated honestly): everything before
- * the staging write — the callback-to-executor handoff — can be
- * lost on process death and is directly unmeasurable; durable
- * staging narrows the window to "until the staging write
- * completes". Unrecovered-before-enqueue loss has no counter by
- * construction.
+ * Durable ingress / recovery (no synchronous staging on the
+ * callback thread — that would block the Binder callback on Room
+ * I/O + PrivacyGate): a RECEIVED-but-not-ACCEPTED snapshot is
+ * recovered only by rescan (`PaylistListenerService.rescanActive`,
+ * on listener connect + manual), which re-reads notifications
+ * still posted in the shade and dedupes by `dedupe_key`.
+ * Limitations, stated honestly: rescan recovers only
+ * notifications still active in the shade and < 24 h old;
+ * dismissed/expired notifications are unrecoverable; the
+ * pre-acceptance window itself is unmeasurable by construction —
+ * no durable record exists for a snapshot that never reached the
+ * executor and was never overflow-evicted. Overflow evictions,
+ * by contrast, ARE durably recorded: every snapshot the bounded
+ * queue drops gets one metadata-only `capture_log` row
+ * ([CaptureOutcome.OVERFLOW_DROPPED] — package, post time,
+ * PrivacyGate-scanned title snippet; no amount, no event link, no
+ * content hash), visible to the operator in History, so a burst
+ * leaves durable per-snapshot evidence instead of only a counter.
+ *
+ * No zero-loss claim is made for this design: the RECEIVED →
+ * ACCEPTED window above is a real loss window, narrowed to
+ * "until the staging write completes" and recoverable only via
+ * rescan while the notification is still posted.
  *
  * Lock order (design §8.3 R12–R14): this path acquires
  * `Sender.LOCK` only (inside the legacy enqueue), never the
@@ -135,6 +186,12 @@ class CaptureCoordinator(
      * silent (LH-04(d)) — the capture itself continues.
      */
     private val captureLogDao: CaptureLogDao? = null,
+    /**
+     * Executor work-queue capacity (tests use a small value to
+     * saturate the queue deterministically; production uses
+     * [EXECUTOR_CAPACITY]).
+     */
+    private val executorCapacity: Int = EXECUTOR_CAPACITY,
 ) {
     companion object {
         /** Executor work-queue capacity (design §8.3 (6′), proposed value). */
@@ -154,7 +211,7 @@ class CaptureCoordinator(
         }
     }
 
-    private val accepted = AtomicLong()
+    private val received = AtomicLong()
     private val staged = AtomicLong()
     private val enqueued = AtomicLong()
     private val parked = AtomicLong()
@@ -172,34 +229,242 @@ class CaptureCoordinator(
     private val rawSnapshotsEvicted = AtomicLong()
     private val captureLogFailures = AtomicLong()
     private val noConsent = AtomicLong()
+    private val controlInline = AtomicLong()
 
     private fun daemonFactory(name: String): ThreadFactory = ThreadFactory { r ->
         Thread(r, name).apply { isDaemon = true }
     }
 
     /**
+     * What [capture] hands back to the caller: the handoff outcome,
+     * NOT an acceptance ack. QUEUED means RECEIVED (in the queue);
+     * the capture becomes ACCEPTED only when the staging write
+     * completes on the executor thread.
+     */
+    enum class CaptureReceipt {
+        /** The snapshot is queued for the capture executor (received, not yet durable). */
+        QUEUED,
+
+        /** The snapshot was dropped by queue saturation (a durable overflow record was attempted). */
+        DROPPED_OVERFLOW,
+    }
+
+    /** Kinds of work on the capture executor (overflow policy differs per kind). */
+    private enum class CaptureTaskKind {
+        /** A notification snapshot (may be evicted under saturation). */
+        NOTIFICATION,
+
+        /** A staging-sweep pass (never silently dropped). */
+        SWEEP,
+
+        /**
+         * Control work (reserved — no control task is submitted
+         * yet; the handler treats it like SWEEP: never silently
+         * dropped).
+         */
+        CONTROL,
+    }
+
+    /**
+     * One unit of work on the capture executor, tagged with its
+     * kind (and its snapshot, for notifications) so the rejection
+     * handler can tell a droppable snapshot from a sweep/control
+     * task that must never be silently dropped. `submit()` would
+     * wrap this in a `FutureTask` and hide the tag — every
+     * submission here uses `execute()` instead.
+     *
+     * [dropped] is set by the rejection handler (same thread as
+     * the submitting `execute()` call, so the submitter reads it
+     * after `execute()` returns) when THIS task was dropped instead
+     * of admitted — a custom handler means `execute()` does not
+     * throw on shutdown, so the flag is how [capture] learns the
+     * handoff failed.
+     */
+    private class CaptureTask(
+        val kind: CaptureTaskKind,
+        val snapshot: NotificationSnapshot?,
+        private val block: () -> Unit,
+    ) : Runnable {
+        @Volatile
+        var dropped: Boolean = false
+        override fun run() = block()
+    }
+
+    /**
      * Single-thread capture executor with a bounded queue. Overflow
-     * policy (§8.3 (6′)): drop the OLDEST entry, count
-     * `dropped_overflow`, never block the callback thread, never
-     * grow unboundedly.
+     * policy (§8.3 (6′), hardened by the Stage D audit):
+     *
+     * - A rejected NOTIFICATION evicts the OLDEST queued
+     *   NOTIFICATION (never a sweep/control task) to make room; the
+     *   evicted snapshot gets a durable overflow record
+     *   ([recordOverflow]). If the queue holds no notification, the
+     *   NEW snapshot is dropped instead — also with a durable
+     *   overflow record. The callback thread is never blocked and
+     *   the queue never grows unboundedly.
+     * - A rejected SWEEP/CONTROL task is never silently dropped:
+     *   it evicts the oldest queued NOTIFICATION to make room, and
+     *   if there is none it runs inline on the caller thread
+     *   (counted as [CaptureCounters.controlInline] — the sweep is
+     *   idempotent and transactional, so inline execution is safe;
+     *   this branch is unreachable in practice because at most a
+     *   couple of control tasks are ever outstanding).
+     * - Every dropped snapshot leaves a durable `capture_log` row
+     *   (OVERFLOW_DROPPED), not just an in-memory counter — so a
+     *   burst is evidenced per snapshot and recoverable via rescan
+     *   while the notification is still posted.
+     *
+     * The overflow write is a single-row insert executed with
+     * `runBlocking` on the caller thread: bounded, and taken only
+     * on the rare saturation path. It never runs on the executor
+     * thread itself (no submission in the capture path re-enters
+     * the executor), so it cannot deadlock against the queue.
      */
     private val executor = ThreadPoolExecutor(
         1, 1, 0L, TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(EXECUTOR_CAPACITY),
+        LinkedBlockingQueue(executorCapacity),
         daemonFactory("paylist-capture"),
         RejectedExecutionHandler { runnable, exec ->
-            // Drop the oldest queued snapshot to make room.
-            if (exec.queue.poll() != null) droppedOverflow.incrementAndGet()
-            try {
-                exec.execute(runnable)
-            } catch (_: Exception) {
-                // Extreme race (queue refilled between poll and
-                // execute): drop the NEW snapshot rather than block
-                // the callback thread.
-                droppedOverflow.incrementAndGet()
+            val task = runnable as? CaptureTask
+            when (task?.kind) {
+                CaptureTaskKind.NOTIFICATION -> {
+                    val evicted = evictOldestNotification(exec)
+                    if (evicted != null) {
+                        recordOverflow(evicted)
+                        if (!tryAdmit(runnable, exec)) {
+                            // Queue refilled between evict and
+                            // execute, or the executor shut down:
+                            // drop the NEW snapshot rather than
+                            // block the callback thread — with a
+                            // durable record.
+                            task.dropped = true
+                            recordOverflow(task.snapshot)
+                        }
+                    } else {
+                        task.dropped = true
+                        recordOverflow(task.snapshot)
+                    }
+                }
+                else -> {
+                    // SWEEP / CONTROL (or an untagged runnable):
+                    // never silently dropped.
+                    val evicted = evictOldestNotification(exec)
+                    if (evicted != null) {
+                        recordOverflow(evicted)
+                        if (!tryAdmit(runnable, exec)) {
+                            runTaskInline(task, runnable)
+                        }
+                    } else {
+                        runTaskInline(task, runnable)
+                    }
+                }
             }
         },
     )
+
+    /**
+     * One admission attempt for a rejected task. Returns false
+     * without calling `execute()` when the executor is shut down
+     * (a custom handler means `execute()` would otherwise bounce
+     * straight back into this handler); a failed `execute()` also
+     * returns false. The caller decides the drop/inline fallback.
+     */
+    private fun tryAdmit(runnable: Runnable, exec: ThreadPoolExecutor): Boolean {
+        if (exec.isShutdown) return false
+        return try {
+            exec.execute(runnable)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Removes the oldest queued NOTIFICATION task (FIFO scan — the
+     * queue is a [LinkedBlockingQueue], so iteration + remove are
+     * thread-safe) and returns its snapshot. Sweep/control tasks
+     * are never evicted. Returns null when the queue holds no
+     * notification.
+     */
+    private fun evictOldestNotification(
+        exec: ThreadPoolExecutor,
+    ): NotificationSnapshot? {
+        for (queued in exec.queue) {
+            val task = queued as? CaptureTask ?: continue
+            if (task.kind != CaptureTaskKind.NOTIFICATION) continue
+            if (exec.queue.remove(task)) return task.snapshot
+        }
+        return null
+    }
+
+    /**
+     * Durable overflow accounting for one dropped snapshot: the
+     * in-memory counter + one metadata-only `capture_log` row
+     * ([CaptureOutcome.OVERFLOW_DROPPED] — package, post time,
+     * PrivacyGate-scanned title snippet; no amount, no event link,
+     * no content hash: the amount was never parsed and a hash of
+     * un-gated raw text would be a hash of possibly-secret
+     * content). The row is the operator-visible evidence (History
+     * filter) and the rescan handle while the notification is
+     * still posted.
+     *
+     * Runs on the caller thread (the rejection handler runs there):
+     * a single-row insert via `runBlocking`, bounded and taken
+     * only on the rare saturation path. A null DAO (a bare
+     * coordinator in tests) or a failed insert leaves only the
+     * counter + a loud log line — counted in
+     * [CaptureCounters.captureLogFailures], never silent.
+     */
+    private fun recordOverflow(snapshot: NotificationSnapshot?) {
+        droppedOverflow.incrementAndGet()
+        if (snapshot == null) {
+            logger.logLocal("capture overflow: snapshot tidak dikenal terbuang (tanpa catatan tahan)")
+            return
+        }
+        logger.logLocal(
+            "capture overflow: ${snapshot.packageName} @${snapshot.postTimeMs} " +
+                "terbuang sebelum staging (antrean penuh); pindai ulang selagi notifikasi masih aktif",
+        )
+        val dao = captureLogDao ?: return
+        try {
+            runBlocking {
+                dao.insert(
+                    CaptureLogEntity(
+                        captureId = UUID.randomUUID().toString(),
+                        sourcePackage = snapshot.packageName,
+                        postTimeMs = snapshot.postTimeMs,
+                        capturedAtMs = clock(),
+                        outcome = CaptureOutcome.OVERFLOW_DROPPED,
+                        titleSnippet = snippet(snapshot.title),
+                        amountMinor = null,
+                        eventId = null,
+                        contentSha256 = null,
+                    ),
+                )
+            }
+        } catch (e: Exception) {
+            captureLogFailures.incrementAndGet()
+            logger.logLocal(
+                "catatan overflow gagal ditulis (${snapshot.packageName}): " +
+                    e.message?.take(120),
+            )
+        }
+    }
+
+    /**
+     * Last-resort inline execution for a rejected sweep/control
+     * task when the queue holds no notification to evict: the task
+     * runs on the caller thread instead of being silently dropped.
+     * Counted, never silent. Safe for the sweep (idempotent,
+     * transactional); unreachable in practice (see the executor
+     * KDoc).
+     */
+    private fun runTaskInline(task: CaptureTask?, runnable: Runnable) {
+        controlInline.incrementAndGet()
+        logger.logLocal(
+            "tugas ${task?.kind ?: "kontrol"} dijalankan langsung (antrean penuh, tanpa notifikasi untuk diusir)",
+        )
+        runnable.run()
+    }
 
     /** Timer for the periodic staging sweep (submits onto [executor]). */
     private val sweepTimer: ScheduledExecutorService =
@@ -207,7 +472,7 @@ class CaptureCoordinator(
 
     /** Current counter values (for diagnostics and tests). */
     fun counters(): CaptureCounters = CaptureCounters(
-        accepted = accepted.get(),
+        received = received.get(),
         staged = staged.get(),
         enqueued = enqueued.get(),
         parked = parked.get(),
@@ -225,39 +490,115 @@ class CaptureCoordinator(
         rawSnapshotsEvicted = rawSnapshotsEvicted.get(),
         captureLogFailures = captureLogFailures.get(),
         noConsent = noConsent.get(),
+        controlInline = controlInline.get(),
     )
 
     /**
      * Hands a snapshot to the capture executor. Non-blocking: never
      * acquires a lock, never touches a store, never blocks the
      * callback thread (§8.3 (1′)).
+     *
+     * Returns [CaptureReceipt.QUEUED] (RECEIVED — in the queue, not
+     * yet durable) or [CaptureReceipt.DROPPED_OVERFLOW] when the
+     * snapshot was dropped by saturation (with a durable overflow
+     * record attempted) or when the executor is already shut down.
+     * The return value is the handoff outcome, not an acceptance
+     * ack: ACCEPTED means the staging write completed.
      */
-    fun capture(snapshot: NotificationSnapshot) {
-        accepted.incrementAndGet()
-        executor.execute { runBlocking { processSnapshot(snapshot) } }
+    fun capture(snapshot: NotificationSnapshot): CaptureReceipt {
+        received.incrementAndGet()
+        val task = CaptureTask(CaptureTaskKind.NOTIFICATION, snapshot) {
+            runBlocking { processSnapshot(snapshot) }
+        }
+        return try {
+            executor.execute(task)
+            // A custom rejection handler means execute() does not
+            // throw when the task was dropped (shutdown or no room
+            // after eviction) — the handler marks the task instead.
+            if (task.dropped) CaptureReceipt.DROPPED_OVERFLOW else CaptureReceipt.QUEUED
+        } catch (e: RejectedExecutionException) {
+            // Safety net (unreachable with the handler installed,
+            // unless the handler itself throws): the snapshot never
+            // queued. Previously this threw to the caller (an
+            // uncaught throw on the Binder thread); now it is a
+            // counted drop with a durable record attempt, like any
+            // other overflow drop.
+            recordOverflow(snapshot)
+            CaptureReceipt.DROPPED_OVERFLOW
+        }
     }
 
     /**
      * Runs one sweep pass on the executor thread (for tests and for
      * the periodic timer). Blocks until the pass finishes.
+     *
+     * Submitted with `execute()` (not `submit()`) so the rejection
+     * handler sees the SWEEP tag: under saturation the sweep is
+     * admitted by evicting the oldest queued notification, never
+     * silently dropped — so this call keeps its synchronisation
+     * property (it returns only after the sweep ran).
      */
     fun sweepNow() {
-        val future = executor.submit<Unit> { runBlocking { sweepOrphanedStaging() } }
-        future.get()
+        // Preserve the old submit() contract: a sweep after close()
+        // throws instead of running inline or waiting forever.
+        // (A close() racing this check can still land in the
+        // handler's inline fallback — the sweep did run then.)
+        if (executor.isShutdown) throw RejectedExecutionException("capture executor shut down")
+        val done = java.util.concurrent.CountDownLatch(1)
+        try {
+            executor.execute(
+                CaptureTask(CaptureTaskKind.SWEEP, null) {
+                    try {
+                        runBlocking { sweepOrphanedStaging() }
+                    } finally {
+                        done.countDown()
+                    }
+                },
+            )
+        } catch (e: RejectedExecutionException) {
+            // Executor shut down: mirror the old submit() behaviour
+            // (throw) instead of waiting forever on the latch.
+            done.countDown()
+            throw e
+        }
+        done.await()
     }
 
     /** Starts the periodic staging sweep (every [SWEEP_INTERVAL_MINUTES]). */
     fun startPeriodicSweep() {
         sweepTimer.scheduleAtFixedRate(
-            { executor.execute { runBlocking { sweepOrphanedStaging() } } },
+            {
+                executor.execute(
+                    CaptureTask(CaptureTaskKind.SWEEP, null) {
+                        runBlocking { sweepOrphanedStaging() }
+                    },
+                )
+            },
             SWEEP_INTERVAL_MINUTES, SWEEP_INTERVAL_MINUTES, TimeUnit.MINUTES,
         )
     }
 
-    /** Stops the executor and the sweep timer (tests / shutdown). */
+    /**
+     * Stops the executor and the sweep timer (tests / shutdown).
+     *
+     * Graceful-shutdown evidence: snapshots still queued
+     * (RECEIVED, never staged) are drained from `shutdownNow()`
+     * and each gets a durable overflow record ([recordOverflow]),
+     * so a graceful stop leaves evidence instead of silent loss.
+     * This covers `close()` only — a SIGKILL gives no chance to
+     * run it, and those snapshots are recoverable only via rescan
+     * while still posted (see the class KDoc).
+     */
     fun close() {
         sweepTimer.shutdownNow()
-        executor.shutdownNow()
+        val queued = executor.shutdownNow()
+        for (task in queued) {
+            val snapshot = (task as? CaptureTask)
+                ?.takeIf { it.kind == CaptureTaskKind.NOTIFICATION }
+                ?.snapshot
+                ?: continue
+            runCatching { recordOverflow(snapshot) }
+        }
     }
 
     // --- Capture path (executor thread) ---

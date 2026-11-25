@@ -125,10 +125,17 @@ open class PaylistListenerService : NotificationListenerService() {
             if (sbn.postTime < batas) continue
             if (sbn.notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) continue
             ditemukan++
-            coordinator.capture(
-                NotificationNormalizer.from(sbn, System.currentTimeMillis())
-            )
-            diserahkan++
+            // Only a QUEUED receipt counts as handed off: an
+            // overflow-dropped rescan re-submission is still in the
+            // shade and will be picked up by the next rescan, but it
+            // was not received this time (its durable overflow
+            // record is the evidence).
+            if (coordinator.capture(
+                    NotificationNormalizer.from(sbn, System.currentTimeMillis())
+                ) == CaptureCoordinator.CaptureReceipt.QUEUED
+            ) {
+                diserahkan++
+            }
         }
         val ringkas = "$ditemukan notifikasi rute aktif (<24 jam), $diserahkan diserahkan ke capture"
         store.setLastRescan(ringkas)
@@ -147,8 +154,20 @@ open class PaylistListenerService : NotificationListenerService() {
             Store(this).logLocal("capture gagal: coordinator tidak tersedia (${sbn.packageName})")
             return
         }
-        coordinator.capture(
+        // The receipt is the handoff outcome, not an acceptance ack:
+        // QUEUED means RECEIVED (in the queue); ACCEPTED means the
+        // staging write completed on the executor thread. An
+        // overflow drop is loud here and durably recorded by the
+        // coordinator (OVERFLOW_DROPPED capture-log row); the
+        // notification is recoverable via rescan while still posted.
+        val receipt = coordinator.capture(
             NotificationNormalizer.from(sbn, System.currentTimeMillis())
         )
+        if (receipt == CaptureCoordinator.CaptureReceipt.DROPPED_OVERFLOW) {
+            Store(this).logLocal(
+                "capture antrean penuh, notifikasi terbuang sebelum staging " +
+                    "(${sbn.packageName} @${sbn.postTime}); pindai ulang selagi masih aktif",
+            )
+        }
     }
 }

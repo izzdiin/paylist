@@ -30,6 +30,19 @@ object CaptureOutcome {
     /** Pure-auth notification (OTP/PIN, no financial record). Metadata only. */
     const val PURE_AUTH = "PURE_AUTH"
 
+    /**
+     * A notification snapshot dropped by capture-queue saturation
+     * before durable staging (Stage D audit P1). Metadata only:
+     * package + post time + PrivacyGate-scanned title snippet; no
+     * amount (never parsed), no event link, no content hash (a hash
+     * of un-gated raw text would be a hash of possibly-secret
+     * content). The row is the operator-visible evidence (History
+     * filter) and the rescan handle while the notification is still
+     * posted. Retention: unlinked rows expire on the 90-day rule
+     * (LH-06) like any other unlinked row.
+     */
+    const val OVERFLOW_DROPPED = "OVERFLOW_DROPPED"
+
     /** The package is on no enabled route. Package + time + outcome only. */
     const val UNLISTED_PACKAGE = "UNLISTED_PACKAGE"
 }

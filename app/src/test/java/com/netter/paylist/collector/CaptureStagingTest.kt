@@ -303,9 +303,9 @@ class CaptureStagingTest {
         assertTrue(logLines.any { it.contains("staging_mismatch") })
     }
 
-    /** F18: executor burst — 50 rapid captures land exactly once each, none lost. */
+    /** F18: executor burst — 50 rapid captures below capacity land exactly once each. */
     @Test
-    fun f18_executorBurst_noLossNoDuplicates() = runBlocking {
+    fun f18_executorBurst_belowCapacity_allLandExactlyOnce() = runBlocking {
         val n = 50
         for (i in 0 until n) {
             coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))

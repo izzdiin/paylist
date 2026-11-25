@@ -542,6 +542,10 @@ class HistoryTest {
             // D5 onboarding tests wire the capture-log DAO for the
             // F16 local-delete fixture (OnboardingTest).
             "OnboardingTest.kt",
+            // Stage D audit P1 overflow tests wire the capture-log
+            // DAO for the OVERFLOW_DROPPED durability fixtures
+            // (CaptureOverflowTest).
+            "CaptureOverflowTest.kt",
         )
         val moduleDir = root.absoluteFile.parentFile?.parentFile?.parentFile
             ?: throw AssertionError("cannot derive the module dir for LH-T08")

@@ -63,6 +63,7 @@ class HistoryActivity : Activity() {
             CaptureOutcome.COLLISION to "Bentrok identitas",
             CaptureOutcome.PURE_AUTH to "Autentikasi saja",
             CaptureOutcome.UNLISTED_PACKAGE to "Paket tak terdaftar",
+            CaptureOutcome.OVERFLOW_DROPPED to "Antrean penuh (terbuang)",
         )
 
         private val DATE_PRESETS = listOf(
