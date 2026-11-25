@@ -62,12 +62,19 @@ class PaylistApplication : Application(), Configuration.Provider {
 
     companion object {
         /**
-         * Stage D flips this to true when it wires capture to Room.
-         * Until then [runCutover] refuses: activating the worker
-         * while capture still targets the legacy queue would stop
-         * new payments from delivering at all.
+         * Stage D audit (PR #5 review 6049617822, 25 Nov 2026)
+         * restored this to false: the Stage D capture-to-Room
+         * wiring must NOT activate while the PR #4 safety fixes
+         * are unintegrated. Until this is true [runCutover]
+         * refuses: activating the worker while capture still
+         * targets the legacy queue would stop new payments from
+         * delivering at all.
+         *
+         * Flip to true ONLY when PR #4 and Stage D are combined on
+         * one branch with all R01–R08, process-death and Stage D
+         * tests green.
          */
-        const val CAPTURE_TO_ROOM_READY: Boolean = true
+        const val CAPTURE_TO_ROOM_READY: Boolean = false
     }
 
     /** This process's boot identity (fresh UUID per process start). */
