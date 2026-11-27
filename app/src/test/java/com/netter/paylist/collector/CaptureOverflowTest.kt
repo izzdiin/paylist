@@ -231,9 +231,16 @@ class CaptureOverflowTest {
                 coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L)),
             )
 
-            // The eviction is synchronous in capture(): the durable
-            // overflow record already exists before the latch opens.
+            // The eviction DECISION is synchronous in capture()
+            // (the counter already moved), but the durable row is
+            // written by the overflow-writer thread — never by a
+            // blocking insert on this (listener) thread. The
+            // writer is independent of the blocked capture worker,
+            // so the row lands while the latch is still closed.
             assertEquals(1, coordinator.counters().droppedOverflow)
+            awaitCondition("durable overflow row written by the writer thread") {
+                overflowRows().size == 1
+            }
             val rows = overflowRows()
             assertEquals("one durable overflow row for the evicted snapshot", 1, rows.size)
             val row = rows.single()
@@ -290,8 +297,9 @@ class CaptureOverflowTest {
                 }
             }
             sweepThread.start()
-            // The eviction happens synchronously inside the helper
-            // thread's execute(): wait for the durable record.
+            // The eviction decision happens synchronously inside
+            // the helper thread's sweepNow(); the overflow-writer
+            // thread persists the durable record.
             awaitCondition("sweep evicted V1 with an overflow row") {
                 overflowRows().size == 1
             }
@@ -365,7 +373,12 @@ class CaptureOverflowTest {
             coordinator.capture(snapshot()),
         )
         assertEquals(1, coordinator.counters().droppedOverflow)
-        assertEquals(1, overflowRows().size)
+        // The writer thread outlives close() by design, so the
+        // post-close drop still gets its durable record —
+        // asynchronously, never via a blocking insert here.
+        awaitCondition("overflow row for the post-close capture") {
+            overflowRows().size == 1
+        }
         assertEquals(POST_TIME, overflowRows().single().postTimeMs)
         assertEquals(0, eventDao.count())
     }
