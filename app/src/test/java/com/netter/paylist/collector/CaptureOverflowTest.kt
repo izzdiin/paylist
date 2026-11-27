@@ -20,6 +20,7 @@ import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -86,7 +87,35 @@ class CaptureOverflowTest {
         val commitThenFailNext = AtomicInteger(0)
         val insertDelayMs = AtomicLong(0)
 
+        /** When set, inserts throw an [Error] (not an [Exception]) N times. */
+        val errorNextInserts = AtomicInteger(0)
+
+        /** When non-null, inserts block until the latch opens (a stuck writer). */
+        @Volatile
+        var insertBlockLatch: CountDownLatch? = null
+        val insertEntered = AtomicInteger(0)
+
         override suspend fun insert(row: CaptureLogEntity): Long {
+            val latch = insertBlockLatch
+            if (latch != null) {
+                insertEntered.incrementAndGet()
+                // A stuck durable write: waits for the latch,
+                // swallowing interrupts (close() must exhaust
+                // its bounded joins against this writer).
+                val deadline = System.currentTimeMillis() + 30_000L
+                while (latch.count > 0 &&
+                    System.currentTimeMillis() < deadline
+                ) {
+                    try {
+                        latch.await(50, TimeUnit.MILLISECONDS)
+                    } catch (_: InterruptedException) {
+                        // Swallowed on purpose (stuck writer).
+                    }
+                }
+            }
+            if (errorNextInserts.getAndDecrement() > 0) {
+                throw AssertionError("store error (test)")
+            }
             if (failNextInserts.getAndDecrement() > 0) {
                 throw IllegalStateException("db down (test)")
             }
@@ -97,6 +126,50 @@ class CaptureOverflowTest {
                 throw IllegalStateException("commit uncertain (test)")
             }
             return result
+        }
+    }
+
+    /** In-memory [CaptureHealthStore] (item 5): one JSON document in a var. */
+    private class FakeCaptureHealthStore : CaptureHealthStore {
+        @Volatile
+        var doc: String? = null
+
+        override fun readCaptureHealth(): String? = doc
+
+        override fun writeCaptureHealth(json: String) {
+            doc = json
+        }
+
+        fun incidents(): List<org.json.JSONObject> {
+            val raw = doc ?: return emptyList()
+            val arr = JSONObject(raw).optJSONArray("incidents") ?: return emptyList()
+            return (0 until arr.length()).map { arr.getJSONObject(it) }
+        }
+
+        fun incident(category: String): org.json.JSONObject? =
+            incidents().firstOrNull { it.optString("category") == category }
+
+        fun fenceActive(): Boolean {
+            val raw = doc ?: return false
+            return JSONObject(raw).optJSONObject("fence")
+                ?.optBoolean("active") == true
+        }
+    }
+
+    /** A logger whose logLocal throws while [throwing] (a failing Store sink). */
+    private class ThrowingLogger(
+        private val lines: MutableList<String>,
+    ) : CaptureLogSink {
+        @Volatile
+        var throwing: Boolean = false
+
+        override fun logEvent(pkg: String, text: String) {
+            lines.add("$pkg: $text")
+        }
+
+        override fun logLocal(text: String) {
+            if (throwing) throw IllegalStateException("log store down (test)")
+            lines.add(text)
         }
     }
 
@@ -148,6 +221,9 @@ class CaptureOverflowTest {
 
     private fun newCoordinator(
         closeTimeoutMs: Long = CaptureCoordinator.CLOSE_ACTIVE_TIMEOUT_MS,
+        healthStore: CaptureHealthStore? = null,
+        loggerOverride: CaptureLogSink? = null,
+        routesLatch: CountDownLatch? = null,
     ): CaptureCoordinator = CaptureCoordinator(
         repository = repository,
         modeReader = {
@@ -201,9 +277,18 @@ class CaptureOverflowTest {
                 true
             }
         },
-        routesProvider = { routes },
+        routesProvider = {
+            if (routesLatch != null) {
+                // Pre-stage block (item 3 test): the worker is
+                // held BEFORE any staging, interruptibly — the
+                // close() interrupt surfaces here as an
+                // InterruptedException out of processSnapshot.
+                routesLatch.await(15, TimeUnit.SECONDS)
+            }
+            routes
+        },
         deviceIdProvider = { "g57" },
-        logger = object : CaptureLogSink {
+        logger = loggerOverride ?: object : CaptureLogSink {
             override fun logEvent(pkg: String, text: String) {
                 logLines.add("$pkg: $text")
             }
@@ -215,6 +300,7 @@ class CaptureOverflowTest {
         captureLogDao = captureLogDao,
         executorCapacity = CAPACITY,
         closeActiveTimeoutMs = closeTimeoutMs,
+        healthStore = healthStore,
     )
 
     private fun snapshot(
@@ -664,6 +750,390 @@ class CaptureOverflowTest {
             captureLogDao.insertDelayMs.set(0)
             latch.countDown()
         }
+    }
+
+    // --- Writer failure (PR #5 re-review 28 Nov, item 2) ---
+
+    @Test
+    fun writerFailure_throwingLoggerBeforeTry_recordStillPersists() = runBlocking {
+        // The production log sink (Store) persists on the calling
+        // thread and can throw. writeOverflowRecord's loud line
+        // used to be a bare call BEFORE the insert's try: a
+        // throwing logger there killed the writer loop. Now the
+        // logging is best-effort and separated from the DB
+        // attempt — the record must persist regardless.
+        val throwing = ThrowingLogger(logLines)
+        throwing.throwing = true
+        coordinator = newCoordinator(loggerOverride = throwing)
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            awaitCondition("overflow row persisted despite the throwing logger") {
+                overflowRows().size == 1
+            }
+            awaitCondition("outstanding settled") {
+                coordinator.counters().overflowPending == 0L
+            }
+            assertEquals(0, coordinator.counters().overflowRecordDropped)
+            assertTrue("writer loop survived", coordinator.isOverflowWriterAlive())
+        } finally {
+            latch.countDown()
+        }
+        awaitCondition("admitted captures enqueued") { legacyQueue.size == 4 }
+    }
+
+    @Test
+    fun writerFailure_throwingLoggerInCatchPath_retriesStillSettle() = runBlocking {
+        // The catch path also logged bare: DAO failing AND the
+        // logger throwing on the failure line must not strand
+        // the record — retries continue and the record lands on
+        // the third attempt.
+        val throwing = ThrowingLogger(logLines)
+        throwing.throwing = true
+        coordinator = newCoordinator(loggerOverride = throwing)
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            awaitCondition("blocker capture-log row written") {
+                store.captureLog.values.any {
+                    it.outcome == CaptureOutcome.CAPTURED
+                }
+            }
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            captureLogDao.failNextInserts.set(2)
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            awaitCondition("overflow row persisted after two DB failures") {
+                overflowRows().size == 1
+            }
+            awaitCondition("outstanding settled") {
+                coordinator.counters().overflowPending == 0L
+            }
+            assertTrue(coordinator.counters().captureLogFailures >= 2)
+            assertEquals(0, coordinator.counters().overflowRecordDropped)
+            assertTrue("writer loop survived", coordinator.isOverflowWriterAlive())
+        } finally {
+            latch.countDown()
+        }
+        awaitCondition("admitted captures enqueued") { legacyQueue.size == 4 }
+    }
+
+    @Test
+    fun writerFailure_errorEscapesWrite_terminalCleanupLoopSurvives() = runBlocking {
+        // An Error (not Exception) from the store escapes
+        // writeOverflowRecord's insert guard entirely: the
+        // loop's OUTER terminal cleanup must settle the record
+        // (counted lost + writer-failure counter), keep the
+        // outstanding accounting exact, and keep the loop alive
+        // for the next record.
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            awaitCondition("blocker capture-log row written") {
+                store.captureLog.values.any {
+                    it.outcome == CaptureOutcome.CAPTURED
+                }
+            }
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            captureLogDao.errorNextInserts.set(1)
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            awaitCondition("escaped record settled as lost") {
+                coordinator.counters().overflowWriterFailures == 1L &&
+                    coordinator.counters().overflowRecordDropped == 1L
+            }
+            awaitCondition("outstanding settled after terminal failure") {
+                coordinator.counters().overflowPending == 0L
+            }
+            assertTrue("writer loop survived an Error", coordinator.isOverflowWriterAlive())
+            // The next eviction is written normally.
+            coordinator.capture(snapshot(postTime = POST_TIME + 5 * 1_000L))
+            awaitCondition("next overflow row persisted") {
+                overflowRows().size == 1
+            }
+            assertEquals(POST_TIME + 2_000L, overflowRows().single().postTimeMs)
+        } finally {
+            latch.countDown()
+        }
+        // Blocker + V3 + V4 + V5 (V1 lost via the Error, V2 via
+        // the second eviction's durable row).
+        awaitCondition("admitted captures enqueued") { legacyQueue.size == 4 }
+    }
+
+    // --- Close outcomes (PR #5 re-review 28 Nov, item 3) ---
+
+    @Test
+    fun closeInterruptedPreStage_cancelledUnknownNotResolved() = runBlocking {
+        // The active task is held BEFORE staging (in the routes
+        // read) and honours the close interrupt by throwing:
+        // its outcome is PRE-STAGE CANCELLED / UNKNOWN — counted
+        // in its own counter, recorded as an UNRECOVERABLE
+        // persistent incident, and NOT folded into "resolved"
+        // or into unresolvedAtClose.
+        val health = FakeCaptureHealthStore()
+        val routesLatch = CountDownLatch(1)
+        coordinator = newCoordinator(
+            healthStore = health,
+            routesLatch = routesLatch,
+            closeTimeoutMs = 2_000L,
+        )
+        assertEquals(
+            CaptureCoordinator.CaptureReceipt.QUEUED,
+            coordinator.capture(snapshot()),
+        )
+        // Wait until the worker is inside the pre-stage block:
+        // the routes latch is being awaited (worker alive, no
+        // event staged, task active). Poll on the latch having a
+        // waiter is not observable — use a short settle sleep
+        // after the receipt, then close.
+        Thread.sleep(500)
+        assertEquals(0, eventDao.count())
+        val started = System.currentTimeMillis()
+        coordinator.close()
+        assertTrue(
+            "close() bounded",
+            System.currentTimeMillis() - started < 15_000,
+        )
+        assertEquals(1, coordinator.counters().preStageInterruptedAtClose)
+        assertEquals(0, coordinator.counters().unresolvedAtClose)
+        assertEquals(0, eventDao.count())
+        val incident = health.incident(
+            CaptureIncidentCategory.PRE_STAGE_INTERRUPTED,
+        )
+        assertNotNull("persistent pre-stage incident recorded", incident)
+        assertEquals(
+            CaptureIncidentStatus.UNRECOVERABLE,
+            incident!!.optString("status"),
+        )
+        assertTrue(coordinator.degradedState().degraded)
+        routesLatch.countDown()
+    }
+
+    @Test
+    fun closeWithStuckWriter_fenceRecorded_successorWaitsForPredecessor() = runBlocking {
+        // The overflow writer is stuck inside a durable insert
+        // that swallows interrupts: close() exhausts its bounded
+        // flush + join and must record the successor fence. A
+        // replacement coordinator over the same health store
+        // must NOT process captures until the stuck writer
+        // actually exits (its exit clears its fence half).
+        val health = FakeCaptureHealthStore()
+        coordinator = newCoordinator(healthStore = health)
+        val latch = blockExecutorWith(POST_TIME)
+        val writerLatch = CountDownLatch(1)
+        try {
+            awaitCondition("blocker capture-log row written") {
+                store.captureLog.values.any {
+                    it.outcome == CaptureOutcome.CAPTURED
+                }
+            }
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            captureLogDao.insertBlockLatch = writerLatch
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            awaitCondition("writer stuck inside the overflow insert") {
+                captureLogDao.insertEntered.get() >= 1
+            }
+            val started = System.currentTimeMillis()
+            coordinator.close()
+            val elapsed = System.currentTimeMillis() - started
+            assertTrue("close() bounded against a stuck writer (was ${elapsed}ms)",
+                elapsed < 20_000)
+            assertTrue(
+                "stuck writer outlived close()",
+                coordinator.isOverflowWriterAlive(),
+            )
+            assertTrue("fence recorded", health.fenceActive())
+            assertTrue(coordinator.degradedState().successorFenced)
+
+            // The successor: admitted, but its worker is fenced
+            // — nothing is staged while the predecessor's writer
+            // is still alive.
+            val eventsBefore = eventDao.count()
+            val successor = newCoordinator(healthStore = health)
+            try {
+                assertEquals(
+                    CaptureCoordinator.CaptureReceipt.QUEUED,
+                    successor.capture(
+                        snapshot(postTime = POST_TIME + 9_000L),
+                    ),
+                )
+                Thread.sleep(800)
+                assertEquals(
+                    "successor must not stage while fenced",
+                    eventsBefore, eventDao.count(),
+                )
+                // Release the stuck writer: it drains, exits,
+                // and clears the fence; the successor then
+                // processes its queued capture.
+                writerLatch.countDown()
+                awaitCondition("fence cleared after predecessor writer exit") {
+                    !health.fenceActive()
+                }
+                awaitCondition("successor processed after fence cleared") {
+                    eventDao.count() == eventsBefore + 1
+                }
+            } finally {
+                runCatching { successor.close() }
+            }
+        } finally {
+            captureLogDao.insertBlockLatch = null
+            writerLatch.countDown()
+            latch.countDown()
+        }
+    }
+
+    // --- Persistent degraded state (PR #5 re-review 28 Nov, item 5) ---
+
+    @Test
+    fun persistentDegradedState_survivesReplacement_recoversOnDbHealth() = runBlocking {
+        val health = FakeCaptureHealthStore()
+        coordinator = newCoordinator(healthStore = health)
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            awaitCondition("blocker capture-log row written") {
+                store.captureLog.values.any {
+                    it.outcome == CaptureOutcome.CAPTURED
+                }
+            }
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            // Permanent DB failure: the overflow record is given
+            // up after the retry budget.
+            captureLogDao.failNextInserts.set(Int.MAX_VALUE)
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            awaitCondition("overflow record given up") {
+                coordinator.counters().overflowRecordDropped == 1L
+            }
+            awaitCondition("persistent incidents recorded") {
+                health.incident(CaptureIncidentCategory.DB_PERMANENT_FAILURE) != null &&
+                    health.incident(CaptureIncidentCategory.OVERFLOW_RECORD_LOST) != null
+            }
+            val dbIncident = health.incident(
+                CaptureIncidentCategory.DB_PERMANENT_FAILURE,
+            )
+            assertNotNull(dbIncident)
+            assertEquals(
+                CaptureIncidentStatus.OPEN,
+                dbIncident!!.optString("status"),
+            )
+        } finally {
+            captureLogDao.failNextInserts.set(0)
+            latch.countDown()
+        }
+        awaitCondition("admitted captures enqueued") { legacyQueue.size == 4 }
+        coordinator.close()
+
+        // "Restart": a NEW coordinator with zeroed volatile
+        // counters over the same health store still reports the
+        // pipeline degraded — the incident survived.
+        coordinator = newCoordinator(healthStore = health)
+        assertEquals(0, coordinator.counters().overflowRecordDropped)
+        val afterRestart = coordinator.degradedState()
+        assertTrue(
+            "persistent incident keeps the state degraded across restart",
+            afterRestart.degraded,
+        )
+        assertTrue(
+            afterRestart.persistentIncidents.any {
+                it.category == CaptureIncidentCategory.DB_PERMANENT_FAILURE &&
+                    it.status == CaptureIncidentStatus.OPEN
+            },
+        )
+        // Recovery: the DB is healthy again and an overflow
+        // record lands — the permanent-failure incident closes
+        // itself as RECOVERED. (Manual block: blockExecutorWith
+        // asserts an event count of 1, but four events already
+        // exist from the first coordinator.)
+        val latch2 = CountDownLatch(1)
+        modeReaderLatch = latch2
+        try {
+            assertEquals(
+                CaptureCoordinator.CaptureReceipt.QUEUED,
+                coordinator.capture(
+                    snapshot(postTime = POST_TIME + 100_000L),
+                ),
+            )
+            awaitCondition("recovery blocker staged") { eventDao.count() == 5 }
+            for (i in 1..3) {
+                coordinator.capture(
+                    snapshot(postTime = POST_TIME + 100_000L + i * 1_000L),
+                )
+            }
+            coordinator.capture(
+                snapshot(postTime = POST_TIME + 104_000L),
+            )
+            awaitCondition("overflow row persisted after recovery") {
+                overflowRows().any { it.postTimeMs == POST_TIME + 101_000L }
+            }
+            awaitCondition("incident recovered") {
+                health.incident(CaptureIncidentCategory.DB_PERMANENT_FAILURE)
+                    ?.optString("status") == CaptureIncidentStatus.RECOVERED
+            }
+        } finally {
+            modeReaderLatch = null
+            latch2.countDown()
+        }
+    }
+
+    // --- Privacy: pre-consent paths are metadata-only (item 4) ---
+
+    @Test
+    fun noKeywordAndNoAmount_metadataOnlyRowsAndLogs() = runBlocking {
+        // NO_KEYWORD: no route keyword in the combined text.
+        coordinator.capture(
+            snapshot(
+                title = "Promo Spesial",
+                text = "Diskon besar-besaran hari ini saja",
+                postTime = POST_TIME,
+            ),
+        )
+        // NO_AMOUNT: keyword matched, no parseable amount.
+        coordinator.capture(
+            snapshot(
+                title = "Pembayaran",
+                text = "Pembayaran kamu sedang diproses",
+                postTime = POST_TIME + 60_000L,
+            ),
+        )
+        awaitCondition("both reject rows written") {
+            store.captureLog.values.any {
+                it.outcome == CaptureOutcome.NO_KEYWORD
+            } && store.captureLog.values.any {
+                it.outcome == CaptureOutcome.NO_AMOUNT
+            }
+        }
+        val noKeyword = store.captureLog.values.first {
+            it.outcome == CaptureOutcome.NO_KEYWORD
+        }
+        val noAmount = store.captureLog.values.first {
+            it.outcome == CaptureOutcome.NO_AMOUNT
+        }
+        assertNull(
+            "NO_KEYWORD is pre-consent: no title text at all",
+            noKeyword.titleSnippet,
+        )
+        assertNull(
+            "NO_AMOUNT: no title text at all (not even redacted)",
+            noAmount.titleSnippet,
+        )
+        assertNull(noKeyword.contentSha256)
+        assertNull(noAmount.contentSha256)
+        // And no log line carries either title.
+        assertFalse(
+            "no persistent log line may carry the NO_KEYWORD title",
+            logLines.any { it.contains("Promo Spesial") },
+        )
+        assertFalse(
+            "no persistent log line may carry the NO_AMOUNT title text",
+            logLines.any { it.contains("sedang diproses") },
+        )
+        assertEquals(0, eventDao.count())
     }
 
     @Test

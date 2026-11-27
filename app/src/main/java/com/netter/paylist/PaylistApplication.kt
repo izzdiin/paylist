@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.work.Configuration
 import com.netter.paylist.collector.AmountReview
 import com.netter.paylist.collector.CaptureCoordinator
+import com.netter.paylist.collector.CaptureHealthStore
 import com.netter.paylist.collector.CaptureLogSink
 import com.netter.paylist.collector.ConsentStore
 import com.netter.paylist.collector.PrivacyGate
@@ -75,6 +76,9 @@ class PaylistApplication : Application(), Configuration.Provider {
          * tests green.
          */
         const val CAPTURE_TO_ROOM_READY: Boolean = false
+
+        /** SharedPreferences key of the persistent capture-health document. */
+        const val CAPTURE_HEALTH_KEY: String = "capture_health_v1"
     }
 
     /** This process's boot identity (fresh UUID per process start). */
@@ -151,6 +155,20 @@ class PaylistApplication : Application(), Configuration.Provider {
             override fun logEvent(pkg: String, text: String) = store.logEvent(pkg, text)
             override fun logLocal(text: String) = store.logLocal(text)
         }
+        // PR #5 re-review 28 Nov: the persistent capture-health
+        // document (incidents + successor fence) lives in the
+        // same "paylist" SharedPreferences as the rest of the
+        // Store state; writes are apply() (async, never a
+        // blocking commit on a pipeline thread).
+        val healthPrefs = getSharedPreferences("paylist", MODE_PRIVATE)
+        val healthStore = object : CaptureHealthStore {
+            override fun readCaptureHealth(): String? =
+                healthPrefs.getString(CAPTURE_HEALTH_KEY, null)
+
+            override fun writeCaptureHealth(json: String) {
+                healthPrefs.edit().putString(CAPTURE_HEALTH_KEY, json).apply()
+            }
+        }
         CaptureCoordinator(
             repository = repository,
             modeReader = { coordinator.getMode() },
@@ -163,6 +181,7 @@ class PaylistApplication : Application(), Configuration.Provider {
             rawSnapshotStore = rawSnapshotStore,
             consentStore = consentStore,
             captureLogDao = db.captureLogDao(),
+            healthStore = healthStore,
         )
     }
 
@@ -385,6 +404,30 @@ class PaylistApplication : Application(), Configuration.Provider {
             }
         } catch (e: Exception) {
             store.logLocal("pemulihan awal gagal: ${e.message?.take(120)}")
+        }
+        try {
+            // PR #5 re-review 28 Nov: surface the PERSISTENT
+            // capture-health state at startup — incidents recorded
+            // by a previous process are operator-visible in the
+            // local log (and via degradedState()) instead of dying
+            // with that process's volatile counters.
+            val health = captureCoordinator.degradedState()
+            if (health.degraded) {
+                store.logLocal(
+                    "kesehatan capture TERDEGRADASI saat mulai: " +
+                        health.reasons.joinToString("; ").take(900),
+                )
+            }
+            if (health.persistentIncidents.isNotEmpty()) {
+                store.logLocal(
+                    "insiden capture persisten: " +
+                        health.persistentIncidents.joinToString("; ") {
+                            "${it.category}=${it.status} x${it.count}"
+                        }.take(600),
+                )
+            }
+        } catch (e: Exception) {
+            store.logLocal("cek kesehatan capture gagal: ${e.message?.take(120)}")
         }
         try {
             val routesStore = SharedPreferencesKeyValueStore(
