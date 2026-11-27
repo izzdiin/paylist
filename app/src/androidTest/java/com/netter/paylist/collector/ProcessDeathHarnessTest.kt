@@ -26,36 +26,35 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Stage D audit follow-up (PR #5 re-review 27 Nov): ACTUAL
- * process-death evidence for the capture pipeline — the reviewer
- * rejected coordinator replacement as a SIGKILL substitute, so
- * this harness is built to be killed for real.
+ * Stage D audit follow-up (PR #5 re-review 27 Nov), re-scoped by
+ * the 28 Nov re-review: this class is an IN-PROCESS
+ * restart-boundary REGRESSION — it is NOT process-death evidence.
+ * The 27 Nov runner script for it was rejected as an oracle (it
+ * could exit 0 after an instrumentation failure and could not
+ * prove the killed PID was the staged process), and the script
+ * has been removed. Actual process death for this pipeline is
+ * proven by the two-phase oracle `scripts/capture_death_tests.sh`
+ * (CaptureDeathPhaseA/B: self-kill at the crash window, runner
+ * death checks, fresh-process PhaseB, negative + fake-adb
+ * controls), which runs in CI's `process-death-oracle` job.
  *
  * Two scenarios against a FILE-BACKED Room database (a named
- * file, never the in-memory builder):
+ * file, never the in-memory builder), driven here as a
+ * same-process coordinator-replacement regression:
  *
- * - AFTER-STAGE kill: a capture is ACCEPTED (staging row
- *   committed) but its enqueue is parked. The process dies. On
- *   restart, the startup sweep must promote it exactly once.
- * - BEFORE-STAGE kill: a capture is RECEIVED-only (queued in
- *   memory behind a held worker) when the process dies. No
- *   staging row, no overflow row (SIGKILL runs no close()). On
- *   restart it exists only as a still-posted notification: a
- *   rescan re-capture must land it exactly once, and a second
- *   rescan must dedupe.
- *
- * Execution: `scripts/process-death-harness.sh` runs the two
- * setup methods via instrumentation, kills the app process with
- * `kill -9`, then runs the two recovery methods in a fresh
- * process. Run inside CI's single instrumentation process
- * (methods ordered by name), the same assertions hold as a
- * restart-boundary regression — but the SIGKILL claim rests on
- * the script's runs, and only those.
+ * - AFTER-STAGE: a capture is ACCEPTED (staging row committed)
+ *   but its enqueue is parked. The coordinator is replaced. The
+ *   startup sweep must promote it exactly once.
+ * - BEFORE-STAGE: a capture is RECEIVED-only (queued in memory
+ *   behind a held worker) when the coordinator is replaced. No
+ *   staging row, no overflow row. It exists only as a still-
+ *   posted notification: a rescan re-capture must land it
+ *   exactly once, and a second rescan must dedupe.
  *
  * Nothing here is closed or cleaned up in the setup methods:
  * closing would write the graceful-shutdown evidence whose
- * absence is precisely what a SIGKILL means. The databases are
- * dedicated test files, deleted at each setup.
+ * absence the replacement boundary is meant to simulate. The
+ * databases are dedicated test files, deleted at each setup.
  */
 @RunWith(AndroidJUnit4::class)
 @FixMethodOrder(MethodSorters.NAME_ASCENDING)

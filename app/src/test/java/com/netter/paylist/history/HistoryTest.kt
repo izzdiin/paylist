@@ -573,6 +573,13 @@ class HistoryTest {
                 Regex(""".*captureLogDao = db\.captureLogDao\(\).*"""),
                 Regex(""".*db\.captureLogDao\(\)\.countHistory\(.*"""),
             ),
+            // The capture process-death oracle harness (28 Nov)
+            // wires the REAL capture-log DAO into its coordinator
+            // exactly the way production does — only that one call
+            // shape is allowed.
+            "CaptureDeathHarness.kt" to listOf(
+                Regex(""".*captureLogDao = db\.captureLogDao\(\).*"""),
+            ),
         )
         val moduleDir = root.absoluteFile.parentFile?.parentFile?.parentFile
             ?: throw AssertionError("cannot derive the module dir for LH-T08")
