@@ -5,7 +5,7 @@ import android.os.Process
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.netter.paylist.collector.CaptureCoordinator
-import com.netter.paylist.collector.LegacyEnqueue
+import com.netter.paylist.migration.LegacyEnqueue
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.fail

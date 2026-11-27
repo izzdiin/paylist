@@ -1,21 +1,21 @@
 package com.netter.paylist
 
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
-import androidx.core.app.NotificationCompat
 import androidx.room.Room
 import com.netter.paylist.collector.CaptureCoordinator
 import com.netter.paylist.collector.CaptureHealthStore
 import com.netter.paylist.collector.CaptureLogSink
 import com.netter.paylist.collector.ConsentStore
-import com.netter.paylist.collector.LegacyEnqueue
 import com.netter.paylist.collector.NotificationNormalizer
 import com.netter.paylist.collector.NotificationSnapshot
 import com.netter.paylist.collector.PrivacyGate
 import com.netter.paylist.data.EventRepository
 import com.netter.paylist.data.PaylistDatabase
 import com.netter.paylist.migration.CutoverMode
+import com.netter.paylist.migration.LegacyEnqueue
 import com.netter.paylist.migration.LegacyQkey
 import org.json.JSONArray
 import org.json.JSONObject
@@ -177,7 +177,7 @@ object CaptureDeathHarness {
      * way PaylistApplication wires the production one (real
      * repository, real ConsentStore with the route's consent
      * granted, real PrivacyGate, SharedPreferences health store),
-     * except: mode pinned LEGACY (the pre-cutover initial mode),
+     * except: mode pinned LEGACY_ONLY (the pre-cutover initial mode),
      * routes from the seeded Store, and the caller's
      * [legacyEnqueue].
      */
@@ -201,7 +201,7 @@ object CaptureDeathHarness {
         }
         return CaptureCoordinator(
             repository = newRepository(db),
-            modeReader = { CutoverMode.LEGACY },
+            modeReader = { CutoverMode.LEGACY_ONLY },
             legacyEnqueue = legacyEnqueue,
             routesProvider = { store.routes() },
             deviceIdProvider = { "capture-death-emulator" },
@@ -230,7 +230,7 @@ object CaptureDeathHarness {
                 NotificationManager.IMPORTANCE_DEFAULT,
             ),
         )
-        val notification = NotificationCompat.Builder(ctx, CHANNEL_ID)
+        val notification = Notification.Builder(ctx, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("Pembayaran QRIS")
             .setContentText("Pembayaran QRIS $amountText dari Pelanggan berhasil")
