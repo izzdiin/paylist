@@ -33,10 +33,12 @@ object CaptureOutcome {
     /**
      * A notification snapshot dropped by capture-queue saturation
      * before durable staging (Stage D audit P1). Metadata only:
-     * package + post time + PrivacyGate-scanned title snippet; no
-     * amount (never parsed), no event link, no content hash (a hash
-     * of un-gated raw text would be a hash of possibly-secret
-     * content). The row is the operator-visible evidence (History
+     * package + post time, and NO title snippet — since the
+     * 27 Nov re-review the overflow row stores no title text at
+     * all, because the drop happens before route/consent
+     * evaluation; no amount (never parsed), no event link, no
+     * content hash (a hash of un-gated raw text would be a hash
+     * of possibly-secret content). The row is the operator-visible evidence (History
      * filter) and the rescan handle while the notification is still
      * posted. Retention: unlinked rows expire on the 90-day rule
      * (LH-06) like any other unlinked row.

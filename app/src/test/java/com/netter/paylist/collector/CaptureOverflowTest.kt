@@ -9,6 +9,7 @@ import com.netter.paylist.FakeStore
 import com.netter.paylist.FakeTransactionRunner
 import com.netter.paylist.Route
 import com.netter.paylist.data.EventRepository
+import com.netter.paylist.data.dao.CaptureLogDao
 import com.netter.paylist.data.entity.CaptureLogEntity
 import com.netter.paylist.data.entity.CaptureOutcome
 import com.netter.paylist.migration.CutoverMode
@@ -25,6 +26,9 @@ import org.junit.Before
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Stage D audit P1 (PR #5 review 6049617822): capture loss before
@@ -42,12 +46,16 @@ import java.util.concurrent.TimeUnit
  * overflow drop must leave a durable OVERFLOW_DROPPED row.
  *
  * What is NOT claimed here: a true SIGKILL mid-flight cannot be
- * asserted in CI — the test process itself would die, and
- * instrumented tests use an in-memory database anyway. The
- * deterministic equivalent is coordinator replacement over the
- * same durable store (`restartBoundary_...` below) plus the
- * `close()` drain evidence. A file-backed-DB two-phase
- * instrumented kill test is future work, not claimed.
+ * asserted inside this JVM suite — the test process itself would
+ * die. The deterministic equivalent here is coordinator
+ * replacement over the same durable store (`restartBoundary_...`
+ * below) plus the `close()` drain evidence. The ACTUAL
+ * process-kill evidence lives in the instrumented two-phase
+ * harness (`ProcessDeathHarnessTest` in androidTest +
+ * `scripts/process-death-harness.sh`): a file-backed Room
+ * database, a real `kill -9` of the app process between the
+ * setup and recovery phases, and exactly-once assertions after
+ * the restart.
  */
 class CaptureOverflowTest {
 
@@ -63,7 +71,40 @@ class CaptureOverflowTest {
     private lateinit var eventDao: FakeEventDao
     private lateinit var deliveryDao: FakeDeliveryDao
     private lateinit var stagingDao: FakeCaptureStagingDao
-    private lateinit var captureLogDao: FakeCaptureLogDao
+    private lateinit var captureLogDao: FlakyCaptureLogDao
+
+    /**
+     * Capture-log DAO wrapper for the lifecycle tests: can fail
+     * the next N inserts, commit-then-fail the next N inserts
+     * (an uncertain commit — the row landed but the call threw),
+     * and delay inserts (a slow durable write).
+     */
+    private class FlakyCaptureLogDao(
+        private val delegate: CaptureLogDao,
+    ) : CaptureLogDao by delegate {
+        val failNextInserts = AtomicInteger(0)
+        val commitThenFailNext = AtomicInteger(0)
+        val insertDelayMs = AtomicLong(0)
+
+        override suspend fun insert(row: CaptureLogEntity): Long {
+            if (failNextInserts.getAndDecrement() > 0) {
+                throw IllegalStateException("db down (test)")
+            }
+            val delay = insertDelayMs.get()
+            if (delay > 0) Thread.sleep(delay)
+            val result = delegate.insert(row)
+            if (commitThenFailNext.getAndDecrement() > 0) {
+                throw IllegalStateException("commit uncertain (test)")
+            }
+            return result
+        }
+    }
+
+    /** While true, the mode read ignores interrupts and keeps waiting for its latch. */
+    private val stubbornModeRead = AtomicBoolean(false)
+
+    /** While true, the legacy enqueue reports failure (captures park). */
+    private val enqueueShouldFail = AtomicBoolean(false)
     private lateinit var repository: EventRepository
     private lateinit var legacyQueue: MutableList<JSONObject>
     private lateinit var logLines: MutableList<String>
@@ -90,7 +131,7 @@ class CaptureOverflowTest {
         eventDao = FakeEventDao(store)
         deliveryDao = FakeDeliveryDao(store)
         stagingDao = FakeCaptureStagingDao(store)
-        captureLogDao = FakeCaptureLogDao(store)
+        captureLogDao = FlakyCaptureLogDao(FakeCaptureLogDao(store))
         repository = EventRepository(
             eventDao, deliveryDao, stagingDao,
             FakeClassificationDao(store), FakeTransactionRunner(store),
@@ -105,37 +146,60 @@ class CaptureOverflowTest {
         runCatching { coordinator.close() }
     }
 
-    private fun newCoordinator(): CaptureCoordinator = CaptureCoordinator(
+    private fun newCoordinator(
+        closeTimeoutMs: Long = CaptureCoordinator.CLOSE_ACTIVE_TIMEOUT_MS,
+    ): CaptureCoordinator = CaptureCoordinator(
         repository = repository,
         modeReader = {
             val latch = modeReaderLatch
             if (latch != null) {
-                try {
-                    latch.await(10, TimeUnit.SECONDS)
-                } catch (_: InterruptedException) {
-                    // Simulated death interrupts the executor thread;
-                    // the in-flight capture completes normally
-                    // instead of failing noisily (its staging row
-                    // is already durable either way).
-                    Thread.currentThread().interrupt()
+                if (stubbornModeRead.get()) {
+                    // A capture task that does NOT honour the
+                    // close() interrupt: it keeps waiting for its
+                    // latch (bounded) so close() must exhaust its
+                    // bounded join and account the task unresolved.
+                    val deadline = System.currentTimeMillis() + 30_000L
+                    while (latch.count > 0 &&
+                        System.currentTimeMillis() < deadline
+                    ) {
+                        try {
+                            latch.await(50, TimeUnit.MILLISECONDS)
+                        } catch (_: InterruptedException) {
+                            // Swallowed on purpose (stubborn task).
+                        }
+                    }
+                } else {
+                    try {
+                        latch.await(10, TimeUnit.SECONDS)
+                    } catch (_: InterruptedException) {
+                        // Simulated death interrupts the executor thread;
+                        // the in-flight capture completes normally
+                        // instead of failing noisily (its staging row
+                        // is already durable either way).
+                        Thread.currentThread().interrupt()
+                    }
                 }
             }
             mode
         },
         legacyEnqueue = LegacyEnqueue { payload, kind, routeIds ->
-            val qkey = LegacyQkey.build(
-                payload.optString("dedupe_key"), kind, routeIds,
-            )
-            if (legacyQueue.none { it.optString("qkey") == qkey }) {
-                legacyQueue.add(JSONObject().apply {
-                    put("kind", kind)
-                    put("route_ids", org.json.JSONArray(routeIds))
-                    put("next", 0)
-                    put("payload", payload)
-                    put("qkey", qkey)
-                })
+            if (enqueueShouldFail.get()) {
+                false
+            } else {
+                val qkey = LegacyQkey.build(
+                    payload.optString("dedupe_key"), kind, routeIds,
+                )
+                if (legacyQueue.none { it.optString("qkey") == qkey }) {
+                    legacyQueue.add(JSONObject().apply {
+                        put("kind", kind)
+                        put("route_ids", org.json.JSONArray(routeIds))
+                        put("next", 0)
+                        put("payload", payload)
+                        put("qkey", qkey)
+                    })
+                }
+                true
             }
-            true
         },
         routesProvider = { routes },
         deviceIdProvider = { "g57" },
@@ -150,6 +214,7 @@ class CaptureOverflowTest {
         clock = { POST_TIME + 5_000L },
         captureLogDao = captureLogDao,
         executorCapacity = CAPACITY,
+        closeActiveTimeoutMs = closeTimeoutMs,
     )
 
     private fun snapshot(
@@ -246,7 +311,11 @@ class CaptureOverflowTest {
             val row = rows.single()
             assertEquals(PKG, row.sourcePackage)
             assertEquals(POST_TIME + 1_000L, row.postTimeMs)
-            assertEquals("Pembayaran berhasil", row.titleSnippet)
+            assertNull(
+                "consent policy: overflow rows store NO title text " +
+                    "(the drop precedes route/consent evaluation)",
+                row.titleSnippet,
+            )
             assertNull("no amount parsed before the drop", row.amountMinor)
             assertNull("overflow rows are never linked to an event", row.eventId)
             assertNull("no hash of un-gated raw text", row.contentSha256)
@@ -366,20 +435,253 @@ class CaptureOverflowTest {
     // --- Capture after shutdown ---
 
     @Test
-    fun captureAfterClose_droppedOverflowReceipt_durableRow_noThrow() = runBlocking {
+    fun captureAfterClose_droppedOverflowReceipt_countedRecordLost_noThrow() = runBlocking {
         coordinator.close()
+        // The overflow writer is terminated by close() now (PR #5
+        // re-review 27 Nov — it no longer outlives the coordinator
+        // retaining the DAO), so a post-close capture cannot get a
+        // durable row any more: the drop is counted as a lost
+        // overflow record, explicitly, and capture() still never
+        // throws to the caller.
+        assertFalse(coordinator.isOverflowWriterAlive())
         assertEquals(
             CaptureCoordinator.CaptureReceipt.DROPPED_OVERFLOW,
             coordinator.capture(snapshot()),
         )
         assertEquals(1, coordinator.counters().droppedOverflow)
-        // The writer thread outlives close() by design, so the
-        // post-close drop still gets its durable record —
-        // asynchronously, never via a blocking insert here.
-        awaitCondition("overflow row for the post-close capture") {
-            overflowRows().size == 1
-        }
-        assertEquals(POST_TIME, overflowRows().single().postTimeMs)
+        assertEquals(1, coordinator.counters().overflowRecordDropped)
+        assertEquals(0, overflowRows().size)
         assertEquals(0, eventDao.count())
+        assertTrue(coordinator.degradedState().degraded)
+    }
+
+    // --- Shutdown / lifecycle (PR #5 re-review 27 Nov) ---
+
+    @Test
+    fun closeWithActivePreStage_resolvesActiveTaskExactlyOnce() = runBlocking {
+        val latch = blockExecutorWith(POST_TIME)
+        // The blocker is ACTIVE (staged, held in its mode read).
+        // close() must settle it — grace, interrupt, bounded join —
+        // not return while it is still in flight.
+        val closeThread = Thread { coordinator.close() }
+        closeThread.start()
+        closeThread.join(15_000)
+        assertFalse("close() must return (bounded)", closeThread.isAlive)
+        latch.countDown()
+        // The interrupt honoured by the mode read let the active
+        // capture complete exactly once: staged + enqueued, no
+        // unresolved accounting, no duplicate after a sweep.
+        assertEquals(1, eventDao.count())
+        assertEquals(1, legacyQueue.size)
+        assertEquals(0, coordinator.counters().unresolvedAtClose)
+        assertFalse(coordinator.isCaptureWorkerAlive())
+        assertFalse(coordinator.isOverflowWriterAlive())
+        coordinator = newCoordinator()
+        coordinator.sweepNow()
+        assertEquals("no duplicate promotion after close", 1, legacyQueue.size)
+    }
+
+    @Test
+    fun closeWithStuckActiveTask_unresolvedCountedExplicitly() = runBlocking {
+        stubbornModeRead.set(true)
+        coordinator = newCoordinator(closeTimeoutMs = 400L)
+        val latch = blockExecutorWith(POST_TIME)
+        // close() exhausts its bounded wait (the active task
+        // swallows the interrupt): it must still return, with the
+        // active capture accounted as UNRESOLVED — not silently
+        // abandoned, not assumed lost or saved.
+        val started = System.currentTimeMillis()
+        coordinator.close()
+        val elapsed = System.currentTimeMillis() - started
+        assertTrue("close() bounded (was ${elapsed}ms)", elapsed < 15_000)
+        assertEquals(1, coordinator.counters().unresolvedAtClose)
+        assertTrue(coordinator.degradedState().degraded)
+        assertEquals(
+            1,
+            coordinator.degradedState().unresolvedAtClose,
+        )
+        // Cleanup: release the task; it completes (its staging was
+        // already durable) and the worker then exits on its own.
+        latch.countDown()
+        awaitCondition("stuck worker exits after release") {
+            !coordinator.isCaptureWorkerAlive()
+        }
+        assertEquals(1, eventDao.count())
+        assertEquals(1, legacyQueue.size)
+    }
+
+    @Test
+    fun closeRacingAdmission_noHangNoThrowAccountingConsistent() = runBlocking {
+        val receipts = java.util.Collections.synchronizedList(
+            mutableListOf<CaptureCoordinator.CaptureReceipt>(),
+        )
+        val errors = java.util.Collections.synchronizedList(
+            mutableListOf<Throwable>(),
+        )
+        val producers = (0 until 4).map { t ->
+            Thread {
+                try {
+                    for (i in 1..50) {
+                        receipts.add(
+                            coordinator.capture(
+                                snapshot(postTime = POST_TIME + (t * 50 + i) * 1_000L),
+                            ),
+                        )
+                    }
+                } catch (e: Throwable) {
+                    errors.add(e)
+                }
+            }
+        }
+        producers.forEach { it.start() }
+        Thread.sleep(50)
+        coordinator.close()
+        producers.forEach { it.join(15_000) }
+        producers.forEach { assertFalse("producer must not hang", it.isAlive) }
+        assertTrue("capture() never throws, even racing close: $errors",
+            errors.isEmpty())
+        assertEquals(200, receipts.size)
+        val c = coordinator.counters()
+        assertEquals(200, c.received)
+        // Every received snapshot is accounted: staged (an event),
+        // overflow-dropped (queued-at-close, post-close, or
+        // saturation), or explicitly unresolved. Nothing vanishes.
+        assertTrue(
+            "staged+dropped+unresolved must cover all receipts " +
+                "(staged=${c.staged}, dropped=${c.droppedOverflow}, " +
+                "unresolved=${c.unresolvedAtClose})",
+            c.staged + c.droppedOverflow + c.unresolvedAtClose >= 200,
+        )
+        assertEquals(0, c.overflowPending)
+        assertFalse(coordinator.isOverflowWriterAlive())
+    }
+
+    @Test
+    fun stableOverflowId_retryAfterUncertainCommit_noDuplicateRow() = runBlocking {
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            awaitCondition("blocker capture-log row written") {
+                store.captureLog.values.any {
+                    it.outcome == CaptureOutcome.CAPTURED
+                }
+            }
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            // The overflow record's first insert COMMITS but the
+            // call throws (uncertain commit). The retry must reuse
+            // the same capture_id, so the IGNORE-on-conflict insert
+            // cannot create a second row (PR #5 re-review 27 Nov).
+            captureLogDao.commitThenFailNext.set(1)
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            awaitCondition("overflow row persisted") { overflowRows().size == 1 }
+            Thread.sleep(300)
+            assertEquals(
+                "exactly one row after the uncertain-commit retry",
+                1, overflowRows().size,
+            )
+            assertEquals(POST_TIME + 1_000L, overflowRows().single().postTimeMs)
+            assertTrue(coordinator.counters().captureLogFailures >= 1)
+            assertEquals(0, coordinator.counters().overflowRecordDropped)
+            awaitCondition("outstanding settled after retry success") {
+                coordinator.counters().overflowPending == 0L
+            }
+        } finally {
+            latch.countDown()
+        }
+        awaitCondition("admitted captures enqueued") { legacyQueue.size == 4 }
+    }
+
+    @Test
+    fun permanentDbFailure_writerGivesUpBounded_closeTerminatesWriter() = runBlocking {
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            awaitCondition("blocker capture-log row written") {
+                store.captureLog.values.any {
+                    it.outcome == CaptureOutcome.CAPTURED
+                }
+            }
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            captureLogDao.failNextInserts.set(Int.MAX_VALUE)
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            // The writer retries (bounded) and gives up: the record
+            // is counted lost, pending returns to zero — the writer
+            // does not spin forever on a dead database.
+            awaitCondition("overflow record given up after retries") {
+                coordinator.counters().overflowRecordDropped == 1L
+            }
+            // The outstanding decrement lands just after the
+            // give-up count in the writer thread — poll for it
+            // instead of racing it.
+            awaitCondition("outstanding settled after give-up") {
+                coordinator.counters().overflowPending == 0L
+            }
+            assertTrue(coordinator.counters().captureLogFailures >= 3)
+        } finally {
+            latch.countDown()
+        }
+        awaitCondition("admitted captures enqueued") { legacyQueue.size == 4 }
+        captureLogDao.failNextInserts.set(0)
+        val started = System.currentTimeMillis()
+        coordinator.close()
+        assertTrue(
+            "close() bounded with a dead-then-healed DB",
+            System.currentTimeMillis() - started < 15_000,
+        )
+        assertFalse(coordinator.isOverflowWriterAlive())
+    }
+
+    @Test
+    fun close_flushWaitsForDelayedOverflowWrites_noPrematureEmpty() = runBlocking {
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            awaitCondition("blocker capture-log row written") {
+                store.captureLog.values.any {
+                    it.outcome == CaptureOutcome.CAPTURED
+                }
+            }
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            // Every overflow insert now takes 600 ms. Evict V1,
+            // then close immediately: close strands V2..V4 into
+            // overflow records too, and its flush must wait for
+            // ALL FOUR slow writes — the old take-to-active check
+            // could observe "empty" while the first record was in
+            // flight and return before any row existed.
+            captureLogDao.insertDelayMs.set(600)
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            coordinator.close()
+            assertEquals(
+                "all four overflow rows persisted before close returned",
+                4, overflowRows().size,
+            )
+            assertEquals(0, coordinator.counters().overflowPending)
+            assertEquals(0, coordinator.counters().overflowRecordDropped)
+        } finally {
+            captureLogDao.insertDelayMs.set(0)
+            latch.countDown()
+        }
+    }
+
+    @Test
+    fun sweepFailure_propagatesToCaller_notSwallowed() = runBlocking {
+        // The staging read itself fails: sweepOrphanedStaging
+        // throws before any per-row handling. sweepNow must
+        // propagate that failure (PR #5 re-review 27 Nov) instead
+        // of returning as if the sweep had succeeded.
+        stagingDao.getAllFailure = IllegalStateException("staging read boom (test)")
+        try {
+            coordinator.sweepNow()
+            throw AssertionError("sweepNow must propagate the sweep failure")
+        } catch (e: IllegalStateException) {
+            assertEquals("staging read boom (test)", e.message)
+        } finally {
+            stagingDao.getAllFailure = null
+        }
+        // And the coordinator is still usable afterwards.
+        coordinator.sweepNow()
     }
 }

@@ -546,10 +546,33 @@ class HistoryTest {
             // DAO for the OVERFLOW_DROPPED durability fixtures
             // (CaptureOverflowTest).
             "CaptureOverflowTest.kt",
-            // Stage D audit P1 admission tests wire the capture-log
-            // DAO for the overflow-retry fixtures (FlakyCaptureLogDao
-            // around FakeCaptureLogDao in CaptureAdmissionTest).
-            "CaptureAdmissionTest.kt",
+        )
+        // NARROWED allowlist (PR #5 re-review 27 Nov): a whole-file
+        // exemption for CaptureAdmissionTest was too broad — the
+        // file may touch the capture log ONLY on the fixture lines
+        // below (the FlakyCaptureLogDao wrapper and its wiring for
+        // the overflow-retry tests). Any other capture_log /
+        // CaptureLogDao line in that file is a violation, exactly
+        // as for a non-allowlisted file.
+        val narrowAllowed: Map<String, List<Regex>> = mapOf(
+            "CaptureAdmissionTest.kt" to listOf(
+                Regex("""import com\.netter\.paylist\.FakeCaptureLogDao"""),
+                Regex("""import com\.netter\.paylist\.data\.dao\.CaptureLogDao"""),
+                Regex(""".*class \w*CaptureLogDao\(.*"""),
+                Regex(""".*val delegate: CaptureLogDao.*"""),
+                Regex(""".*CaptureLogDao by delegate.*"""),
+                Regex(""".*var captureLogDao: .*"""),
+                Regex(""".*captureLogDao = .*"""),
+                Regex(""".*captureLogDao\.failNextInserts\..*"""),
+            ),
+            // The process-death harness wires the REAL capture-log
+            // DAO into its coordinator and reads the overflow count
+            // back for the before-stage assertion — only those two
+            // call shapes are allowed.
+            "ProcessDeathHarnessTest.kt" to listOf(
+                Regex(""".*captureLogDao = db\.captureLogDao\(\).*"""),
+                Regex(""".*db\.captureLogDao\(\)\.countHistory\(.*"""),
+            ),
         )
         val moduleDir = root.absoluteFile.parentFile?.parentFile?.parentFile
             ?: throw AssertionError("cannot derive the module dir for LH-T08")
@@ -565,11 +588,17 @@ class HistoryTest {
                 .filter { it.isFile && it.extension == "kt" }
                 .forEach { file ->
                     if (file.name in allowed) return@forEach
+                    val narrowPatterns = narrowAllowed[file.name]
                     file.readLines().forEachIndexed { index, line ->
                         if (isComment(line)) return@forEachIndexed
                         if (line.contains("CaptureLogDao") || line.contains("captureLogDao") ||
                             line.contains("capture_log")
                         ) {
+                            if (narrowPatterns != null &&
+                                narrowPatterns.any { it.containsMatchIn(line.trim()) }
+                            ) {
+                                return@forEachIndexed
+                            }
                             touchViolations.add("${file.relativeTo(moduleDir)}:${index + 1}: ${line.trim()}")
                         }
                     }

@@ -685,6 +685,15 @@ class FakeCollectorStateDao(private val store: FakeStore) : CollectorStateDao {
 
 /** Stage D: fake `capture_staging` DAO (IGNORE insert, -1 on conflict). */
 class FakeCaptureStagingDao(private val store: FakeStore) : CaptureStagingDao {
+    /**
+     * Test hook (PR #5 re-review 27 Nov): when set, [getAll]
+     * throws it — used to prove sweepNow propagates a staging-read
+     * failure instead of swallowing it. Null (the default) changes
+     * nothing for any other suite.
+     */
+    @Volatile
+    var getAllFailure: Throwable? = null
+
     override suspend fun insert(row: CaptureStagingEntity): Long = store.lock.withLock {
         if (store.staging.containsKey(row.legacyQkey)) return@withLock -1L
         store.staging[row.legacyQkey] = row
@@ -697,8 +706,11 @@ class FakeCaptureStagingDao(private val store: FakeStore) : CaptureStagingDao {
     override suspend fun getByDedupeKey(key: String): List<CaptureStagingEntity> =
         store.lock.withLock { store.staging.values.filter { it.dedupeKey == key } }
 
-    override suspend fun getAll(): List<CaptureStagingEntity> = store.lock.withLock {
-        store.staging.values.sortedBy { it.createdAtMs }
+    override suspend fun getAll(): List<CaptureStagingEntity> {
+        getAllFailure?.let { throw it }
+        return store.lock.withLock {
+            store.staging.values.sortedBy { it.createdAtMs }
+        }
     }
 
     override suspend fun deleteByLegacyQkey(qkey: String): Int = store.lock.withLock {

@@ -105,6 +105,54 @@ data class CaptureCounters(
     val overflowRecordDropped: Long = 0,
     /** Overflow records currently waiting in the overflow-writer queue. */
     val overflowPending: Long = 0,
+    /**
+     * Snapshots whose capture task was still active when [close]
+     * exhausted its bounded shutdown wait (Stage D audit follow-up,
+     * PR #5 re-review 27 Nov): the task was interrupted but did
+     * not finish, so its outcome is explicitly UNRESOLVED — it may
+     * or may not have committed its staging row (a Room transaction
+     * is atomic either way); recovery is the startup sweep (when
+     * the staging row committed) plus rescan while the
+     * notification is still posted. Never silently assumed lost
+     * or saved.
+     */
+    val unresolvedAtClose: Long = 0,
+)
+
+/**
+ * Owner-visible capture health (Stage D audit follow-up, PR #5
+ * re-review 27 Nov — the "degraded state" definition the review
+ * required). The capture pipeline is DEGRADED when any snapshot
+ * that reached this coordinator was dropped by saturation, any
+ * durable overflow record was ultimately lost, any capture was
+ * left unresolved by a shutdown, or overflow records are still
+ * waiting to be persisted. A degraded state is visible three
+ * ways: this snapshot (diagnostics), the OVERFLOW_DROPPED rows
+ * in History (one per dropped snapshot, metadata-only), and the
+ * loud local log lines. Recovery, in order: (1) rescan while the
+ * notifications are still posted (listener reconnect / manual
+ * rescan re-reads the shade and dedupes), (2) restart the
+ * listener (the startup sweep re-promotes committed staging
+ * rows), (3) if overflow records keep failing, the database is
+ * the failing component — check storage/DB health before
+ * trusting the counters again. No zero-loss claim: a snapshot
+ * dropped before staging whose notification was dismissed is
+ * unrecoverable; the overflow row is its only evidence.
+ */
+data class CaptureDegradedState(
+    val degraded: Boolean,
+    /** Snapshots dropped by queue saturation (each overflow-recorded). */
+    val overflowDroppedSnapshots: Long,
+    /** Overflow records whose durable write ultimately failed. */
+    val overflowRecordsLost: Long,
+    /** Captures left unresolved by a bounded shutdown (see [CaptureCounters.unresolvedAtClose]). */
+    val unresolvedAtClose: Long,
+    /** Overflow records not yet persisted. */
+    val overflowPending: Long,
+    /** Capture-log inserts that failed (all outcomes). */
+    val captureLogFailures: Long,
+    /** Human-readable reasons (Indonesian, matching the log lines). */
+    val reasons: List<String>,
 )
 
 /**
@@ -169,8 +217,9 @@ data class CaptureCounters(
  * executor and was never overflow-evicted. Overflow evictions,
  * by contrast, ARE durably recorded: every snapshot the bounded
  * queue drops gets one metadata-only `capture_log` row
- * ([CaptureOutcome.OVERFLOW_DROPPED] — package, post time,
- * PrivacyGate-scanned title snippet; no amount, no event link, no
+ * ([CaptureOutcome.OVERFLOW_DROPPED] — package and post time
+ * ONLY: no title text at all, because the drop happens before
+ * route/consent evaluation; no amount, no event link, no
  * content hash), visible to the operator in History, so a burst
  * leaves durable per-snapshot evidence instead of only a counter.
  *
@@ -241,6 +290,12 @@ class CaptureCoordinator(
      * [EXECUTOR_CAPACITY]).
      */
     private val executorCapacity: Int = EXECUTOR_CAPACITY,
+    /**
+     * Bounded wait for the active capture task during [close]
+     * (tests use a small value; production uses
+     * [CLOSE_ACTIVE_TIMEOUT_MS]).
+     */
+    private val closeActiveTimeoutMs: Long = CLOSE_ACTIVE_TIMEOUT_MS,
 ) {
     companion object {
         /** Executor work-queue capacity (design §8.3 (6′), proposed value). */
@@ -257,6 +312,15 @@ class CaptureCoordinator(
 
         /** Bounded wait for the overflow writer to drain during [close]. */
         const val OVERFLOW_FLUSH_TIMEOUT_MS: Long = 5_000
+
+        /** Grace for the active capture task to finish before [close] interrupts it. */
+        const val CLOSE_ACTIVE_GRACE_MS: Long = 250
+
+        /** Bounded wait for the active capture task during [close] (after the grace + interrupt). */
+        const val CLOSE_ACTIVE_TIMEOUT_MS: Long = 5_000
+
+        /** Bounded join of the overflow writer at the end of [close]. */
+        const val WRITER_JOIN_TIMEOUT_MS: Long = 2_000
 
         /** Periodic staging-sweep interval (matches the 15-minute periodic work). */
         const val SWEEP_INTERVAL_MINUTES: Long = 15
@@ -293,6 +357,7 @@ class CaptureCoordinator(
     private val controlInline = AtomicLong()
     private val controlDropped = AtomicLong()
     private val overflowRecordDropped = AtomicLong()
+    private val unresolvedAtClose = AtomicLong()
 
     private fun daemonFactory(name: String): ThreadFactory = ThreadFactory { r ->
         Thread(r, name).apply { isDaemon = true }
@@ -390,6 +455,19 @@ class CaptureCoordinator(
 
     @Volatile
     private var closedFlag: Boolean = false
+
+    /**
+     * The task the capture worker is running right now (guarded
+     * by [admissionLock]; null when the worker is idle). [close]
+     * settles this task explicitly — bounded wait, interrupt,
+     * then an unresolved accounting — instead of returning while
+     * a pre-stage snapshot is still in flight (PR #5 re-review
+     * 27 Nov).
+     */
+    private var activeTask: CaptureTask? = null
+
+    /** Guards the one-shot [close] sequence. */
+    private val closeStarted = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** The ONLY thread that ever runs capture/sweep tasks. */
     private val captureWorker = Thread({ workerLoop() }, "paylist-capture").apply {
@@ -505,13 +583,20 @@ class CaptureCoordinator(
                     else -> null
                 }
             } ?: return
-            if (!task.cancelled) {
-                try {
-                    task.run()
-                } catch (e: Exception) {
-                    logger.logLocal(
-                        "tugas capture gagal (${task.kind}): ${e.message?.take(120)}",
-                    )
+            admissionLock.withLock { activeTask = task }
+            try {
+                if (!task.cancelled) {
+                    try {
+                        task.run()
+                    } catch (e: Exception) {
+                        logger.logLocal(
+                            "tugas capture gagal (${task.kind}): ${e.message?.take(120)}",
+                        )
+                    }
+                }
+            } finally {
+                admissionLock.withLock {
+                    if (activeTask === task) activeTask = null
                 }
             }
         }
@@ -519,22 +604,63 @@ class CaptureCoordinator(
 
     // --- Durable overflow accounting (writer thread) ---
 
-    /** One pending durable overflow record, with its write-attempt count. */
+    /**
+     * One pending durable overflow record, with its write-attempt
+     * count. The `capture_id` is minted ONCE, here at creation,
+     * and reused by every retry (PR #5 re-review 27 Nov): the DAO
+     * insert is IGNORE-on-conflict, so a retry after an uncertain
+     * commit (the row landed but the call threw) hits the same
+     * primary key and cannot create a duplicate row.
+     */
     private class OverflowRecord(val snapshot: NotificationSnapshot) {
+        val captureId: String = UUID.randomUUID().toString()
         var attempts: Int = 0
     }
 
     private val overflowQueue = LinkedBlockingQueue<OverflowRecord>(OVERFLOW_QUEUE_CAPACITY)
 
+    /**
+     * Overflow records accepted by [recordOverflow] but not yet
+     * terminally settled (persisted, or given up after the retry
+     * budget). Incremented BEFORE the record is offered and
+     * decremented exactly once when the writer settles it, all
+     * under the writer's control — this replaces the old
+     * take-to-`overflowActive` check, whose gap between `take()`
+     * and the volatile assignment let [flushOverflow] observe a
+     * premature "empty" while a record was in flight (PR #5
+     * re-review 27 Nov). [flushOverflow] and
+     * [CaptureCounters.overflowPending] read only this counter.
+     */
+    private val overflowOutstanding = AtomicLong()
+
+    /** Set by [close] after the final flush: the writer exits once its queue is empty. */
     @Volatile
-    private var overflowActive: OverflowRecord? = null
+    private var overflowWriterShutdown: Boolean = false
 
     /**
-     * The overflow writer: a dedicated daemon thread, deliberately
-     * NOT stopped by [close] (like a logger, it outlives the
-     * capture pipeline so a capture attempted after shutdown
-     * still gets its record attempted; [close] only waits,
-     * bounded, for it to drain). It exits with the process.
+     * Guards the writer-termination handshake: [recordOverflow]
+     * checks [overflowWriterTerminated] and offers its record
+     * under this lock, and the writer sets
+     * [overflowWriterTerminated] under the same lock only after
+     * observing an empty queue — so a record can never be offered
+     * into a queue whose writer has already decided to exit
+     * (which would strand its outstanding count forever).
+     */
+    private val overflowStateLock = ReentrantLock()
+
+    /** Guarded by [overflowStateLock]: the writer thread has exited for good. */
+    private var overflowWriterTerminated: Boolean = false
+
+    /**
+     * The overflow writer: a dedicated daemon thread that owns
+     * every durable overflow write AND the loud overflow log
+     * lines, so neither happens on a caller thread. It is stopped
+     * by [close] — bounded join after the final flush (PR #5
+     * re-review 27 Nov: a writer that loops forever per
+     * coordinator retains the DAO and makes the coordinator's
+     * lifecycle unbounded). A coordinator that is never closed
+     * (the production singleton) keeps its writer for its own
+     * lifetime, which is the coordinator's lifetime by design.
      */
     private val overflowWriter = Thread({ overflowLoop() }, "paylist-overflow-writer").apply {
         isDaemon = true
@@ -543,43 +669,61 @@ class CaptureCoordinator(
 
     /**
      * Overflow accounting for one dropped snapshot: the in-memory
-     * counter + a loud local log line synchronously (cheap, safe
-     * on any caller thread), and the durable `capture_log` row
-     * ASYNCHRONOUSLY on the overflow-writer thread — this method
-     * never touches the database and never blocks the caller on
-     * I/O, so the listener (Binder) thread is never stalled by an
-     * overflow write.
+     * counter and the outstanding accounting synchronously (cheap,
+     * no I/O, safe on any caller thread), and EVERYTHING else —
+     * the loud local log line and the durable `capture_log` row —
+     * on the overflow-writer thread. This method never calls the
+     * logger and never touches a store: the production log sink
+     * (Store) serialises and persists its whole log on the
+     * calling thread, which must never happen on the listener
+     * (Binder) callback (PR #5 re-review 27 Nov).
      *
      * The row is metadata-only ([CaptureOutcome.OVERFLOW_DROPPED]
-     * — package, post time, PrivacyGate-scanned title snippet; no
-     * amount, no event link, no content hash: the amount was
-     * never parsed and a hash of un-gated raw text would be a
-     * hash of possibly-secret content). It is the operator-visible
+     * — package + post time; no title text: the drop precedes
+     * route/consent evaluation, so no text of this snapshot may
+     * be retained; no amount — never parsed; no event link; no
+     * content hash — a hash of un-gated raw text would be a hash
+     * of possibly-secret content). It is the operator-visible
      * evidence (History filter) and the rescan handle while the
      * notification is still posted.
      *
      * A null DAO (a bare coordinator in tests) leaves only the
-     * counter + log. A full writer queue leaves the counter + log
-     * and is counted in [CaptureCounters.overflowRecordDropped] —
-     * never silent either way.
+     * counter. A full writer queue, a terminated writer
+     * (post-close), or a database that keeps failing leaves the
+     * counter + [CaptureCounters.overflowRecordDropped] — never
+     * silent either way.
      */
     private fun recordOverflow(snapshot: NotificationSnapshot?) {
         droppedOverflow.incrementAndGet()
         if (snapshot == null) {
-            logger.logLocal("capture overflow: snapshot tidak dikenal terbuang (tanpa catatan tahan)")
+            // Unknown snapshot: the counter is the only evidence
+            // (there is nothing to write a row about).
             return
         }
-        logger.logLocal(
-            "capture overflow: ${snapshot.packageName} @${snapshot.postTimeMs} " +
-                "terbuang sebelum staging (antrean penuh); pindai ulang selagi notifikasi masih aktif",
-        )
         if (captureLogDao == null) return
-        if (!overflowQueue.offer(OverflowRecord(snapshot))) {
-            overflowRecordDropped.incrementAndGet()
-            logger.logLocal(
-                "catatan overflow tidak masuk antrean penulis (${snapshot.packageName}): " +
-                    "bukti hanya counter + log lokal",
-            )
+        // This method runs on caller threads — including the
+        // NotificationListenerService Binder thread — so it must
+        // not touch the production log sink or any store
+        // synchronously (PR #5 re-review 27 Nov: Store.logLocal
+        // serialises + persists the whole log on the calling
+        // thread, and its exceptions must never reach the
+        // callback). It only counts, accounts, and offers the
+        // record; the writer thread emits the loud log line and
+        // performs the insert.
+        overflowStateLock.withLock {
+            if (overflowWriterTerminated) {
+                // The writer is gone (post-close): the record
+                // cannot be persisted any more. Counted
+                // explicitly as a lost record, never silently
+                // queued to a dead writer.
+                overflowRecordDropped.incrementAndGet()
+                return
+            }
+            overflowOutstanding.incrementAndGet()
+            if (!overflowQueue.offer(OverflowRecord(snapshot))) {
+                overflowOutstanding.decrementAndGet()
+                overflowRecordDropped.incrementAndGet()
+            }
         }
     }
 
@@ -595,55 +739,110 @@ class CaptureCoordinator(
     private fun overflowLoop() {
         while (true) {
             val record = try {
-                overflowQueue.take()
+                overflowQueue.poll(100, TimeUnit.MILLISECONDS)
             } catch (_: InterruptedException) {
+                // An interrupt is close()'s stop signal: do NOT
+                // exit here — fall into the same termination
+                // handshake as an empty poll below, so the
+                // terminated flag is always set under the lock
+                // before this thread dies. (Exiting directly from
+                // this catch once left the flag unset, and a
+                // post-close recordOverflow then queued a record
+                // to a dead writer.)
+                null
+            }
+            if (record == null) {
+                if (overflowWriterShutdown) {
+                    // Termination handshake (see
+                    // overflowStateLock): exit only when the
+                    // queue is provably empty under the lock.
+                    val exit = overflowStateLock.withLock {
+                        if (overflowQueue.isEmpty()) {
+                            overflowWriterTerminated = true
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    if (exit) return
+                }
                 continue
             }
-            overflowActive = record
-            try {
-                val dao = captureLogDao
-                if (dao != null) {
-                    val snapshot = record.snapshot
-                    runBlocking {
-                        dao.insert(
-                            CaptureLogEntity(
-                                captureId = UUID.randomUUID().toString(),
-                                sourcePackage = snapshot.packageName,
-                                postTimeMs = snapshot.postTimeMs,
-                                capturedAtMs = clock(),
-                                outcome = CaptureOutcome.OVERFLOW_DROPPED,
-                                titleSnippet = snippet(snapshot.title),
-                                amountMinor = null,
-                                eventId = null,
-                                contentSha256 = null,
-                            ),
-                        )
-                    }
-                }
-            } catch (e: Exception) {
-                captureLogFailures.incrementAndGet()
-                val snapshot = record.snapshot
-                logger.logLocal(
-                    "catatan overflow gagal ditulis (${snapshot.packageName}): " +
-                        e.message?.take(120),
+            if (writeOverflowRecord(record)) {
+                overflowOutstanding.decrementAndGet()
+            }
+        }
+    }
+
+    /**
+     * One writer pass over [record]: emits the loud overflow log
+     * line (on this writer thread, never on a submitting thread)
+     * and attempts the durable insert with the record's stable
+     * `capture_id`. Returns true when the record is terminally
+     * settled — persisted, or given up (retry budget exhausted,
+     * retry queue full, or the writer is shutting down) — and
+     * false when it was re-queued for another attempt (ownership
+     * of the outstanding count moves with it).
+     */
+    private fun writeOverflowRecord(record: OverflowRecord): Boolean {
+        val snapshot = record.snapshot
+        logger.logLocal(
+            "capture overflow: ${snapshot.packageName} @${snapshot.postTimeMs} " +
+                "terbuang sebelum staging (antrean penuh); " +
+                "pindai ulang selagi notifikasi masih aktif",
+        )
+        val dao = captureLogDao ?: return true
+        return try {
+            runBlocking {
+                dao.insert(
+                    CaptureLogEntity(
+                        captureId = record.captureId,
+                        sourcePackage = snapshot.packageName,
+                        postTimeMs = snapshot.postTimeMs,
+                        capturedAtMs = clock(),
+                        outcome = CaptureOutcome.OVERFLOW_DROPPED,
+                        // Consent policy (PR #5 re-review 27 Nov):
+                        // an overflow drop happens BEFORE route /
+                        // consent evaluation, so NO title text is
+                        // stored at all — the row is metadata-only
+                        // (package, post time, outcome). A
+                        // pre-consent snippet, however well
+                        // redacted, is still text the owner never
+                        // consented to retain for this snapshot.
+                        titleSnippet = null,
+                        amountMinor = null,
+                        eventId = null,
+                        contentSha256 = null,
+                    ),
                 )
-                record.attempts += 1
-                if (record.attempts < MAX_OVERFLOW_WRITE_ATTEMPTS) {
-                    if (!overflowQueue.offer(record)) {
-                        overflowRecordDropped.incrementAndGet()
-                        logger.logLocal(
-                            "catatan overflow hilang saat retry (${snapshot.packageName})",
-                        )
-                    }
+            }
+            true
+        } catch (e: Exception) {
+            captureLogFailures.incrementAndGet()
+            logger.logLocal(
+                "catatan overflow gagal ditulis (${snapshot.packageName}): " +
+                    e.message?.take(120),
+            )
+            record.attempts += 1
+            if (!overflowWriterShutdown &&
+                record.attempts < MAX_OVERFLOW_WRITE_ATTEMPTS
+            ) {
+                if (overflowQueue.offer(record)) {
+                    false
                 } else {
                     overflowRecordDropped.incrementAndGet()
                     logger.logLocal(
-                        "catatan overflow menyerah setelah ${record.attempts} percobaan " +
-                            "(${snapshot.packageName}): bukti hanya counter + log lokal",
+                        "catatan overflow hilang saat retry (${snapshot.packageName})",
                     )
+                    true
                 }
-            } finally {
-                overflowActive = null
+            } else {
+                overflowRecordDropped.incrementAndGet()
+                logger.logLocal(
+                    "catatan overflow menyerah setelah ${record.attempts} percobaan " +
+                        "(${snapshot.packageName}): bukti hanya counter + log lokal",
+                )
+                true
             }
         }
     }
@@ -659,7 +858,7 @@ class CaptureCoordinator(
     private fun flushOverflow(timeoutMs: Long) {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
-            if (overflowQueue.isEmpty() && overflowActive == null) return
+            if (overflowOutstanding.get() == 0L) return
             try {
                 Thread.sleep(10)
             } catch (_: InterruptedException) {
@@ -668,6 +867,12 @@ class CaptureCoordinator(
             }
         }
     }
+
+    /** Test/diagnostic visibility into the bounded shutdown's outcome. */
+    internal fun isCaptureWorkerAlive(): Boolean = captureWorker.isAlive
+
+    /** Test/diagnostic visibility: the overflow writer thread's liveness. */
+    internal fun isOverflowWriterAlive(): Boolean = overflowWriter.isAlive
 
     /** Timer for the periodic staging sweep (submits onto the capture worker). */
     private val sweepTimer: ScheduledExecutorService =
@@ -696,8 +901,49 @@ class CaptureCoordinator(
         controlInline = controlInline.get(),
         controlDropped = controlDropped.get(),
         overflowRecordDropped = overflowRecordDropped.get(),
-        overflowPending = (overflowQueue.size + if (overflowActive != null) 1 else 0).toLong(),
+        overflowPending = overflowOutstanding.get(),
+        unresolvedAtClose = unresolvedAtClose.get(),
     )
+
+    /**
+     * The owner-visible degraded state (definition on
+     * [CaptureDegradedState]): degraded when any snapshot was
+     * saturation-dropped, any overflow record was lost, any
+     * capture was left unresolved by a shutdown, or overflow
+     * records are still waiting to persist. Accounting is not
+     * recovery — this state says the pipeline owes the owner
+     * attention (rescan / restart / DB check), not that the
+     * dropped payments were recovered.
+     */
+    fun degradedState(): CaptureDegradedState {
+        val c = counters()
+        val reasons = mutableListOf<String>()
+        if (c.droppedOverflow > 0) {
+            reasons += "ada ${c.droppedOverflow} snapshot terbuang sebelum staging " +
+                "(bukti: baris OVERFLOW_DROPPED di Riwayat; pulih hanya lewat pindai ulang " +
+                "selagi notifikasi masih aktif)"
+        }
+        if (c.overflowRecordDropped > 0) {
+            reasons += "${c.overflowRecordDropped} catatan overflow gagal ditulis permanen " +
+                "(basis data gagal berulang; periksa kesehatan basis data/penyimpanan)"
+        }
+        if (c.unresolvedAtClose > 0) {
+            reasons += "${c.unresolvedAtClose} capture tidak terselesaikan saat penutupan " +
+                "(periksa hasil sweep awal + pindai ulang setelah listener jalan lagi)"
+        }
+        if (c.overflowPending > 0) {
+            reasons += "${c.overflowPending} catatan overflow masih menunggu ditulis"
+        }
+        return CaptureDegradedState(
+            degraded = reasons.isNotEmpty(),
+            overflowDroppedSnapshots = c.droppedOverflow,
+            overflowRecordsLost = c.overflowRecordDropped,
+            unresolvedAtClose = c.unresolvedAtClose,
+            overflowPending = c.overflowPending,
+            captureLogFailures = c.captureLogFailures,
+            reasons = reasons,
+        )
+    }
 
     /**
      * Hands a snapshot to the capture worker. Non-blocking: one
@@ -750,9 +996,16 @@ class CaptureCoordinator(
     fun sweepNow() {
         if (closedFlag) throw RejectedExecutionException("capture executor shut down")
         val done = CountDownLatch(1)
+        val failureBox = java.util.concurrent.atomic.AtomicReference<Throwable?>()
         val task = CaptureTask(CaptureTaskKind.SWEEP, null) {
             try {
                 runBlocking { sweepOrphanedStaging() }
+            } catch (t: Throwable) {
+                // Propagated to the caller below (PR #5 re-review
+                // 27 Nov): a sweep failure must never look like a
+                // successful sweep. The worker loop's generic
+                // catch does not see this — the task owns it.
+                failureBox.set(t)
             } finally {
                 done.countDown()
             }
@@ -767,6 +1020,7 @@ class CaptureCoordinator(
         }
         done.await()
         if (task.cancelled) throw RejectedExecutionException("capture executor shut down")
+        failureBox.get()?.let { throw it }
     }
 
     /** Starts the periodic staging sweep (every [SWEEP_INTERVAL_MINUTES]). */
@@ -783,20 +1037,30 @@ class CaptureCoordinator(
     }
 
     /**
-     * Stops the capture worker and the sweep timer (tests /
-     * shutdown).
+     * Orderly, bounded shutdown (PR #5 re-review 27 Nov —
+     * replaces the old interrupt-and-return close):
      *
-     * Graceful-shutdown evidence: snapshots still queued
-     * (RECEIVED, never staged) are stranded and each gets a
-     * durable overflow record ([recordOverflow]); a stranded
-     * sweep releases its [sweepNow] caller with a throw instead
-     * of a hang. [close] then waits, bounded, for the overflow
-     * writer to persist the queued records before returning.
-     * This covers `close()` only — a SIGKILL gives no chance to
-     * run it, and those snapshots are recoverable only via
-     * rescan while still posted (see the class KDoc).
+     * 1. Admission stops; queued tasks are stranded — queued
+     *    notifications each get a durable overflow record,
+     *    stranded sweeps release their [sweepNow] caller with a
+     *    throw instead of a hang.
+     * 2. The ACTIVE task is settled explicitly (see
+     *    [settleActiveTaskAtClose]): grace, interrupt, bounded
+     *    join; a task still running after the bound is counted
+     *    as unresolved, never silently abandoned.
+     * 3. The overflow writer is flushed (bounded), then
+     *    TERMINATED — it no longer loops forever retaining the
+     *    DAO. Captures attempted after close are refused with a
+     *    counted, record-lost overflow outcome (the writer is
+     *    gone), never a throw to the caller.
+     *
+     * Idempotent: a second call returns immediately. This covers
+     * `close()` only — a SIGKILL gives no chance to run it, and
+     * those snapshots are recoverable only via rescan while
+     * still posted (see the class KDoc).
      */
     fun close() {
+        if (!closeStarted.compareAndSet(false, true)) return
         sweepTimer.shutdownNow()
         val stranded: List<CaptureTask> = admissionLock.withLock {
             closedFlag = true
@@ -814,8 +1078,66 @@ class CaptureCoordinator(
                 task.completionLatch?.countDown()
             }
         }
+        settleActiveTaskAtClose()
         flushOverflow(OVERFLOW_FLUSH_TIMEOUT_MS)
-        captureWorker.interrupt()
+        // Terminate the overflow writer (PR #5 re-review 27 Nov):
+        // after the final flush the queue is drained; the writer
+        // exits instead of looping forever retaining the DAO.
+        // Records offered after this point are counted as lost
+        // (see recordOverflow), never queued to a dead writer.
+        overflowWriterShutdown = true
+        overflowWriter.interrupt()
+        try {
+            overflowWriter.join(WRITER_JOIN_TIMEOUT_MS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    /**
+     * Settles the capture worker's ACTIVE task at [close] (PR #5
+     * re-review 27 Nov): a short grace for it to finish on its
+     * own, then an interrupt (the cooperative cancellation signal
+     * the capture path already honours), then a bounded join. A
+     * task that finishes — before or after the interrupt — is
+     * fully resolved: its staging transaction either committed
+     * (the startup sweep re-promotes it) or rolled back (the
+     * notification is rescan-recoverable while still posted).
+     * Only a task still running after the bounded join is
+     * UNRESOLVED: counted in [CaptureCounters.unresolvedAtClose]
+     * and logged with metadata only (package + post time — no
+     * text), so the outcome is explicit instead of an unexamined
+     * "worker may still run after close".
+     */
+    private fun settleActiveTaskAtClose() {
+        if (!captureWorker.isAlive) return
+        try {
+            captureWorker.join(CLOSE_ACTIVE_GRACE_MS)
+            if (captureWorker.isAlive) {
+                captureWorker.interrupt()
+                captureWorker.join(closeActiveTimeoutMs)
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        if (captureWorker.isAlive) {
+            val active = admissionLock.withLock { activeTask }
+            if (active != null && active.kind == CaptureTaskKind.NOTIFICATION) {
+                unresolvedAtClose.incrementAndGet()
+                val snap = active.snapshot
+                logger.logLocal(
+                    "capture tidak terselesaikan saat penutupan: " +
+                        "${snap?.packageName} @${snap?.postTimeMs} " +
+                        "(tugas aktif melewati batas tunggu; hasil staging tidak pasti — " +
+                        "pulihkan lewat sweep awal + pindai ulang)",
+                )
+            } else if (active != null) {
+                logger.logLocal(
+                    "tugas ${active.kind} masih berjalan saat penutupan " +
+                        "melewati batas tunggu (diinterupsi; tanpa snapshot aktif)",
+                )
+            }
+        }
     }
 
     // --- Capture path (capture worker thread) ---
@@ -838,7 +1160,13 @@ class CaptureCoordinator(
         val matched = SourcePolicy.keywordMatchedRoutes(routes, snapshot.combined)
         if (matched.isEmpty()) {
             noKeyword.incrementAndGet()
-            logger.logEvent(pkg, "target-lain: $pkg - ${snapshot.title.take(40)}")
+            // PR #5 re-review 27 Nov: the log sink persists this
+            // line (Store), so it must never carry the RAW title —
+            // the gate has not run on this path and consent has
+            // not been evaluated. Only the redactor-scanned
+            // snippet (the same text the capture-log row stores)
+            // may be logged.
+            logger.logEvent(pkg, "target-lain: $pkg - ${snippet(snapshot.title)}")
             // LH-04(a): the gate never ran here, so the snippet is
             // scanned directly (confirmed + ambiguous spans redacted).
             writeCaptureLog(
@@ -888,7 +1216,9 @@ class CaptureCoordinator(
                 )
             } else {
                 noAmount.incrementAndGet()
-                logger.logEvent(pkg, "target-tanpa-nominal: $pkg - ${snapshot.title.take(40)}")
+                // Redacted title only (see the NO_KEYWORD note):
+                // the raw title never reaches the persistent log.
+                logger.logEvent(pkg, "target-tanpa-nominal: $pkg - ${gate.redactedTitle.take(40)}")
                 writeCaptureLog(
                     snapshot, CaptureOutcome.NO_AMOUNT,
                     titleSnippet = gate.redactedTitle.take(40),

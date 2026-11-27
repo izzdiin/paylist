@@ -95,9 +95,16 @@ class CaptureAdmissionTest {
     /** When non-null, the worker thread blocks here (mode read) until released. */
     private var modeReaderLatch: CountDownLatch? = null
 
-    /** Thread names observed inside the mode read (worker-thread evidence). */
+    /**
+     * Thread OBJECTS observed inside the mode read (worker-thread
+     * evidence). Identity, not name (PR #5 re-review 27 Nov): the
+     * name alone is not proof — kotlinx-coroutines debug mode
+     * suffixes it per coroutine — but a set of Thread objects with
+     * exactly one element proves every mode read ran on the same
+     * single thread.
+     */
     private val modeReaderThreads =
-        Collections.synchronizedSet(mutableSetOf<String>())
+        Collections.synchronizedSet(mutableSetOf<Thread>())
     private val modeActive = AtomicInteger()
     private val modeMaxConcurrent = AtomicInteger()
 
@@ -139,12 +146,7 @@ class CaptureAdmissionTest {
     private fun newCoordinator(): CaptureCoordinator = CaptureCoordinator(
         repository = repository,
         modeReader = {
-            // kotlinx-coroutines debug mode suffixes the thread
-            // name with " @coroutine#N" per running coroutine;
-            // strip it so the set records the worker thread only.
-            modeReaderThreads.add(
-                Thread.currentThread().name.substringBefore(" @coroutine"),
-            )
+            modeReaderThreads.add(Thread.currentThread())
             val active = modeActive.incrementAndGet()
             modeMaxConcurrent.updateAndGet { maxOf(it, active) }
             try {
@@ -293,6 +295,20 @@ class CaptureAdmissionTest {
         assertEquals(201, coordinator.counters().received)
         assertEquals(4, coordinator.counters().staged)
         assertEquals(0, stagingDao.count())
+        // Identity-level conservation (PR #5 re-review 27 Nov —
+        // not just aggregate counts): the SET of submitted
+        // snapshot identities (post times) equals exactly the set
+        // of event identities plus the set of overflow-row
+        // identities — every snapshot accounted for by name, no
+        // identity twice, none missing.
+        val submittedTimes = (0..200).map { POST_TIME + it * 1_000L }.toSet()
+        val eventTimes = store.events.values.map { it.occurredAtMs }.toSet()
+        val overflowTimes = overflowRows().map { it.postTimeMs }.toSet()
+        assertEquals(4, eventTimes.size)
+        assertEquals(197, overflowTimes.size)
+        assertTrue("event and overflow identities must be disjoint",
+            eventTimes.intersect(overflowTimes).isEmpty())
+        assertEquals(submittedTimes, eventTimes union overflowTimes)
     }
 
     // --- DB failure: the overflow record is retried, then persisted ---
@@ -349,7 +365,16 @@ class CaptureAdmissionTest {
             // staging row is the orphan the sweep will promote.
             enqueueShouldFail.set(true)
             coordinator.capture(snapshot(POST_TIME))
-            awaitCondition("orphan staged and parked") { stagingDao.count() == 1 }
+            // Wait until the orphan is fully PARKED, not merely
+            // staged: `parked` is incremented after its mode read,
+            // so this guarantees the orphan no longer competes for
+            // the modeReaderLatch installed by blockWorkerWith
+            // below. (Staging alone races that latch on a slow
+            // machine: the orphan would block on the latch itself
+            // and the blocker would never stage.)
+            awaitCondition("orphan staged and parked") {
+                stagingDao.count() == 1 && coordinator.counters().parked >= 1
+            }
             enqueueShouldFail.set(false)
 
             val latch = blockWorkerWith(POST_TIME + 10_000L, expectedEvents = 2)
@@ -386,9 +411,14 @@ class CaptureAdmissionTest {
             coordinator.sweepNow()
 
             // Every mode read (capture processing AND the sweep's
-            // promotion) happened on the single worker thread, and
+            // promotion) happened on the single worker thread —
+            // proven by Thread IDENTITY (exactly one Thread object
+            // ever observed, and it is the capture worker) — and
             // never two at once.
-            assertEquals(setOf("paylist-capture"), modeReaderThreads.toSet())
+            assertEquals(1, modeReaderThreads.size)
+            assertTrue(
+                modeReaderThreads.single().name.startsWith("paylist-capture"),
+            )
             assertEquals(1, modeMaxConcurrent.get())
             assertEquals(0, coordinator.counters().controlInline)
 
