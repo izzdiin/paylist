@@ -139,7 +139,12 @@ class CaptureAdmissionTest {
     private fun newCoordinator(): CaptureCoordinator = CaptureCoordinator(
         repository = repository,
         modeReader = {
-            modeReaderThreads.add(Thread.currentThread().name)
+            // kotlinx-coroutines debug mode suffixes the thread
+            // name with " @coroutine#N" per running coroutine;
+            // strip it so the set records the worker thread only.
+            modeReaderThreads.add(
+                Thread.currentThread().name.substringBefore(" @coroutine"),
+            )
             val active = modeActive.incrementAndGet()
             modeMaxConcurrent.updateAndGet { maxOf(it, active) }
             try {
