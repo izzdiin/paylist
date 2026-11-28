@@ -390,70 +390,149 @@ enum class ProcessLiveness { ALIVE, DEAD, UNKNOWN }
  * never assumed (fail-safe).
  */
 object CaptureProcessIdentitySource {
-    fun current(): CaptureProcessIdentity {
-        val stat = runCatching {
-            java.io.File("/proc/self/stat").readText()
-        }.getOrNull() ?: return CaptureProcessIdentity(-1, -1)
-        val pid = stat.substringBefore(' ').toIntOrNull() ?: -1
-        return CaptureProcessIdentity(pid, startTicksOf(stat))
+    fun current(procRoot: String = "/proc"): CaptureProcessIdentity {
+        val read = readProcStat(
+            java.nio.file.Paths.get(procRoot, "self", "stat"),
+        )
+        if (read !is ProcStatRead.Ok) return CaptureProcessIdentity(-1, -1)
+        val pid = read.text.substringBefore(' ').toIntOrNull() ?: -1
+        return CaptureProcessIdentity(pid, startTicksOf(read.text))
     }
 
     /** True unless [identity]'s process is PROVABLY dead ([liveness] == DEAD). */
     fun isAlive(identity: CaptureProcessIdentity): Boolean =
         liveness(identity) != ProcessLiveness.DEAD
 
+    /** Outcome of one attempt to read a `/proc/<pid>/stat` file. */
+    private sealed interface ProcStatRead {
+        class Ok(val text: String) : ProcStatRead
+
+        /** The open itself reported ENOENT: the file does not exist. */
+        object Absent : ProcStatRead
+
+        /**
+         * The file could not be read for any OTHER reason:
+         * EACCES/EPERM, a transient I/O error, the path being a
+         * directory, a visibility restriction — everything that
+         * is not positive absence.
+         */
+        object Inaccessible : ProcStatRead
+    }
+
+    /**
+     * Reads [path] classifying the failure by its KIND (audit
+     * 7239229553, A03): [java.nio.file.NoSuchFileException] is
+     * the explicit ENOENT signal of the open itself; every
+     * other failure is [ProcStatRead.Inaccessible]. This is
+     * deliberately NOT a `File.exists()` probe: an exists()
+     * false cannot distinguish "not there" from "not visible
+     * to you", which is exactly the confusion the audit
+     * rejected.
+     */
+    private fun readProcStat(path: java.nio.file.Path): ProcStatRead = try {
+        ProcStatRead.Ok(
+            String(java.nio.file.Files.readAllBytes(path), Charsets.UTF_8),
+        )
+    } catch (e: java.nio.file.NoSuchFileException) {
+        ProcStatRead.Absent
+    } catch (t: Throwable) {
+        ProcStatRead.Inaccessible
+    }
+
     /**
      * The tri-state liveness of [identity] (audit 7237720579,
-     * A03 residual — the previous boolean treated EVERY read
-     * failure as death):
+     * A03 residual; absence proof hardened by audit
+     * 7239229553):
      *
      * - [ProcessLiveness.DEAD] only on POSITIVE evidence: the
-     *   `/proc/<pid>/stat` file does not exist AND its `/proc`
-     *   directory is gone too (a permission or visibility
-     *   failure leaves the directory in place or fails
-     *   differently), or the stat parses and its start time
-     *   differs (the PID was reused by a different process).
+     *   stat parses and its start time differs (the PID was
+     *   reused by a different process), or the stat's absence
+     *   is CORROBORATED (see [corroboratedAbsence]).
      * - [ProcessLiveness.ALIVE] when the stat parses and the
      *   start time matches exactly.
      * - [ProcessLiveness.UNKNOWN] for everything else: an
      *   invalid identity, an unreadable SELF stat (our own
      *   /proc view cannot be trusted this call), a permission
-     *   denial, a transient I/O error, or an unparseable stat.
-     *   UNKNOWN always retains the fence.
+     *   denial, a transient I/O error, an unparseable stat, or
+     *   an absence that could not be corroborated. UNKNOWN
+     *   always retains the fence.
+     *
+     * SCOPE of the absence proof, stated plainly: the fence
+     * only ever asks about THIS APP's own predecessor process
+     * (the identity a predecessor recorded for itself — same
+     * UID). Kernel /proc hiding (hidepid) filters processes
+     * ACROSS uids, not within one uid, so for a same-uid
+     * subject an ENOENT that survives corroboration is
+     * positive absence, not a visibility artefact; denials
+     * that do apply to a same-uid subject (SELinux, I/O
+     * errors) surface as non-ENOENT failures and classify
+     * UNKNOWN above.
      */
-    fun liveness(identity: CaptureProcessIdentity): ProcessLiveness {
+    fun liveness(
+        identity: CaptureProcessIdentity,
+        procRoot: String = "/proc",
+    ): ProcessLiveness {
         if (identity.pid <= 0 || identity.startTicks < 0) {
             return ProcessLiveness.UNKNOWN
         }
+        val root = java.nio.file.Paths.get(procRoot)
         // If our own stat cannot be read/parsed, this call's
         // view of /proc is unreliable — prove nothing.
-        val selfStat = runCatching {
-            java.io.File("/proc/self/stat").readText()
-        }.getOrNull() ?: return ProcessLiveness.UNKNOWN
-        if (startTicksOf(selfStat) < 0) return ProcessLiveness.UNKNOWN
-        val statFile = java.io.File("/proc/${identity.pid}/stat")
-        val stat = try {
-            statFile.readText()
-        } catch (e: java.io.FileNotFoundException) {
-            // Positive absence requires the directory to be
-            // gone as well; a bare stat-file miss under a live
-            // directory is a visibility artefact, not death.
-            return if (java.io.File("/proc/${identity.pid}").exists()) {
-                ProcessLiveness.UNKNOWN
-            } else {
-                ProcessLiveness.DEAD
+        val self = readProcStat(root.resolve("self").resolve("stat"))
+        if (self !is ProcStatRead.Ok || startTicksOf(self.text) < 0) {
+            return ProcessLiveness.UNKNOWN
+        }
+        return when (
+            val read = readProcStat(
+                root.resolve(identity.pid.toString()).resolve("stat"),
+            )
+        ) {
+            is ProcStatRead.Ok -> {
+                val start = startTicksOf(read.text)
+                when {
+                    start < 0 -> ProcessLiveness.UNKNOWN
+                    start == identity.startTicks -> ProcessLiveness.ALIVE
+                    // Same PID, different start: the original
+                    // process is provably gone (PID reuse).
+                    else -> ProcessLiveness.DEAD
+                }
+            }
+            ProcStatRead.Absent -> corroboratedAbsence(root, identity.pid)
+            ProcStatRead.Inaccessible -> ProcessLiveness.UNKNOWN
+        }
+    }
+
+    /**
+     * Corroborates an ENOENT on `/proc/<pid>/stat` before it
+     * may count as death (audit 7239229553: a single negative
+     * probe is not positive proof of absence). DEAD requires
+     * BOTH: (1) a listing of the proc root SUCCEEDS and does
+     * not contain the pid, and (2) a second, independent stat
+     * read also returns ENOENT. A listing failure, the pid
+     * appearing in the listing (the directory is there but
+     * its stat is not readable — a visibility/race artefact,
+     * not death), or any other second-read outcome leaves the
+     * death UNPROVEN (UNKNOWN, fence retained).
+     */
+    private fun corroboratedAbsence(
+        root: java.nio.file.Path,
+        pid: Int,
+    ): ProcessLiveness {
+        val names = try {
+            java.nio.file.Files.newDirectoryStream(root).use { stream ->
+                stream.map { it.fileName.toString() }
             }
         } catch (t: Throwable) {
             return ProcessLiveness.UNKNOWN
         }
-        val start = startTicksOf(stat)
-        if (start < 0) return ProcessLiveness.UNKNOWN
-        return if (start == identity.startTicks) {
-            ProcessLiveness.ALIVE
-        } else {
-            // Same PID, different start: the original process
-            // is provably gone (PID reuse).
-            ProcessLiveness.DEAD
+        if (names.contains(pid.toString())) {
+            return ProcessLiveness.UNKNOWN
+        }
+        return when (
+            readProcStat(root.resolve(pid.toString()).resolve("stat"))
+        ) {
+            ProcStatRead.Absent -> ProcessLiveness.DEAD
+            else -> ProcessLiveness.UNKNOWN
         }
     }
 
@@ -469,6 +548,86 @@ object CaptureProcessIdentitySource {
 object CaptureHealthLock {
     private val lock = ReentrantLock()
     fun <T> withLock(block: () -> T): T = lock.withLock(block)
+}
+
+/**
+ * Process-wide AUTHORITATIVE ownership claims (audit
+ * 7239229553, A03 — the acceptance the previous round missed:
+ * "process-wide authoritative ownership independent of
+ * failing persistence").
+ *
+ * A coordinator CLAIMS ownership here at the exact moment it
+ * would publish its successor fence — its bounded [close]
+ * gave up with pipeline threads still alive — BEFORE any
+ * durable write is attempted, and the claim is released only
+ * when both pipeline threads have actually exited (their exit
+ * handlers release it). A successor consults this registry
+ * BEFORE the durable records: while a foreign claim stands,
+ * the successor WAITS — it does not stage and does not write
+ * — no matter what the durable records say (missing, corrupt,
+ * or even cleanly inactive). Exclusion therefore no longer
+ * depends on a store write succeeding: the dual-write-failure
+ * corner of the previous round (lifecycle channel AND health
+ * document both failing while predecessor threads live) is
+ * closed by construction, because the claim lives in the
+ * process's own memory, not in the failing store.
+ *
+ * CONSTRUCTION BOUNDARY, stated plainly: the registry is
+ * authoritative WITHIN one process. That is exactly the
+ * shape of the failure it closes — a predecessor whose
+ * threads still live is, by construction, a predecessor in
+ * a living process, and a successor replacing it in that
+ * same process sees the claim. A successor in a NEW process
+ * starts only after the old process died (the Android
+ * process model for this app), when the predecessor's
+ * threads are dead by construction; the transitional
+ * evidence for that case remains the durable fence plus the
+ * tri-state process-death proof, unchanged.
+ */
+object CaptureOwnershipRegistry {
+    private val lock = ReentrantLock()
+    private val claims = HashMap<String, CaptureProcessIdentity>()
+
+    /** Records [instanceId]'s ownership claim (idempotent). */
+    fun claim(instanceId: String, identity: CaptureProcessIdentity) {
+        lock.withLock { claims[instanceId] = identity }
+    }
+
+    /** Releases [instanceId]'s claim (its threads have exited). */
+    fun release(instanceId: String) {
+        lock.withLock { claims.remove(instanceId) }
+    }
+
+    /** True while ANOTHER instance's claim stands. */
+    fun hasForeignClaim(selfInstanceId: String): Boolean =
+        lock.withLock { claims.keys.any { it != selfInstanceId } }
+}
+
+/**
+ * Process-wide registry of LIVE coordinator instances (audit
+ * 7239229553, A06): an instance registers at construction and
+ * unregisters only when its health writer has terminated —
+ * the point after which it can never apply another queued
+ * health operation. Startup reconciliation consults this
+ * registry (for same-process owners) before it may call an
+ * owner's unapplied offers a loss: a still-live owner's
+ * pending records are DEFERRED, never counted as a dead
+ * process's UNKNOWN_LOSS.
+ */
+object CaptureLiveInstances {
+    private val lock = ReentrantLock()
+    private val live = HashSet<String>()
+
+    fun register(instanceId: String) {
+        lock.withLock { live.add(instanceId) }
+    }
+
+    fun unregister(instanceId: String) {
+        lock.withLock { live.remove(instanceId) }
+    }
+
+    fun isLive(instanceId: String): Boolean =
+        lock.withLock { live.contains(instanceId) }
 }
 
 /**
@@ -830,6 +989,26 @@ class CaptureCoordinator(
          */
         const val JOURNAL_WRITE_BOUND_MS: Long = 250
 
+        /**
+         * The TOTAL journal-wait budget of one journal-sync
+         * episode (audit 7239229553, A06): the per-sync bound
+         * above capped each individual wait, but one listener
+         * callback can offer MANY incident records (a burst of
+         * saturation drops), and each offer waited again — so
+         * callback latency grew per record. Now every offer
+         * that joins the SAME in-flight sync shares ONE budget
+         * window of this size: once the window is spent,
+         * further offers do not wait at all (the sync lands
+         * late on the journal thread and the lag is counted).
+         * Total caller waiting attributable to one sync episode
+         * is therefore bounded by this value, however many
+         * records the callback offers during it. The window is
+         * scoped to the sync episode — the unit a callback's
+         * offers actually share — because the coordinator
+         * cannot see listener-callback boundaries.
+         */
+        const val JOURNAL_CALLBACK_BUDGET_MS: Long = 500
+
         /** Cap on the quarantined raw health document kept as evidence. */
         const val MAX_QUARANTINED_RAW_CHARS: Int = 4_000
 
@@ -1030,6 +1209,86 @@ class CaptureCoordinator(
         }
     }
 
+    /**
+     * One journal owner's attributed totals (audit 7239229553,
+     * A06): the offers/drops ONE coordinator instance added to
+     * the journal, stamped with the process identity that owned
+     * them. Attribution is what lets reconciliation distinguish
+     * a LIVE predecessor's pending offers (defer — it may still
+     * apply them itself) from a terminated one's losses (claim
+     * exactly once) — the global totals of the previous design
+     * could not tell the two apart and could report a live
+     * predecessor's pending records as UNKNOWN_LOSS.
+     */
+    private data class JournalInstance(
+        val offered: Long,
+        val dropped: Long,
+        val pid: Int,
+        val start: Long,
+    )
+
+    /**
+     * The per-instance journal entries as THIS instance first
+     * saw them (empty for a journal written before attribution
+     * existed — that case reconciles by the legacy global rule,
+     * see [reconcilePreDurableLoss]).
+     */
+    private val journalInstancesAtInit: Map<String, JournalInstance> =
+        readJournalInstances()
+
+    private fun readJournalInstances(): Map<String, JournalInstance> {
+        val store = healthStore ?: return emptyMap()
+        return try {
+            val raw = store.readCaptureHealthJournal()
+            if (raw.isNullOrBlank()) return emptyMap()
+            val instances = JSONObject(raw).optJSONObject("instances")
+                ?: return emptyMap()
+            val out = HashMap<String, JournalInstance>()
+            val keys = instances.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                val entry = instances.optJSONObject(key) ?: continue
+                out[key] = JournalInstance(
+                    offered = entry.optLong("offered", 0L),
+                    dropped = entry.optLong("dropped", 0L),
+                    pid = entry.optLong("pid", -1L).toInt(),
+                    start = entry.optLong("start", -1L),
+                )
+            }
+            out
+        } catch (t: Throwable) {
+            emptyMap()
+        }
+    }
+
+    // --- Pipeline-thread exit flags + live registration
+    // (audit 7239229553) ---
+    //
+    // Declared here, before every pipeline thread, for the
+    // same init-order reason as the journal state above: the
+    // exit handlers run ON the pipeline threads and touch this
+    // state the moment a thread dies, whenever that is.
+
+    /** Set by the capture worker's exit handler. */
+    private val workerThreadExited =
+        java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Set by the overflow writer's exit handler. */
+    private val writerThreadExited =
+        java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Registers this instance as LIVE in this process (audit
+     * 7239229553, A06): from this moment a successor's startup
+     * reconciliation defers this instance's unapplied offers
+     * instead of reporting them as a dead process's loss. The
+     * registration is released by the health writer's exit
+     * (see [healthWriterLoop]) — the point after which this
+     * instance can never apply another queued operation.
+     */
+    private val liveInstanceRegistration: Unit =
+        CaptureLiveInstances.register(instanceId)
+
     // --- Bounded, cross-instance-exact journal sync (audit
     // 7237720579, A06) ---
     //
@@ -1079,6 +1338,17 @@ class CaptureCoordinator(
     @Volatile
     private var journalLagging: Boolean = false
 
+    /**
+     * Deadline of the current journal-sync episode's shared
+     * wait budget (audit 7239229553, A06; guarded by
+     * [journalLock]): every offer joining the in-flight sync
+     * waits only within this window, so a multi-record
+     * callback's total journal waiting is bounded by
+     * [JOURNAL_CALLBACK_BUDGET_MS] per episode, not per record.
+     * Zero when no episode is open.
+     */
+    private var journalBudgetDeadlineMs: Long = 0L
+
     /** Owns every journal write; created lazily, threads start on first submit. */
     private val journalExecutor: java.util.concurrent.ExecutorService =
         java.util.concurrent.Executors.newSingleThreadExecutor(
@@ -1121,12 +1391,32 @@ class CaptureCoordinator(
                 }
                 val newOffered = json.optLong("offered", 0L) + deltaOffered
                 val newDropped = json.optLong("dropped", 0L) + deltaDropped
-                store.writeCaptureHealthJournal(
-                    JSONObject().apply {
-                        put("offered", newOffered)
-                        put("dropped", newDropped)
-                    }.toString(),
+                json.put("offered", newOffered)
+                json.put("dropped", newDropped)
+                // Per-instance attribution (audit 7239229553,
+                // A06): this instance's delta also lands under
+                // its OWN id, stamped with the owning process
+                // identity — the input startup reconciliation
+                // needs to tell a live predecessor's pending
+                // offers from a terminated one's losses. The
+                // global totals above are kept unchanged for
+                // every existing reader.
+                val instances = json.optJSONObject("instances")
+                    ?: JSONObject().also { json.put("instances", it) }
+                val mine = instances.optJSONObject(instanceId)
+                    ?: JSONObject().also { instances.put(instanceId, it) }
+                mine.put(
+                    "offered",
+                    mine.optLong("offered", 0L) + deltaOffered,
                 )
+                mine.put(
+                    "dropped",
+                    mine.optLong("dropped", 0L) + deltaDropped,
+                )
+                val identity = store.processIdentity()
+                mine.put("pid", identity.pid)
+                mine.put("start", identity.startTicks)
+                store.writeCaptureHealthJournal(json.toString())
                 journalSyncedOffered = offeredNow
                 journalSyncedDropped = droppedNow
             }
@@ -1158,6 +1448,7 @@ class CaptureCoordinator(
             if (!syncJournalOnce()) {
                 journalLock.withLock {
                     journalFuture = null
+                    journalBudgetDeadlineMs = 0L
                     journalLagging = true
                 }
                 return
@@ -1167,6 +1458,7 @@ class CaptureCoordinator(
                     healthDroppedCount.get() == droppedAtSync
                 ) {
                     journalFuture = null
+                    journalBudgetDeadlineMs = 0L
                     journalLagging = false
                     true
                 } else {
@@ -1179,24 +1471,45 @@ class CaptureCoordinator(
 
     /**
      * Ensures a journal sync is in flight and waits for it —
-     * at most [JOURNAL_WRITE_BOUND_MS] (audit 7237720579,
-     * A06: measured, bounded caller latency under slow or
-     * failing storage). On timeout the sync keeps running on
-     * the journal thread and lands late; the lag is counted
-     * ([CaptureCounters.healthJournalTimeouts]) and exposed in
-     * [degradedState]. The declared residual window: an offer
-     * whose sync is still lagging when the process dies is not
-     * yet journaled, so that one incident can escape the
-     * next start's gap — the window exists ONLY while storage
-     * is slower than the bound (or failing), and the lagging
-     * state is itself surfaced in-process. On a healthy store
-     * the sync completes inside the wait and the window is
-     * zero, exactly as with the old synchronous write.
+     * bounded TWICE (audit 7237720579, A06; per-callback bound
+     * added by audit 7239229553): at most
+     * [JOURNAL_WRITE_BOUND_MS] for this one wait, and at most
+     * [JOURNAL_CALLBACK_BUDGET_MS] of total waiting across ALL
+     * offers that join the same sync episode. The second bound
+     * is the one a multi-record listener callback feels: a
+     * burst of saturation drops offers many records in one
+     * callback, and under the per-wait bound alone each of
+     * them waited again, so the callback's latency grew per
+     * record. Now the episode's offers share one window; once
+     * it is spent, offers return without waiting (the sync
+     * lands late on the journal thread; the lag is counted in
+     * [CaptureCounters.healthJournalTimeouts] and exposed in
+     * [degradedState]).
+     *
+     * THE RESIDUAL WINDOW, stated for owner review (audit
+     * 7239229553): an offer is undetectable at the next start
+     * only if the process dies after the offer but before
+     * EITHER durable channel lands — the journal sync started
+     * here, or the health writer's application of the queued
+     * operation (which stamps the document's applied counts in
+     * the same write as the incident itself). Both channels
+     * start at offer time and each is a single minimal
+     * commit(); on a healthy store the window is zero (the
+     * sync completes inside the wait, exactly as with the old
+     * synchronous write). Under failing storage the lagging
+     * state is surfaced in-process, but a kill inside that
+     * state can still lose the KNOWLEDGE of an offer — the
+     * tradeoff this design accepts: bounded, nonblocking
+     * ingress with a detectable-in-the-next-start gap, over an
+     * unbounded synchronous commit on the listener thread. No
+     * zero-loss claim is made for that corner.
      */
     private fun writeJournalBounded() {
         if (healthStore == null) return
-        val future = journalLock.withLock {
-            journalFuture ?: try {
+        val now = System.currentTimeMillis()
+        val waitPlan = journalLock.withLock {
+            val existing = journalFuture
+            val future: java.util.concurrent.Future<*> = existing ?: try {
                 journalExecutor.submit { drainJournalWrites() }
                     .also { journalFuture = it }
             } catch (t: Throwable) {
@@ -1212,9 +1525,37 @@ class CaptureCoordinator(
                 )
                 return
             }
+            if (existing == null) {
+                // A new sync episode opens a fresh shared
+                // budget window for its offers.
+                journalBudgetDeadlineMs = now + JOURNAL_CALLBACK_BUDGET_MS
+            }
+            if (journalBudgetDeadlineMs <= 0L) {
+                journalBudgetDeadlineMs = now + JOURNAL_CALLBACK_BUDGET_MS
+            }
+            future to (journalBudgetDeadlineMs - now)
+        }
+        val (future, remainingMs) = waitPlan
+        if (remainingMs <= 0L) {
+            // The episode's budget is spent: do not wait. The
+            // sync is still in flight and lands late; this
+            // offer's lag is counted exactly like a timed-out
+            // wait.
+            journalLagging = true
+            healthJournalTimeouts.incrementAndGet()
+            logSafely(
+                "capture-health: anggaran tunggu jurnal per callback " +
+                    "(${JOURNAL_CALLBACK_BUDGET_MS}ms) habis untuk episode " +
+                    "sinkronisasi ini — penawaran lanjut tanpa menunggu; " +
+                    "jurnal mengejar di thread jurnal dan lag ini tercatat",
+            )
+            return
         }
         try {
-            future.get(JOURNAL_WRITE_BOUND_MS, TimeUnit.MILLISECONDS)
+            future.get(
+                minOf(JOURNAL_WRITE_BOUND_MS, remainingMs),
+                TimeUnit.MILLISECONDS,
+            )
         } catch (e: java.util.concurrent.TimeoutException) {
             journalLagging = true
             healthJournalTimeouts.incrementAndGet()
@@ -1871,6 +2212,20 @@ class CaptureCoordinator(
     }
 
     private fun healthWriterLoop() {
+        try {
+            healthWriterLoopBody()
+        } finally {
+            // This instance can never apply another queued
+            // health operation: from here a successor's startup
+            // reconciliation may treat its still-unapplied
+            // offers as losses (audit 7239229553, A06). While
+            // this writer lived, those offers were deferred —
+            // never falsely reported.
+            CaptureLiveInstances.unregister(instanceId)
+        }
+    }
+
+    private fun healthWriterLoopBody() {
         // FIRST action, before any queued operation is applied:
         // reconcile the offer journal (audit A06). Running here
         // — on the only thread that applies queued operations,
@@ -1961,6 +2316,20 @@ class CaptureCoordinator(
                 "applied_count",
                 doc.optLong("applied_count", 0L) + recordCount,
             )
+            // Per-instance attribution of the same count (audit
+            // 7239229553, A06): reconciliation debits each
+            // journal owner only with what THAT owner failed to
+            // apply — a successor's own applications must never
+            // mask a predecessor's gap, nor a predecessor's
+            // applications a successor's.
+            if (recordCount > 0) {
+                val appliedBy = doc.optJSONObject("applied_by")
+                    ?: JSONObject().also { doc.put("applied_by", it) }
+                appliedBy.put(
+                    instanceId,
+                    appliedBy.optLong(instanceId, 0L) + recordCount,
+                )
+            }
         }
     }
 
@@ -2106,34 +2475,143 @@ class CaptureCoordinator(
 
     /**
      * Startup reconciliation of the pre-durable window (audit
-     * 7235948077, A06), run by the health writer before it
-     * applies anything: incident RECORD operations a PREVIOUS
-     * process offered (journal `offered`), minus the ones it
-     * accounted as dropped in process (journal `dropped`),
-     * minus the ones the document durably applied
-     * (`applied_count`), are an exact count of health-incident
-     * records lost before the durable boundary. WHAT THE GAP
-     * COUNTS — stated precisely (audit 7237720579, A06(b)):
-     * health-incident RECORD operations, and nothing else.
-     * Recover operations are never journaled and never counted
-     * as applied, so maintenance traffic cannot inflate or
-     * deflate the gap; and the gap is about incident RECORDS
-     * (the persistent evidence), never about payments or
-     * captures — a lost incident record does not mean a lost
-     * payment, and this reconciliation makes no claim about
-     * either. All three inputs are order-independent totals,
-     * so the count is exact even though drops are accounted
-     * out of order. The gap is recorded as one aggregate
+     * 7235948077, A06; per-instance attribution added by audit
+     * 7239229553), run by the health writer before it applies
+     * anything: incident RECORD operations a PREVIOUS instance
+     * offered (journal `offered`), minus the ones it accounted
+     * as dropped in process (journal `dropped`), minus the ones
+     * the document durably applied (`applied_count`), are an
+     * exact count of health-incident records lost before the
+     * durable boundary. WHAT THE GAP COUNTS — stated precisely
+     * (audit 7237720579, A06(b)): health-incident RECORD
+     * operations, and nothing else. Recover operations are
+     * never journaled and never counted as applied, so
+     * maintenance traffic cannot inflate or deflate the gap;
+     * and the gap is about incident RECORDS (the persistent
+     * evidence), never about payments or captures — a lost
+     * incident record does not mean a lost payment, and this
+     * reconciliation makes no claim about either.
+     *
+     * PER-INSTANCE RULE (audit 7239229553): the journal now
+     * attributes offers to the instance (and process) that made
+     * them, and the document attributes applications the same
+     * way (`applied_by`). An owner's gap may be CLAIMED —
+     * recorded as UNKNOWN_LOSS and marked reconciled — only
+     * once that owner's termination is ESTABLISHED
+     * ([instanceTerminationEstablished]): a same-process owner
+     * must have left the live registry (its health writer
+     * terminated), a cross-process owner must be provably DEAD
+     * by the tri-state liveness proof. While termination is
+     * not established the gap is DEFERRED untouched: the owner
+     * may still apply its pending records itself, and counting
+     * them as a dead process's loss would be a false
+     * UNKNOWN_LOSS (the previous design's global snapshot could
+     * do exactly that to a live predecessor). A later start,
+     * after the owner has terminated, claims the deferred gap
+     * exactly once (`reconciled_by` is the durable claim
+     * marker). The gap is recorded as one aggregate
      * UNKNOWN_LOSS incident — WHICH incidents they were is
      * unknowable, and the record says so — and `applied_count`
-     * is advanced to the accounted total so the gap is
-     * reported exactly once. No gap, no incident: a clean
-     * close (which flushes the queue) leaves offered −
+     * advances by the claimed amount so the global invariant
+     * (offered − dropped == applied, once every owner is
+     * applied or claimed) still holds. No gap, no incident: a
+     * clean close (which flushes the queue) leaves offered −
      * dropped == applied.
+     *
+     * A journal with NO per-instance entries predates
+     * attribution; its totals reconcile by the legacy global
+     * rule in [reconcileLegacyJournal] — the only reading the
+     * data supports.
      */
     private fun reconcilePreDurableLoss() {
         val snapshot = journalSnapshotAtInit ?: return
         if (healthStore == null) return
+        if (journalInstancesAtInit.isEmpty()) {
+            reconcileLegacyJournal(snapshot)
+            return
+        }
+        mutateHealth { doc ->
+            val appliedBy = doc.optJSONObject("applied_by")
+                ?: JSONObject().also { doc.put("applied_by", it) }
+            val reconciledBy = doc.optJSONObject("reconciled_by")
+                ?: JSONObject().also { doc.put("reconciled_by", it) }
+            var claimed = 0L
+            for ((ownerId, entry) in journalInstancesAtInit) {
+                if (ownerId == instanceId) continue
+                val accounted = entry.offered - entry.dropped
+                val unaccounted = accounted - appliedBy.optLong(ownerId, 0L)
+                val already = reconciledBy.optLong(ownerId, 0L)
+                if (unaccounted <= already) continue
+                if (!instanceTerminationEstablished(ownerId, entry)) {
+                    // DEFERRED: the owner may still apply these
+                    // records itself. Claiming them now would
+                    // report a live predecessor's pending work
+                    // as a dead process's loss.
+                    continue
+                }
+                claimed += unaccounted - already
+                reconciledBy.put(ownerId, unaccounted)
+            }
+            if (claimed > 0) {
+                applyIncidentCounted(
+                    doc,
+                    CaptureIncidentCategory.UNKNOWN_LOSS,
+                    CaptureIncidentStatus.OPEN,
+                    "$claimed insiden kesehatan terantre dari instance " +
+                        "sebelumnya yang terbukti berhenti tidak pernah " +
+                        "mencapai batas durable (isi insidennya tidak " +
+                        "diketahui — hanya jumlahnya yang pasti, dari " +
+                        "jurnal penawaran per-instance)",
+                    "",
+                    claimed,
+                )
+                doc.put(
+                    "applied_count",
+                    doc.optLong("applied_count", 0L) + claimed,
+                )
+                logSafely(
+                    "capture-health: $claimed insiden dari instance " +
+                        "sebelumnya yang terbukti berhenti hilang sebelum " +
+                        "batas durable — tercatat sebagai unknown_loss, " +
+                        "bukan hilang diam-diam",
+                )
+            }
+        }
+    }
+
+    /**
+     * May [ownerId]'s unapplied offers be claimed as losses —
+     * i.e. is its termination ESTABLISHED (audit 7239229553,
+     * A06)? A same-process owner (its journal entry carries
+     * THIS process's identity) is terminated exactly when it
+     * has left [CaptureLiveInstances] — its health writer
+     * exited, so it can never apply another record. A
+     * cross-process owner is terminated only on the tri-state
+     * DEAD proof; ALIVE and UNKNOWN both defer. An entry
+     * without a usable process identity can never be proven
+     * terminated and is deferred forever rather than guessed.
+     */
+    private fun instanceTerminationEstablished(
+        ownerId: String,
+        entry: JournalInstance,
+    ): Boolean {
+        val store = healthStore ?: return false
+        if (entry.pid <= 0 || entry.start < 0) return false
+        val identity = CaptureProcessIdentity(entry.pid, entry.start)
+        return if (identity == store.processIdentity()) {
+            !CaptureLiveInstances.isLive(ownerId)
+        } else {
+            store.processLiveness(identity) == ProcessLiveness.DEAD
+        }
+    }
+
+    /**
+     * The pre-attribution reconciliation (journal totals only):
+     * offered − dropped − applied, claimed in one mutation.
+     * Kept for journals written before per-instance attribution
+     * existed; new journals never take this path.
+     */
+    private fun reconcileLegacyJournal(snapshot: LongArray) {
         val offeredAtInit = snapshot[0]
         val droppedAtInit = snapshot[1]
         if (offeredAtInit <= 0L) return
@@ -2685,6 +3163,19 @@ class CaptureCoordinator(
     /** Evaluates a PREDECESSOR's fence from the lifecycle record. */
     private fun predecessorFenceVerdict(): FenceVerdict {
         if (healthStore == null) return FenceVerdict.CLEAR
+        // Authoritative ownership FIRST (audit 7239229553,
+        // A03): a foreign claim in the process-wide registry
+        // binds this successor regardless of what the durable
+        // records say — the claim exists precisely for the
+        // states the records cannot represent (both fence
+        // write channels failed while the predecessor's
+        // threads live). The claim is released only when both
+        // predecessor threads have actually exited, so WAIT
+        // here is always backed by live threads, never by a
+        // stale record.
+        if (CaptureOwnershipRegistry.hasForeignClaim(instanceId)) {
+            return FenceVerdict.WAIT
+        }
         return when (val eval = evaluateLifecycleFence(adopt = true)) {
             LifecycleEval.Clear -> FenceVerdict.CLEAR
             LifecycleEval.Corrupt -> FenceVerdict.WAIT_LIFECYCLE_CORRUPT
@@ -2771,6 +3262,12 @@ class CaptureCoordinator(
      */
     private fun fenceRecordedActive(): Boolean {
         if (healthStore == null) return false
+        // A standing ownership claim fences successors exactly
+        // like a recorded fence (audit 7239229553, A03) —
+        // diagnostics report the same fail-safe reading.
+        if (CaptureOwnershipRegistry.hasForeignClaim(instanceId)) {
+            return true
+        }
         return when (evaluateLifecycleFence(adopt = false)) {
             is LifecycleEval.Active -> true
             LifecycleEval.Corrupt -> true
@@ -2871,8 +3368,36 @@ class CaptureCoordinator(
      * publish declared failed: a FENCE_PUBLISH_FAILED incident
      * is recorded and the degraded state reports it — visible,
      * never silent.
+     *
+     * AUTHORITATIVE OWNERSHIP (audit 7239229553, A03): the
+     * durable channels above are now the SECOND line of
+     * exclusion, not the only one. Before any of them is
+     * attempted, this instance claims ownership in
+     * [CaptureOwnershipRegistry] — process memory, independent
+     * of the failing store — and the claim is released only
+     * when both pipeline threads have actually exited. A
+     * successor in this process consults the registry before
+     * the durable records and waits while a foreign claim
+     * stands, so even the both-channels-failed corner excludes
+     * it: logging/degraded state was never the exclusion, and
+     * now it no longer needs to be. The FENCE_PUBLISH_FAILED
+     * incident remains as the visible record that the DURABLE
+     * fence could not be published.
      */
     private fun publishSuccessorFenceIfNeeded(reason: String) {
+        // The authoritative claim comes FIRST, before any
+        // durable write is attempted (audit 7239229553): if
+        // either pipeline thread outlived close, this process
+        // records that fact in its own memory, where a store
+        // failure cannot erase it. Released by the thread-exit
+        // handlers once both threads have exited.
+        if (captureWorker.isAlive || overflowWriter.isAlive) {
+            CaptureOwnershipRegistry.claim(
+                instanceId,
+                healthStore?.processIdentity()
+                    ?: CaptureProcessIdentity(-1, -1),
+            )
+        }
         var publishedWorker = false
         var publishedWriter = false
         val fenceBlock: (JSONObject) -> Unit = { fence ->
@@ -3014,6 +3539,14 @@ class CaptureCoordinator(
             if (!fence.optBoolean("writer_alive")) fence.put("active", false)
         }
         clearDocFenceHalf(workerHalf = true)
+        // Authoritative-ownership release (audit 7239229553,
+        // A03): once BOTH pipeline threads have exited, the
+        // in-memory claim is released — in memory, so a store
+        // failure above cannot strand it either.
+        workerThreadExited.set(true)
+        if (writerThreadExited.get()) {
+            CaptureOwnershipRegistry.release(instanceId)
+        }
     }
 
     /** The overflow writer exited: clears its half of this instance's fence. */
@@ -3026,6 +3559,12 @@ class CaptureCoordinator(
             if (!fence.optBoolean("worker_alive")) fence.put("active", false)
         }
         clearDocFenceHalf(workerHalf = false)
+        // See onWorkerThreadExit: the second thread out
+        // releases the ownership claim.
+        writerThreadExited.set(true)
+        if (workerThreadExited.get()) {
+            CaptureOwnershipRegistry.release(instanceId)
+        }
     }
 
     /**
