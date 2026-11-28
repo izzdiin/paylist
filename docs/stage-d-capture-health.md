@@ -128,7 +128,11 @@ Tightened by the PR #5 audit of 28 Nov 2026:
   offers joining one sync episode additionally share a single
   `JOURNAL_CALLBACK_BUDGET_MS` (500 ms) window, so a
   multi-record callback's total waiting is bounded per
-  callback, not per record (see the A06 sections below).
+  callback, not per record; and since audit 7242084700 that
+  window is scoped to a contiguous burst of offers on one
+  calling thread and measured on the monotonic clock, with
+  the synchronous lag logging moved off the caller (see the
+  A06 sections below).
 - **Durable acceptance boundary.** An incident is ACCEPTED
   (durable) only when its `writeCaptureHealth` call has
   RETURNED — production writes with `SharedPreferences`
@@ -512,6 +516,121 @@ with harder acceptance criteria. What changed:
   persisted by pre-keying builds (the unkeyed form) likewise
   never match a keyed re-derivation. The mechanism is
   unchanged this round by design.
+
+## Audit 7242084700 (28 Nov): atomic ownership handshake, monotonic burst budget, migration + late-update verification
+
+The follow-up audit of head `81f990d` accepted the
+corroborated /proc death proof and the direction of
+per-instance reconciliation, and kept A03 and A06 open on
+narrower points. What changed:
+
+- **A03 — the ownership handshake is atomic; the permanent
+  foreign claim race is closed.** The registry claim was
+  inserted AFTER a separate `isAlive` sample, while the exit
+  handlers released the claim independently — both handlers
+  could finish between the sample and the insertion, leaving
+  a claim no one would ever release and a successor stalled
+  until a process restart. Now the liveness sample and the
+  claim insertion are ONE critical section in
+  `CaptureOwnershipRegistry.claimIfAlive`, serialised against
+  `noteThreadExit`: an exit handler records its half's exit
+  in the registry FIRST (before any store cleanup), under the
+  same lock; a half already recorded as exited never counts
+  as alive in the sample, and an exit that lands during the
+  publish queues on the lock and completes the release
+  immediately after the insertion. No interleaving produces a
+  claim whose owners have both already exited, and none loses
+  a release. Construction/close serialisation is tightened
+  with it: the claim is first taken at the START of the
+  one-shot `close()` sequence (and re-asserted by the publish
+  for threads that outlive the bounded joins), so a successor
+  constructed at any point during a predecessor's close is
+  already excluded, and a concurrent second `close()` is a
+  no-op by the existing CAS. Proven by
+  `ownershipHandshake_exitBetweenSampleAndClaim_noOrphanClaim_successorProceeds`
+  (a barrier hook parks the publish inside the handshake,
+  after the sample and before the insertion, while the stuck
+  writer exits into it; no orphan claim stands and the
+  successor proceeds without a restart),
+  `ownershipRegistry_handshakeVariants_noOrphanClaim` (exit
+  before the sample inserts no claim; exit after the claim
+  releases it on the second half), and
+  `constructionDuringClose_successorWaits_concurrentCloseIsOneShot`.
+  The construction boundary of the 7239229553 section is
+  unchanged: the registry is authoritative within one
+  process; cross-process exclusion still rests on the durable
+  fence plus the tri-state death proof.
+- **A06 — the latency budget is monotonic and scoped to a
+  burst, and the logging is inside the accounting.** The
+  7239229553 window had three defects: it was measured on the
+  WALL clock (a rollback could stretch it), it was scoped per
+  SYNC EPISODE (a callback spanning several episodes — each
+  sync settling before the next offer — waited the budget
+  once per episode), and the synchronous lag log lines sat
+  OUTSIDE the wait (a slow logger extended the caller beyond
+  the budget). Now: all budget arithmetic uses the monotonic
+  clock (`System.nanoTime`); the window belongs to ONE
+  CONTIGUOUS BURST OF OFFERS ON ONE CALLING THREAD — stated
+  honestly as the accounting unit, because the coordinator
+  cannot see listener-callback boundaries, and one callback's
+  offers are exactly a contiguous same-thread burst (a burst
+  ends after `JOURNAL_BURST_QUIET_MS` = 500 ms of quiet on
+  that thread; episodes settling inside the burst do not
+  reopen it); and every log line on the offer path (journal
+  lag lines and the health-drop line) hands off to a dedicated
+  daemon log thread, so no synchronous logging remains
+  uncounted on that path. Total synchronous journal waiting
+  per burst is ≤ `JOURNAL_CALLBACK_BUDGET_MS` (500 ms), plus
+  at most one queue offer for the async log hand-off. Proven
+  by `journalBudget_multiEpisodeBurstAndSlowLogger_totalWaitBounded`
+  (twelve dropping captures against a 150 ms journal store —
+  every sync settling between offers — with a logger that
+  sleeps 300 ms per line: the burst completes inside one
+  budget window, lag counted, journal exact after healing)
+  and `journalBudget_monotonicDeadline_fakeClockJump_endsBurstWaits`
+  (the monotonic source is driven deterministically: jumped
+  past the deadline mid-burst, later offers return without
+  waiting and are counted as lag).
+- **A06 — legacy-to-attributed migration and late journal
+  updates are verified, and the migration hole is fixed.**
+  Verification found a real hole: a journal carrying BOTH
+  pre-attribution totals AND per-instance entries (the first
+  attributed instance synced its entry, then died before any
+  start reconciled the legacy totals) took the per-instance
+  path, which never saw the unattributed remainder — those
+  offers would have vanished from accounting. The remainder
+  now reconciles in the same mutation, decomposed exactly
+  (global totals minus attributed sums; the document's
+  `applied_count` minus every owner's `applied_by` — the two
+  are stamped in the same write), and claim-once is the same
+  mechanism as the legacy path (claiming advances
+  `applied_count`). Late journal updates need no new
+  mechanism and are now pinned by test: a claim records
+  `reconciled_by` at the owner's then-current unaccounted
+  total, so when a lagging sync grows the owner's journal
+  entry after a reconciliation, the next start claims exactly
+  the growth — never the whole gap twice, and the late delta
+  is never lost. Proven by
+  `reconcile_mixedJournal_legacyRemainderAndAttributed_claimedExactlyOnce`
+  (seeded mixed journal: attributed gap 3 + legacy remainder
+  gap 3 claimed as exactly 6, `applied_count` landing on
+  `offered − dropped`, unrepeated at the next start) and
+  `reconcile_lateJournalUpdate_claimedExactlyOnceOnNextStart`
+  (claim 2, journal grows by 2, next start claims exactly 2
+  more, a third start claims nothing).
+- **A06 — the residual tradeoff is NOT approved and its
+  construction is unchanged.** The auditor stated explicitly:
+  the residual pre-durable loss tradeoff requires owner
+  review and received no approval from the auditor. The owner
+  has not approved it either — this round changed only code
+  correctness (handshake, budget measurement, migration
+  accounting). The tradeoff's construction is exactly as
+  stated in the 7239229553 section: bounded, nonblocking
+  ingress with a next-start-detectable gap, over an unbounded
+  synchronous commit on the listener thread; a kill before the
+  first durable write on even healthy storage can still lose
+  the knowledge of an offer. It remains PENDING explicit owner
+  review.
 
 ## What is NOT claimed
 
