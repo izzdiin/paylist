@@ -185,18 +185,23 @@ object CaptureDeathHarness {
         ctx: Context,
         db: PaylistDatabase,
         legacyEnqueue: LegacyEnqueue,
+        executorCapacity: Int = CaptureCoordinator.EXECUTOR_CAPACITY,
     ): CaptureCoordinator {
         val store = Store(ctx)
         val consentStore = ConsentStore(db.collectorStateDao())
         consentStore.grant(ROUTE_ID)
         val healthPrefs = ctx.getSharedPreferences("paylist", Context.MODE_PRIVATE)
+        // The production durability contract (PR #5 audit
+        // 28 Nov): health writes are commit() — a durable
+        // acknowledgement a SIGKILL cannot beat — never apply().
         val healthStore = object : CaptureHealthStore {
             override fun readCaptureHealth(): String? =
                 healthPrefs.getString(PaylistApplication.CAPTURE_HEALTH_KEY, null)
 
             override fun writeCaptureHealth(json: String) {
-                healthPrefs.edit()
-                    .putString(PaylistApplication.CAPTURE_HEALTH_KEY, json).apply()
+                val ok = healthPrefs.edit()
+                    .putString(PaylistApplication.CAPTURE_HEALTH_KEY, json).commit()
+                check(ok) { "capture-health commit failed" }
             }
         }
         return CaptureCoordinator(
@@ -214,6 +219,7 @@ object CaptureDeathHarness {
             privacyGate = PrivacyGate(consentStore),
             consentStore = consentStore,
             captureLogDao = db.captureLogDao(),
+            executorCapacity = executorCapacity,
             healthStore = healthStore,
         )
     }

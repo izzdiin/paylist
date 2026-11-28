@@ -77,6 +77,16 @@
 #      expected fresh-process assertion; a missing-marker, recovery
 #      assertion, or infrastructure failure makes the run INVALID.
 #
+# Scenario c07 (PR #5 audit 28 Nov, P1-2) reuses the same
+# two-phase contract for the capture-HEALTH document: PhaseA
+# drives an overflow drop, crosses the durable acceptance
+# boundary (flushHealthIncidents — the incident's commit() write
+# has returned), verifies the incident from durable storage, and
+# kills itself; PhaseB (fresh process) requires the incident to
+# still be in the document. This is the real process-kill proof
+# for persisted incidents; the residual pre-flush loss window is
+# documented in the CaptureHealthStore contract.
+#
 # Usage: run on a machine with an emulator (or device) attached and
 # Gradle 8.9 on PATH (the CI job provides both). Exits 0 only when
 # every PhaseB passes; a PhaseA death-check failure — including a
@@ -154,6 +164,7 @@ PHASE_B="com.netter.paylist.CaptureDeathPhaseB"
 # scenario -> "phaseA method : phaseB method"
 SCENARIOS=(
   "c01KillAfterStagingBeforeDelivery:c01RecoveryCompletesExactlyOnce"
+  "c07KillAfterDurableIncident:c07IncidentSurvivedKill"
 )
 
 # Negative control: PhaseA writes the marker but deliberately does

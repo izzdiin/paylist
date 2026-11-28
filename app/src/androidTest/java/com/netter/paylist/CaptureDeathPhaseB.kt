@@ -213,6 +213,62 @@ class CaptureDeathPhaseB {
         recoveryCompletesExactlyOnce()
     }
 
+    /**
+     * c07 recovery (PR #5 audit 28 Nov, P1-2): the health
+     * incident PhaseA flushed across the durable acceptance
+     * boundary and then SIGKILLed itself over must still be in
+     * the durable health document in this FRESH process — the
+     * real process-kill proof for persisted incidents (a
+     * coordinator replacement in one process cannot prove this:
+     * an apply()-only write could have survived in memory there;
+     * here nothing in memory survived).
+     */
+    @Test
+    fun c07IncidentSurvivedKill() = runBlocking {
+        requireFreshProcess("c07")
+        val raw = ctx.getSharedPreferences("paylist", Context.MODE_PRIVATE)
+            .getString(PaylistApplication.CAPTURE_HEALTH_KEY, null)
+        assertNotNull(
+            "the health document must survive the process kill",
+            raw,
+        )
+        val incidents = org.json.JSONObject(raw!!).getJSONArray("incidents")
+        var found = false
+        for (i in 0 until incidents.length()) {
+            val item = incidents.getJSONObject(i)
+            if (item.optString("category") == "overflow_snapshot_dropped" &&
+                item.optString("status") == "OPEN" &&
+                item.optLong("count") >= 1L
+            ) {
+                found = true
+            }
+        }
+        assertTrue(
+            "the flushed overflow incident must survive the kill",
+            found,
+        )
+        // And a fresh coordinator over the same store reports it
+        // through the persistent layer (not just raw JSON).
+        val db = CaptureDeathHarness.openTestDb(ctx)
+        try {
+            val coordinator = CaptureDeathHarness.newCoordinator(
+                ctx, db, CaptureDeathHarness.durableLegacyEnqueue(ctx),
+            )
+            try {
+                assertTrue(
+                    coordinator.degradedState().persistentIncidents.any {
+                        it.category == "overflow_snapshot_dropped" &&
+                            it.status == "OPEN"
+                    },
+                )
+            } finally {
+                coordinator.close()
+            }
+        } finally {
+            db.close()
+        }
+    }
+
     @Test
     fun c06NegativeControlMustFail() = runBlocking {
         // Negative control (see CaptureDeathPhaseA): PhaseA wrote

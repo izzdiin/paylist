@@ -58,17 +58,10 @@ class CaptureDeathPhaseA {
 
     // NOTE: no @After — the process is killed inside the test.
 
-    /**
-     * Drives the pipeline to the crash window: one capture durably
-     * staged in Room, its legacy delivery blocked in-flight (the
-     * enqueue latch is never released in this process). Shared by
-     * c01 (which then kills) and the c06 negative control (which
-     * deliberately does not).
-     */
-    private suspend fun driveToStagedBeforeDelivery() {
-        val db = CaptureDeathHarness.openTestDb(ctx)
+    /** A legacy enqueue whose delivery stays in-flight forever in this process. */
+    private fun blockingEnqueue(): LegacyEnqueue {
         val neverReleased = CountDownLatch(1)
-        val blockingEnqueue = LegacyEnqueue { _, _, _ ->
+        return LegacyEnqueue { _, _, _ ->
             // Delivery in-flight forever (this process): waits,
             // swallowing interrupts — the kill is the only way out,
             // exactly like a crash mid-delivery.
@@ -83,7 +76,18 @@ class CaptureDeathPhaseA {
             }
             false
         }
-        val coordinator = CaptureDeathHarness.newCoordinator(ctx, db, blockingEnqueue)
+    }
+
+    /**
+     * Drives the pipeline to the crash window: one capture durably
+     * staged in Room, its legacy delivery blocked in-flight (the
+     * enqueue latch is never released in this process). Shared by
+     * c01 (which then kills) and the c06 negative control (which
+     * deliberately does not).
+     */
+    private suspend fun driveToStagedBeforeDelivery() {
+        val db = CaptureDeathHarness.openTestDb(ctx)
+        val coordinator = CaptureDeathHarness.newCoordinator(ctx, db, blockingEnqueue())
 
         // A REAL notification in the system shade; the snapshot is
         // the same normalisation the listener hands the pipeline.
@@ -118,6 +122,99 @@ class CaptureDeathPhaseA {
     fun c01KillAfterStagingBeforeDelivery() = runBlocking {
         driveToStagedBeforeDelivery()
         CaptureDeathHarness.writeMarker(ctx, "c01")
+        Process.killProcess(Process.myPid())
+        fail("the process must have died")
+    }
+
+    /**
+     * c07 (PR #5 audit 28 Nov, P1-2): a persistent health
+     * incident must survive a REAL process kill — not just a
+     * coordinator replacement. Drives one overflow drop (queue
+     * capacity 1, the worker blocked in a delivery), then crosses
+     * the durable acceptance boundary EXPLICITLY:
+     * `flushHealthIncidents` returns only after the incident's
+     * durable write (commit()) has returned from the store. The
+     * incident is then verified FROM DURABLE STORAGE in this
+     * process, the marker is written, and the process kills
+     * itself. PhaseB re-reads the document in a fresh process.
+     *
+     * The residual window is stated honestly (see the
+     * CaptureHealthStore contract): an incident offered but not
+     * yet flushed when the process dies is lost — this scenario
+     * proves the BOUNDARY (post-flush durability), not zero loss.
+     */
+    @Test
+    fun c07KillAfterDurableIncident() = runBlocking {
+        val db = CaptureDeathHarness.openTestDb(ctx)
+        val coordinator = CaptureDeathHarness.newCoordinator(
+            ctx, db, blockingEnqueue(), executorCapacity = 1,
+        )
+        CaptureDeathHarness.postPaymentNotification(
+            ctx, CaptureDeathHarness.NOTIF_ID_1, "Rp150.000",
+        )
+        CaptureDeathHarness.awaitCondition("first notification in the shade") {
+            CaptureDeathHarness.activeSnapshots(ctx).isNotEmpty()
+        }
+        val first = CaptureDeathHarness.activeSnapshots(ctx).single()
+        assertEquals(
+            CaptureCoordinator.CaptureReceipt.QUEUED,
+            coordinator.capture(first),
+        )
+        CaptureDeathHarness.awaitCondition("first capture durably staged") {
+            runBlocking { db.eventDao().count() == 1 }
+        }
+        // Second notification fills the capacity-1 queue; the
+        // third evicts it — an overflow drop, hence a persistent
+        // OVERFLOW_SNAPSHOT_DROPPED incident.
+        CaptureDeathHarness.postPaymentNotification(
+            ctx, CaptureDeathHarness.NOTIF_ID_2, "Rp200.000",
+        )
+        CaptureDeathHarness.awaitCondition("second notification in the shade") {
+            CaptureDeathHarness.activeSnapshots(ctx).size >= 2
+        }
+        val second = CaptureDeathHarness.activeSnapshots(ctx)
+            .first { it.postTimeMs != first.postTimeMs }
+        assertEquals(
+            CaptureCoordinator.CaptureReceipt.QUEUED,
+            coordinator.capture(second),
+        )
+        CaptureDeathHarness.postPaymentNotification(
+            ctx, CaptureDeathHarness.NOTIF_ID_3, "Rp300.000",
+        )
+        CaptureDeathHarness.awaitCondition("third notification in the shade") {
+            CaptureDeathHarness.activeSnapshots(ctx).size >= 3
+        }
+        val third = CaptureDeathHarness.activeSnapshots(ctx)
+            .first {
+                it.postTimeMs != first.postTimeMs &&
+                    it.postTimeMs != second.postTimeMs
+            }
+        coordinator.capture(third)
+        assertEquals(1L, coordinator.counters().droppedOverflow)
+        // THE DURABLE ACCEPTANCE BOUNDARY: returns only after
+        // the incident's durable write has returned.
+        coordinator.flushHealthIncidents(20_000)
+        // Prove it from durable storage, in this process, before
+        // the kill: the health document in SharedPreferences
+        // carries the OPEN incident.
+        val raw = ctx.getSharedPreferences("paylist", Context.MODE_PRIVATE)
+            .getString(PaylistApplication.CAPTURE_HEALTH_KEY, null)
+        org.junit.Assert.assertNotNull("health document must be durable", raw)
+        val incidents = org.json.JSONObject(raw!!).getJSONArray("incidents")
+        var found = false
+        for (i in 0 until incidents.length()) {
+            val item = incidents.getJSONObject(i)
+            if (item.optString("category") == "overflow_snapshot_dropped" &&
+                item.optString("status") == "OPEN"
+            ) {
+                found = true
+            }
+        }
+        org.junit.Assert.assertTrue(
+            "the overflow incident must be durable BEFORE the kill",
+            found,
+        )
+        CaptureDeathHarness.writeMarker(ctx, "c07")
         Process.killProcess(Process.myPid())
         fail("the process must have died")
     }
