@@ -588,14 +588,86 @@ object CaptureOwnershipRegistry {
     private val lock = ReentrantLock()
     private val claims = HashMap<String, CaptureProcessIdentity>()
 
-    /** Records [instanceId]'s ownership claim (idempotent). */
-    fun claim(instanceId: String, identity: CaptureProcessIdentity) {
-        lock.withLock { claims[instanceId] = identity }
+    /**
+     * Per-instance record of which pipeline threads have
+     * EXITED (bit 1 = capture worker, bit 2 = overflow
+     * writer), written by the exit handlers via
+     * [noteThreadExit] under the same lock that serialises
+     * [claimIfAlive]. Instance ids are unique per instance
+     * and never reused, so an exit record can never be
+     * mistaken for a later instance's state.
+     */
+    private val exitedHalves = HashMap<String, Int>()
+
+    private const val WORKER_HALF = 1
+    private const val WRITER_HALF = 2
+    private const val BOTH_HALVES = WORKER_HALF or WRITER_HALF
+
+    /**
+     * Test seam (audit 7242084700, A03): when set, invoked
+     * INSIDE the registry lock by [claimIfAlive] after the
+     * liveness sample and before the claim is inserted — the
+     * exact point the old code raced. A barrier test parks
+     * the publish there, runs an exit handler to completion
+     * (it queues on this lock), then lets the publish finish;
+     * the handshake must still leave no orphan claim. Null in
+     * production.
+     */
+    @Volatile
+    internal var claimBarrierHook: (() -> Unit)? = null
+
+    /**
+     * THE ATOMIC HANDSHAKE (audit 7242084700, A03 residual):
+     * samples the pipeline threads' liveness and inserts
+     * [instanceId]'s ownership claim in ONE critical section,
+     * serialised against [noteThreadExit]. A half whose exit
+     * has already been recorded never counts as alive, even
+     * if the sampled thread object still reports alive in a
+     * race window; a half that exits DURING this section
+     * queues its [noteThreadExit] on the same lock and
+     * completes the release immediately after the claim lands.
+     * There is therefore no interleaving in which a claim is
+     * inserted for threads that have both already exited, and
+     * none in which an exit is recorded but a later claim
+     * resurrects it: a claim exists only while at least one
+     * pipeline thread is un-exited, and it is removed by the
+     * second exit, whenever that exit runs. Returns true when
+     * a claim was inserted.
+     */
+    fun claimIfAlive(
+        instanceId: String,
+        identity: CaptureProcessIdentity,
+        workerAlive: () -> Boolean,
+        writerAlive: () -> Boolean,
+    ): Boolean {
+        lock.withLock {
+            val exited = exitedHalves[instanceId] ?: 0
+            val workerLive = workerAlive() && (exited and WORKER_HALF) == 0
+            val writerLive = writerAlive() && (exited and WRITER_HALF) == 0
+            if (!workerLive && !writerLive) return false
+            claimBarrierHook?.invoke()
+            claims[instanceId] = identity
+            return true
+        }
     }
 
-    /** Releases [instanceId]'s claim (its threads have exited). */
-    fun release(instanceId: String) {
-        lock.withLock { claims.remove(instanceId) }
+    /**
+     * Records one pipeline thread's exit (called FIRST by the
+     * thread's exit handler, before any store cleanup, so the
+     * fact is visible to a concurrent publish immediately).
+     * When the second half exits, the instance's ownership
+     * claim — whenever it was inserted — is released in the
+     * same critical section.
+     */
+    fun noteThreadExit(instanceId: String, workerHalf: Boolean) {
+        lock.withLock {
+            val mask = (exitedHalves[instanceId] ?: 0) or
+                (if (workerHalf) WORKER_HALF else WRITER_HALF)
+            exitedHalves[instanceId] = mask
+            if (mask == BOTH_HALVES) {
+                claims.remove(instanceId)
+            }
+        }
     }
 
     /** True while ANOTHER instance's claim stands. */
@@ -990,24 +1062,42 @@ class CaptureCoordinator(
         const val JOURNAL_WRITE_BOUND_MS: Long = 250
 
         /**
-         * The TOTAL journal-wait budget of one journal-sync
-         * episode (audit 7239229553, A06): the per-sync bound
-         * above capped each individual wait, but one listener
-         * callback can offer MANY incident records (a burst of
-         * saturation drops), and each offer waited again — so
-         * callback latency grew per record. Now every offer
-         * that joins the SAME in-flight sync shares ONE budget
-         * window of this size: once the window is spent,
-         * further offers do not wait at all (the sync lands
-         * late on the journal thread and the lag is counted).
-         * Total caller waiting attributable to one sync episode
-         * is therefore bounded by this value, however many
-         * records the callback offers during it. The window is
-         * scoped to the sync episode — the unit a callback's
-         * offers actually share — because the coordinator
-         * cannot see listener-callback boundaries.
+         * The TOTAL journal-wait budget of one contiguous
+         * burst of offers on one calling thread (audit
+         * 7239229553, A06; unit corrected by audit 7242084700):
+         * the per-sync bound above capped each individual
+         * wait, but one listener callback can offer MANY
+         * incident records (a burst of saturation drops), and
+         * each offer waited again — so callback latency grew
+         * per record. The 7239229553 fix shared one window per
+         * SYNC EPISODE, but a callback spanning several
+         * episodes (each sync settling before the next offer)
+         * still waited once per episode, and the window was
+         * measured on the WALL clock, which a clock rollback
+         * could stretch. Now the window belongs to the burst
+         * (see [JournalBudgetWindow]): every offer in the
+         * burst waits only inside ONE window of this size,
+         * measured on the MONOTONIC clock, however many sync
+         * episodes the burst spans; once it is spent, further
+         * offers in the burst do not wait at all (the sync
+         * lands late on the journal thread and the lag is
+         * counted). Total synchronous journal waiting per
+         * burst is therefore bounded by this value.
          */
         const val JOURNAL_CALLBACK_BUDGET_MS: Long = 500
+
+        /**
+         * Quiet gap that ends a calling thread's offer burst
+         * (audit 7242084700, A06): an offer arriving at least
+         * this long after the same thread's previous offer
+         * opens a fresh budget window. Sized equal to the
+         * budget itself — a callback's sequential offers are
+         * separated by milliseconds at most, while distinct
+         * callbacks are separated by real notification
+         * arrivals; a full budget-length silence is the
+         * conservative boundary between the two.
+         */
+        const val JOURNAL_BURST_QUIET_MS: Long = 500
 
         /** Cap on the quarantined raw health document kept as evidence. */
         const val MAX_QUARANTINED_RAW_CHARS: Int = 4_000
@@ -1261,21 +1351,21 @@ class CaptureCoordinator(
         }
     }
 
-    // --- Pipeline-thread exit flags + live registration
-    // (audit 7239229553) ---
+    // --- Pipeline-thread exit handshake + live registration
+    // (audits 7239229553, 7242084700) ---
     //
     // Declared here, before every pipeline thread, for the
     // same init-order reason as the journal state above: the
     // exit handlers run ON the pipeline threads and touch this
-    // state the moment a thread dies, whenever that is.
-
-    /** Set by the capture worker's exit handler. */
-    private val workerThreadExited =
-        java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /** Set by the overflow writer's exit handler. */
-    private val writerThreadExited =
-        java.util.concurrent.atomic.AtomicBoolean(false)
+    // state the moment a thread dies, whenever that is. The
+    // exit facts themselves live in [CaptureOwnershipRegistry]
+    // (see [CaptureOwnershipRegistry.noteThreadExit]): the
+    // previous per-instance AtomicBoolean pair was sampled by
+    // the exit handlers OUTSIDE the registry lock, so both
+    // handlers could finish between a publish's liveness
+    // sample and its claim insertion and strand a permanent
+    // foreign claim (audit 7242084700, A03). The registry's
+    // locked handshake is now the only exit/claim state.
 
     /**
      * Registers this instance as LIVE in this process (audit
@@ -1339,21 +1429,80 @@ class CaptureCoordinator(
     private var journalLagging: Boolean = false
 
     /**
-     * Deadline of the current journal-sync episode's shared
-     * wait budget (audit 7239229553, A06; guarded by
-     * [journalLock]): every offer joining the in-flight sync
-     * waits only within this window, so a multi-record
-     * callback's total journal waiting is bounded by
-     * [JOURNAL_CALLBACK_BUDGET_MS] per episode, not per record.
-     * Zero when no episode is open.
+     * The calling thread's current journal-wait budget window
+     * (audit 7242084700, A06 — replaces the wall-clock,
+     * per-sync-episode deadline of audit 7239229553). THE
+     * ACCOUNTING UNIT, stated honestly: the coordinator
+     * cannot see listener-callback boundaries, so the budget
+     * unit is ONE CONTIGUOUS BURST OF OFFERS ON ONE CALLING
+     * THREAD — the closest boundary the coordinator can
+     * actually observe, since one listener callback offers
+     * its records sequentially on one thread with no quiet
+     * gap. A burst opens at the thread's first offer and ends
+     * after [JOURNAL_BURST_QUIET_MS] of quiet on that thread;
+     * sync episodes that start and settle INSIDE the burst do
+     * NOT reopen the budget (the previous per-episode window
+     * let a multi-episode callback wait the budget once per
+     * episode). All deadline arithmetic uses the MONOTONIC
+     * clock ([monotonicNowNanos]): a wall-clock rollback or
+     * jump can neither extend nor fabricate budget. Total
+     * synchronous journal waiting inside one burst is at most
+     * [JOURNAL_CALLBACK_BUDGET_MS]; the synchronous lag
+     * logging that used to sit outside the wait is no longer
+     * on the caller at all (see [logOfferPathAsync]).
      */
-    private var journalBudgetDeadlineMs: Long = 0L
+    private class JournalBudgetWindow(
+        val deadlineNanos: Long,
+        var lastActivityNanos: Long,
+    )
+
+    /** Per-calling-thread burst window (see [JournalBudgetWindow]). */
+    private val journalBudgetWindow = ThreadLocal<JournalBudgetWindow?>()
+
+    /**
+     * The monotonic time source for every journal-budget
+     * measurement. A property (not a direct
+     * [System.nanoTime] call) so a regression test can drive
+     * the deadline deterministically; production always uses
+     * the real monotonic clock.
+     */
+    internal var monotonicNowNanos: () -> Long = { System.nanoTime() }
 
     /** Owns every journal write; created lazily, threads start on first submit. */
     private val journalExecutor: java.util.concurrent.ExecutorService =
         java.util.concurrent.Executors.newSingleThreadExecutor(
             daemonFactory("paylist-health-journal"),
         )
+
+    /**
+     * Owns the offer-path log lines that used to be emitted
+     * synchronously inside the journal-wait budget's scope
+     * (audit 7242084700, A06): the production log sink
+     * persists synchronously and can be slow, so a lag or
+     * drop notification emitted on the offering thread was
+     * synchronous work OUTSIDE the wait budget — a slow
+     * logger could extend a callback past the budget the
+     * wait alone respected. Those lines now hand off to this
+     * daemon thread; the caller pays one queue offer. The
+     * events themselves are always counted synchronously
+     * before the hand-off, so a lost log line never loses
+     * the accounting.
+     */
+    private val lagLogExecutor: java.util.concurrent.ExecutorService =
+        java.util.concurrent.Executors.newSingleThreadExecutor(
+            daemonFactory("paylist-journal-laglog"),
+        )
+
+    /** Emits an offer-path log line off the offering thread (see [lagLogExecutor]). */
+    private fun logOfferPathAsync(text: String) {
+        try {
+            lagLogExecutor.execute { logSafely(text) }
+        } catch (t: Throwable) {
+            // Executor gone (never shut down in production;
+            // a test may race it): the lag was already
+            // counted by the caller — the line is best-effort.
+        }
+    }
 
     /**
      * Adds this instance's unsynced counter delta to the
@@ -1448,7 +1597,6 @@ class CaptureCoordinator(
             if (!syncJournalOnce()) {
                 journalLock.withLock {
                     journalFuture = null
-                    journalBudgetDeadlineMs = 0L
                     journalLagging = true
                 }
                 return
@@ -1458,7 +1606,6 @@ class CaptureCoordinator(
                     healthDroppedCount.get() == droppedAtSync
                 ) {
                     journalFuture = null
-                    journalBudgetDeadlineMs = 0L
                     journalLagging = false
                     true
                 } else {
@@ -1471,105 +1618,133 @@ class CaptureCoordinator(
 
     /**
      * Ensures a journal sync is in flight and waits for it —
-     * bounded TWICE (audit 7237720579, A06; per-callback bound
-     * added by audit 7239229553): at most
+     * bounded TWICE (audit 7237720579, A06; burst bound by
+     * audits 7239229553 + 7242084700): at most
      * [JOURNAL_WRITE_BOUND_MS] for this one wait, and at most
      * [JOURNAL_CALLBACK_BUDGET_MS] of total waiting across ALL
-     * offers that join the same sync episode. The second bound
-     * is the one a multi-record listener callback feels: a
-     * burst of saturation drops offers many records in one
-     * callback, and under the per-wait bound alone each of
-     * them waited again, so the callback's latency grew per
-     * record. Now the episode's offers share one window; once
-     * it is spent, offers return without waiting (the sync
-     * lands late on the journal thread; the lag is counted in
+     * offers in this calling thread's current burst (see
+     * [JournalBudgetWindow] for the accounting unit and why).
+     * The burst bound is the one a multi-record listener
+     * callback feels: a burst of saturation drops offers many
+     * records in one callback, and under the per-wait bound
+     * alone each of them waited again, so the callback's
+     * latency grew per record. All budget arithmetic is
+     * MONOTONIC ([monotonicNowNanos]): a wall-clock rollback
+     * or jump can neither stretch nor fabricate the window —
+     * the previous wall-clock, per-sync-episode window could
+     * be exceeded by exactly those two (a rollback stretched
+     * it; several episodes inside one callback each reopened
+     * it). Once the burst window is spent, offers return
+     * without waiting (the sync lands late on the journal
+     * thread; the lag is counted in
      * [CaptureCounters.healthJournalTimeouts] and exposed in
-     * [degradedState]).
+     * [degradedState]). The lag LOG LINES are emitted off the
+     * caller ([logOfferPathAsync]): a slow synchronous
+     * logger on this path was synchronous work outside the
+     * wait budget (audit 7242084700).
      *
      * THE RESIDUAL WINDOW, stated for owner review (audit
-     * 7239229553): an offer is undetectable at the next start
-     * only if the process dies after the offer but before
-     * EITHER durable channel lands — the journal sync started
-     * here, or the health writer's application of the queued
-     * operation (which stamps the document's applied counts in
-     * the same write as the incident itself). Both channels
-     * start at offer time and each is a single minimal
-     * commit(); on a healthy store the window is zero (the
-     * sync completes inside the wait, exactly as with the old
-     * synchronous write). Under failing storage the lagging
-     * state is surfaced in-process, but a kill inside that
-     * state can still lose the KNOWLEDGE of an offer — the
-     * tradeoff this design accepts: bounded, nonblocking
-     * ingress with a detectable-in-the-next-start gap, over an
-     * unbounded synchronous commit on the listener thread. No
-     * zero-loss claim is made for that corner.
+     * 7239229553; STILL PENDING owner review — the auditor
+     * explicitly did not approve it, audit 7242084700): an
+     * offer is undetectable at the next start only if the
+     * process dies after the offer but before EITHER durable
+     * channel lands — the journal sync started here, or the
+     * health writer's application of the queued operation
+     * (which stamps the document's applied counts in the same
+     * write as the incident itself). Both channels start at
+     * offer time and each is a single minimal commit(); on a
+     * healthy store the window is zero (the sync completes
+     * inside the wait, exactly as with the old synchronous
+     * write). Under failing storage the lagging state is
+     * surfaced in-process, but a kill inside that state can
+     * still lose the KNOWLEDGE of an offer — the tradeoff this
+     * design accepts: bounded, nonblocking ingress with a
+     * detectable-in-the-next-start gap, over an unbounded
+     * synchronous commit on the listener thread. No zero-loss
+     * claim is made for that corner, and this round does not
+     * change the tradeoff's construction.
      */
     private fun writeJournalBounded() {
         if (healthStore == null) return
-        val now = System.currentTimeMillis()
-        val waitPlan = journalLock.withLock {
-            val existing = journalFuture
-            val future: java.util.concurrent.Future<*> = existing ?: try {
-                journalExecutor.submit { drainJournalWrites() }
-                    .also { journalFuture = it }
-            } catch (t: Throwable) {
-                // Executor shut down (post-close offers): the
-                // delta stays unsynced; counted as a lag, never
-                // a crash on a caller thread.
+        // Open or join this thread's burst window (monotonic).
+        val nowNanos = monotonicNowNanos()
+        var window = journalBudgetWindow.get()
+        if (window == null ||
+            nowNanos - window.lastActivityNanos >
+            TimeUnit.MILLISECONDS.toNanos(JOURNAL_BURST_QUIET_MS)
+        ) {
+            window = JournalBudgetWindow(
+                deadlineNanos = nowNanos +
+                    TimeUnit.MILLISECONDS.toNanos(JOURNAL_CALLBACK_BUDGET_MS),
+                lastActivityNanos = nowNanos,
+            )
+            journalBudgetWindow.set(window)
+        }
+        window.lastActivityNanos = nowNanos
+        try {
+            val future = journalLock.withLock {
+                journalFuture ?: try {
+                    journalExecutor.submit { drainJournalWrites() }
+                        .also { journalFuture = it }
+                } catch (t: Throwable) {
+                    // Executor shut down (post-close offers):
+                    // the delta stays unsynced; counted as a
+                    // lag, never a crash on a caller thread.
+                    journalLagging = true
+                    healthJournalTimeouts.incrementAndGet()
+                    logOfferPathAsync(
+                        "capture-health: thread jurnal sudah berhenti; " +
+                            "penawaran sesudah close tidak terjurnal " +
+                            "(tercatat sebagai lag jurnal)",
+                    )
+                    null
+                }
+            } ?: return
+            val remainingMs = TimeUnit.NANOSECONDS.toMillis(
+                window.deadlineNanos - monotonicNowNanos(),
+            )
+            if (remainingMs <= 0L) {
+                // The burst's budget is spent: do not wait.
+                // The sync is still in flight and lands late;
+                // this offer's lag is counted exactly like a
+                // timed-out wait.
                 journalLagging = true
                 healthJournalTimeouts.incrementAndGet()
-                logSafely(
-                    "capture-health: thread jurnal sudah berhenti; " +
-                        "penawaran sesudah close tidak terjurnal " +
-                        "(tercatat sebagai lag jurnal)",
+                logOfferPathAsync(
+                    "capture-health: anggaran tunggu jurnal per burst " +
+                        "(${JOURNAL_CALLBACK_BUDGET_MS}ms monotonik) habis — " +
+                        "penawaran lanjut tanpa menunggu; jurnal mengejar " +
+                        "di thread jurnal dan lag ini tercatat",
                 )
                 return
             }
-            if (existing == null) {
-                // A new sync episode opens a fresh shared
-                // budget window for its offers.
-                journalBudgetDeadlineMs = now + JOURNAL_CALLBACK_BUDGET_MS
+            try {
+                future.get(
+                    minOf(JOURNAL_WRITE_BOUND_MS, remainingMs),
+                    TimeUnit.MILLISECONDS,
+                )
+            } catch (e: java.util.concurrent.TimeoutException) {
+                journalLagging = true
+                healthJournalTimeouts.incrementAndGet()
+                logOfferPathAsync(
+                    "capture-health: penulisan jurnal melampaui batas " +
+                        "${JOURNAL_WRITE_BOUND_MS}ms (penyimpanan lambat) — " +
+                        "penawaran lanjut tanpa menunggu; jurnal mengejar " +
+                        "di thread jurnal dan lag ini tercatat",
+                )
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } catch (t: Throwable) {
+                // The drain guards its own store access;
+                // anything escaping it is counted there already.
             }
-            if (journalBudgetDeadlineMs <= 0L) {
-                journalBudgetDeadlineMs = now + JOURNAL_CALLBACK_BUDGET_MS
-            }
-            future to (journalBudgetDeadlineMs - now)
-        }
-        val (future, remainingMs) = waitPlan
-        if (remainingMs <= 0L) {
-            // The episode's budget is spent: do not wait. The
-            // sync is still in flight and lands late; this
-            // offer's lag is counted exactly like a timed-out
-            // wait.
-            journalLagging = true
-            healthJournalTimeouts.incrementAndGet()
-            logSafely(
-                "capture-health: anggaran tunggu jurnal per callback " +
-                    "(${JOURNAL_CALLBACK_BUDGET_MS}ms) habis untuk episode " +
-                    "sinkronisasi ini — penawaran lanjut tanpa menunggu; " +
-                    "jurnal mengejar di thread jurnal dan lag ini tercatat",
-            )
-            return
-        }
-        try {
-            future.get(
-                minOf(JOURNAL_WRITE_BOUND_MS, remainingMs),
-                TimeUnit.MILLISECONDS,
-            )
-        } catch (e: java.util.concurrent.TimeoutException) {
-            journalLagging = true
-            healthJournalTimeouts.incrementAndGet()
-            logSafely(
-                "capture-health: penulisan jurnal melampaui batas " +
-                    "${JOURNAL_WRITE_BOUND_MS}ms (penyimpanan lambat) — " +
-                    "penawaran lanjut tanpa menunggu; jurnal mengejar " +
-                    "di thread jurnal dan lag ini tercatat",
-            )
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-        } catch (t: Throwable) {
-            // The drain guards its own store access; anything
-            // escaping it is counted there already.
+        } finally {
+            // The burst's quiet gap is measured from the last
+            // offer ACTIVITY, not only its arrival: an offer
+            // that spent its wait inside the window was never
+            // quiet, so a following offer arriving right after
+            // it returns still belongs to the same burst.
+            window.lastActivityNanos = monotonicNowNanos()
         }
     }
 
@@ -2461,7 +2636,13 @@ class CaptureCoordinator(
         }
         if (droppedNow) {
             if (isRecord) writeJournalBounded()
-            logSafely(
+            // Async (audit 7242084700, A06): this line is on
+            // the offering thread, inside the same latency
+            // scope as the journal wait — a slow synchronous
+            // logger here would be uncounted synchronous work
+            // on the offer path. The drop was already counted
+            // above; the line is evidence, not accounting.
+            logOfferPathAsync(
                 if (writerGone) {
                     "capture-health: penulis kesehatan sudah berhenti; " +
                         "operasi kesehatan tidak terantre (dihitung hilang)"
@@ -2521,7 +2702,13 @@ class CaptureCoordinator(
      * A journal with NO per-instance entries predates
      * attribution; its totals reconcile by the legacy global
      * rule in [reconcileLegacyJournal] — the only reading the
-     * data supports.
+     * data supports. A journal with BOTH (the first attributed
+     * instance synced, then died before a start reconciled
+     * the legacy totals) reconciles its attributed entries
+     * per-instance above AND its unattributed remainder by
+     * the same legacy rule, decomposed against the attributed
+     * sums — neither part is dropped or counted twice (audit
+     * 7242084700, A06 migration verification).
      */
     private fun reconcilePreDurableLoss() {
         val snapshot = journalSnapshotAtInit ?: return
@@ -2549,8 +2736,57 @@ class CaptureCoordinator(
                     // as a dead process's loss.
                     continue
                 }
+                // Claiming only the part not already claimed
+                // is also what makes LATE JOURNAL UPDATES
+                // exact (audit 7242084700, A06): if the
+                // owner's journal entry grows after a previous
+                // reconciliation claimed its then-current gap
+                // (a lagging sync landing after the successor
+                // started), the next start sees
+                // unaccounted > already and claims exactly the
+                // growth — never the whole gap twice, and the
+                // late delta is never lost.
                 claimed += unaccounted - already
                 reconciledBy.put(ownerId, unaccounted)
+            }
+            // MIXED-JOURNAL MIGRATION (audit 7242084700, A06):
+            // a journal that carries BOTH pre-attribution
+            // totals AND per-instance entries — the state left
+            // when the first attributed instance synced its
+            // entry but died before any start reconciled the
+            // legacy totals. The per-instance loop above never
+            // sees the unattributed remainder, so without this
+            // step those offers would be silently dropped from
+            // accounting the moment any instance entry exists.
+            // The remainder reconciles by the legacy global
+            // rule, decomposed exactly: its offered/dropped are
+            // the global totals minus the attributed sums, and
+            // its applied share is the document's applied_count
+            // minus every attributed owner's applied_by (the
+            // two are stamped in the same write, so the
+            // decomposition is exact). Claim-once is the same
+            // mechanism as the legacy path: claiming advances
+            // applied_count, so a later start recomputes a
+            // remainder gap of zero.
+            val attributedOffered =
+                journalInstancesAtInit.values.sumOf { it.offered }
+            val attributedDropped =
+                journalInstancesAtInit.values.sumOf { it.dropped }
+            val legacyAccounted =
+                (snapshot[0] - attributedOffered) -
+                    (snapshot[1] - attributedDropped)
+            if (legacyAccounted > 0) {
+                var attributedApplied = 0L
+                val appliedKeys = appliedBy.keys()
+                while (appliedKeys.hasNext()) {
+                    attributedApplied += appliedBy.optLong(appliedKeys.next(), 0L)
+                }
+                val legacyApplied =
+                    doc.optLong("applied_count", 0L) - attributedApplied
+                val legacyUnknown = legacyAccounted - legacyApplied
+                if (legacyUnknown > 0) {
+                    claimed += legacyUnknown
+                }
             }
             if (claimed > 0) {
                 applyIncidentCounted(
@@ -2561,7 +2797,8 @@ class CaptureCoordinator(
                         "sebelumnya yang terbukti berhenti tidak pernah " +
                         "mencapai batas durable (isi insidennya tidak " +
                         "diketahui — hanya jumlahnya yang pasti, dari " +
-                        "jurnal penawaran per-instance)",
+                        "jurnal penawaran per-instance dan sisa " +
+                        "pra-atribusinya)",
                     "",
                     claimed,
                 )
@@ -3389,15 +3626,23 @@ class CaptureCoordinator(
         // durable write is attempted (audit 7239229553): if
         // either pipeline thread outlived close, this process
         // records that fact in its own memory, where a store
-        // failure cannot erase it. Released by the thread-exit
-        // handlers once both threads have exited.
-        if (captureWorker.isAlive || overflowWriter.isAlive) {
-            CaptureOwnershipRegistry.claim(
-                instanceId,
-                healthStore?.processIdentity()
-                    ?: CaptureProcessIdentity(-1, -1),
-            )
-        }
+        // failure cannot erase it. The claim is inserted by
+        // the registry's ATOMIC handshake (audit 7242084700):
+        // the liveness sample and the insertion are one
+        // critical section serialised against the exit
+        // handlers' release, so an exit that lands between
+        // the sample and the insertion can no longer strand a
+        // permanent foreign claim — the exit either precedes
+        // the sample (the half counts as exited and no claim
+        // is owed for it) or follows the insertion (and its
+        // recorded exit completes the release).
+        CaptureOwnershipRegistry.claimIfAlive(
+            instanceId,
+            healthStore?.processIdentity()
+                ?: CaptureProcessIdentity(-1, -1),
+            workerAlive = { captureWorker.isAlive },
+            writerAlive = { overflowWriter.isAlive },
+        )
         var publishedWorker = false
         var publishedWriter = false
         val fenceBlock: (JSONObject) -> Unit = { fence ->
@@ -3531,6 +3776,15 @@ class CaptureCoordinator(
 
     /** The capture worker exited: clears its half of this instance's fence. */
     private fun onWorkerThreadExit() {
+        // The exit is recorded in the ownership registry
+        // FIRST (audit 7242084700, A03): the atomic handshake
+        // serialises this record against any in-flight claim
+        // insertion, so the claim's release can never be lost
+        // between a publish's liveness sample and its claim —
+        // and being in-memory, no store failure below can
+        // strand the claim either. The durable fence cleanup
+        // follows as before.
+        CaptureOwnershipRegistry.noteThreadExit(instanceId, workerHalf = true)
         mutateLifecycle { fence ->
             if (fence.optString("owner") != instanceId || !fence.optBoolean("active")) {
                 return@mutateLifecycle
@@ -3539,18 +3793,13 @@ class CaptureCoordinator(
             if (!fence.optBoolean("writer_alive")) fence.put("active", false)
         }
         clearDocFenceHalf(workerHalf = true)
-        // Authoritative-ownership release (audit 7239229553,
-        // A03): once BOTH pipeline threads have exited, the
-        // in-memory claim is released — in memory, so a store
-        // failure above cannot strand it either.
-        workerThreadExited.set(true)
-        if (writerThreadExited.get()) {
-            CaptureOwnershipRegistry.release(instanceId)
-        }
     }
 
     /** The overflow writer exited: clears its half of this instance's fence. */
     private fun onWriterThreadExit() {
+        // See onWorkerThreadExit: the registry records the
+        // exit before any store cleanup runs.
+        CaptureOwnershipRegistry.noteThreadExit(instanceId, workerHalf = false)
         mutateLifecycle { fence ->
             if (fence.optString("owner") != instanceId || !fence.optBoolean("active")) {
                 return@mutateLifecycle
@@ -3559,12 +3808,6 @@ class CaptureCoordinator(
             if (!fence.optBoolean("worker_alive")) fence.put("active", false)
         }
         clearDocFenceHalf(workerHalf = false)
-        // See onWorkerThreadExit: the second thread out
-        // releases the ownership claim.
-        writerThreadExited.set(true)
-        if (workerThreadExited.get()) {
-            CaptureOwnershipRegistry.release(instanceId)
-        }
     }
 
     /**
@@ -4162,6 +4405,26 @@ class CaptureCoordinator(
      */
     fun close() {
         if (!closeStarted.compareAndSet(false, true)) return
+        // Construction/close serialisation (audit 7242084700,
+        // A03): the ownership claim is taken NOW, at the start
+        // of the one-shot close sequence — not only later in
+        // publishSuccessorFenceIfNeeded. A successor
+        // constructed at any point during this close therefore
+        // sees the claim and waits, instead of racing a close
+        // whose fence publish has not happened yet. The claim
+        // is released by the exit handlers as the pipeline
+        // threads actually exit during the close (the normal
+        // clean-close path removes it before close returns);
+        // publishSuccessorFenceIfNeeded re-asserts it through
+        // the same atomic handshake for any thread that
+        // outlives the bounded joins.
+        CaptureOwnershipRegistry.claimIfAlive(
+            instanceId,
+            healthStore?.processIdentity()
+                ?: CaptureProcessIdentity(-1, -1),
+            workerAlive = { captureWorker.isAlive },
+            writerAlive = { overflowWriter.isAlive },
+        )
         sweepTimer.shutdownNow()
         val stranded: List<CaptureTask> = admissionLock.withLock {
             closedFlag = true
