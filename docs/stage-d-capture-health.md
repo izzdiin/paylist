@@ -110,11 +110,11 @@ Tightened by the PR #5 audit of 28 Nov 2026:
   health-writer thread performs the durable writes. An offer
   that cannot be queued is counted
   (`healthIncidentsDropped`), logged, and journaled as
-  known-dropped (see the offer journal below). The ONE
-  synchronous durable write on the offer path is the offer
-  journal itself — a single-key `commit()` of two counters to
-  a dedicated minimal store, only on incident-offer paths
-  (failures and drops, never the per-capture hot path).
+  known-dropped (see the offer journal below). The offer
+  journal's own sync is bounded too — since audit 7237720579
+  it runs on a dedicated journal thread and the offering
+  caller waits at most `JOURNAL_WRITE_BOUND_MS` (250 ms) per
+  sync, at most twice per offer (see the A06 section below).
 - **Durable acceptance boundary.** An incident is ACCEPTED
   (durable) only when its `writeCaptureHealth` call has
   RETURNED — production writes with `SharedPreferences`
@@ -130,22 +130,25 @@ Tightened by the PR #5 audit of 28 Nov 2026:
   yet written when the process dies is still lost AS AN
   INCIDENT — that much is not claimed otherwise. What changed
   is that the loss no longer vanishes without a trace. Every
-  offer first advances the **offer journal** — two durable
-  counters (`offered`, `dropped`) in their own prefs file,
-  written synchronously at offer time — and every durable
-  batch application advances the document's `applied_count`.
-  At the next start, before applying anything, the health
-  writer reconciles: `offered − dropped − applied` is the
-  exact count of incidents lost before the durable boundary,
-  recorded as one aggregate `UNKNOWN_LOSS` incident (see the
-  category table). Queue-saturation drops are journaled as
-  known-dropped at the moment they happen, so they are never
-  double-reported as unknown. The residual bound is the
-  journal itself: if the journal value is lost or corrupt,
-  the gap is undetectable — the journal is a single tiny
-  `commit()`-written value precisely to make that window as
-  small as the platform allows, and a failed journal write is
-  counted as a store failure rather than swallowed.
+  incident RECORD offer advances the **offer journal** — two
+  durable counters (`offered`, `dropped`) in their own prefs
+  file — and every durable batch application advances the
+  document's `applied_count` by the number of RECORD
+  operations it carried. At the next start, before applying
+  anything, the health writer reconciles: `offered − dropped
+  − applied` is the exact count of incident records lost
+  before the durable boundary, recorded as one aggregate
+  `UNKNOWN_LOSS` incident (see the category table).
+  Queue-saturation drops are journaled as known-dropped at
+  the moment they happen, so they are never double-reported
+  as unknown. What the gap counts is stated precisely in the
+  A06 section below: incident RECORDS, never payments.
+  The residual bound is the journal itself: if the journal
+  value is lost or corrupt, the gap is undetectable — the
+  journal is a single tiny `commit()`-written value precisely
+  to make that window as small as the platform allows, and a
+  failed journal write is counted as a store failure rather
+  than swallowed.
 - **No silent reset.** A store read that fails aborts the
   mutation (an unreadable document is never blindly
   overwritten). A stored health document that does not parse
@@ -271,6 +274,97 @@ where an emulator exists (the CI `process-death-oracle` job).
 The older `ProcessDeathHarnessTest` remains as an in-process
 restart-boundary regression; it is not, and is no longer
 presented as, kill evidence.
+
+## Audit 7237720579 (28 Nov): tri-state liveness, keyed identities, journal bounds
+
+Three residual findings from the independent audit of head
+`45c4221`, and what changed:
+
+- **A03 residual — death proof is tri-state, the lifecycle
+  record is schema-validated, and a failed publish cannot
+  vanish.** Process liveness is now `ALIVE / DEAD / UNKNOWN`.
+  Only DEAD clears a successor fence, and DEAD requires
+  positive evidence: `/proc/<pid>/stat` absent together with
+  its `/proc/<pid>` directory, or a start-time mismatch (PID
+  reuse). Every other read outcome — permission denial,
+  transient I/O, a visibility restriction, an unparseable
+  stat, an invalid identity, even an unreadable `/proc/self`
+  — is UNKNOWN and retains the fence. The lifecycle record is
+  validated against a SCHEMA (required fields, JSON types,
+  and the consistency rule that known ownership carries a
+  usable PID + start time), not merely parsed; a
+  schema-invalid record takes the corrupt path (preserved
+  byte-for-byte, successor waits). And a fence publish whose
+  lifecycle write fails is retried, then falls back to the
+  legacy in-document fence — the location successors already
+  adopt from — with both channels' failure recorded as a
+  `FENCE_PUBLISH_FAILED` incident plus a degraded reason, so
+  a live predecessor is never silently unfenced. An
+  in-document fence whose owner matches an INACTIVE lifecycle
+  record is a retired leftover of adoption and is ignored;
+  one from any other owner binds, and clears by the same
+  proofs (thread-exit halves, or proven death via
+  `FENCE_ORPHAN_CLEARED`).
+- **A05/A06 — observation identities are KEYED.** The
+  persisted observation identity is `obs:` + HMAC-SHA-256
+  over package + post time + the SHA-256 of the combined
+  text, keyed by a random 32-byte key held in the
+  **SecretVault** (Keystore-encrypted; entry
+  `capture-observation-key`) — never stored in the health
+  document, the lifecycle record, the journal, or Room, i.e.
+  never alongside the identities it derives. Discrimination
+  is unchanged (distinct notifications sharing a package and
+  a millisecond still differ; a rescan of the same
+  notification is still idempotent), but the persisted value
+  can no longer be verified against a guessed text: for a
+  low-entropy pre-consent / pure-auth text (e.g. an OTP-only
+  notification), an attacker who knows the package and post
+  time cannot confirm a guess offline, because the unkeyed
+  derivation of even the exact text does not match the stored
+  keyed identity. No unkeyed hash of raw text is persisted on
+  any loss path. If the vault cannot persist the key, a
+  process-lifetime random key is used instead — identities
+  stay keyed; they just do not survive that restart. The
+  unkeyed derivation remains only inside bare coordinators
+  (no health store wired), whose identities are never
+  persisted at all.
+- **A06 — journal latency is bounded, the gap's meaning is
+  exact, and totals are exact across overlapping instances.**
+  (a) *Latency:* journal writes run on a dedicated journal
+  thread; an offering caller waits at most
+  `JOURNAL_WRITE_BOUND_MS` = **250 ms** per sync and at most
+  two syncs per offer (offered + dropped accounting), even
+  when the store takes seconds or fails. A sync that exceeds
+  the bound lands LATE (the journal thread keeps writing
+  until the counters are durable); the lag is counted
+  (`healthJournalTimeouts`) and surfaced in the degraded
+  state. The declared residual window: an offer whose sync
+  is still lagging when the process dies is not yet
+  journaled, so that incident can escape the next start's
+  gap. The window exists only while storage is slower than
+  the bound (or failing) and the lag is itself visible
+  in-process; on a healthy store the sync completes inside
+  the wait and the window is zero. (b) *Meaning:* only
+  incident RECORD operations are journaled as offered and
+  counted as applied; recover operations are maintenance and
+  move neither counter. `UNKNOWN_LOSS` therefore counts lost
+  health-incident **records** — the persistent evidence —
+  and says nothing about payments or captures: a lost
+  incident record is not a lost payment. (c) *Concurrency:*
+  each journal write is a read-modify-write under a
+  dedicated journal lock — deliberately NOT the
+  health-document lock, so a health writer stuck inside a
+  document commit cannot stall the journal (saturation drops
+  are journaled at the moment they happen) — that adds only
+  the writing instance's unsynced DELTA to the durable
+  totals, so a predecessor and a successor whose health
+  writers overlap sum exactly — each delta applied once,
+  whatever the interleaving (the previous design wrote
+  absolute per-instance snapshots, which could overwrite
+  each other). This exactness is proven for overlapping
+  instances over one store by
+  `overlappingInstances_journalTotalsExact_noUnknownLoss`;
+  no cross-instance claim beyond that construction is made.
 
 ## What is NOT claimed
 
