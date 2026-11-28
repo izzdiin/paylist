@@ -80,6 +80,18 @@ class PaylistApplication : Application(), Configuration.Provider {
         /** SharedPreferences key of the persistent capture-health document. */
         const val CAPTURE_HEALTH_KEY: String = "capture_health_v1"
 
+        /** SharedPreferences file of the successor-fence lifecycle record (audit A03: separate from the health document). */
+        const val CAPTURE_LIFECYCLE_PREFS: String = "paylist_capture_lifecycle"
+
+        /** Key of the lifecycle record inside [CAPTURE_LIFECYCLE_PREFS]. */
+        const val CAPTURE_LIFECYCLE_KEY: String = "capture_lifecycle_v1"
+
+        /** SharedPreferences file of the health offer journal (audit A06). */
+        const val CAPTURE_JOURNAL_PREFS: String = "paylist_capture_journal"
+
+        /** Key of the offer journal inside [CAPTURE_JOURNAL_PREFS]. */
+        const val CAPTURE_JOURNAL_KEY: String = "capture_health_journal_v1"
+
         /** Monitor serialising capture-health file-lock sections inside this process. */
         private val HEALTH_FILE_LOCK_MONITOR = Any()
     }
@@ -159,22 +171,31 @@ class PaylistApplication : Application(), Configuration.Provider {
             override fun logLocal(text: String) = store.logLocal(text)
         }
         // PR #5 re-review 28 Nov; durability contract tightened
-        // by the PR #5 audit of 28 Nov (comment 7229800304): the
-        // persistent capture-health document (incidents +
-        // successor fence) lives in the same "paylist"
+        // by the PR #5 audits of 28 Nov (comments 7229800304 and
+        // 7235948077): the persistent capture-health document
+        // (incidents) lives in the same "paylist"
         // SharedPreferences as the rest of the Store state, but
         // writes are commit() — the durable acceptance boundary
         // (apply() is only an in-memory update whose disk flush
-        // a SIGKILL can beat). commit() runs ONLY on the
-        // coordinator's health-writer thread (and on close /
-        // operator paths), never on a pipeline caller thread.
-        // A failed commit throws, so the failure is counted and
-        // surfaced instead of swallowed. Document
-        // read-modify-writes serialise process-wide through a
-        // file lock (plus a JVM monitor against same-process
-        // overlap), so a predecessor and a successor PROCESS
-        // cannot interleave their mutations.
+        // a SIGKILL can beat). commit() for the document runs
+        // ONLY on the coordinator's health-writer thread (and on
+        // close / operator paths), never on a pipeline caller
+        // thread; the offer journal's minimal counter commit is
+        // the one deliberate exception (audit A06 — it is what
+        // makes pre-durable loss detectable). A failed commit
+        // throws, so the failure is counted and surfaced instead
+        // of swallowed. Document read-modify-writes serialise
+        // process-wide through a file lock (plus a JVM monitor
+        // against same-process overlap), so a predecessor and a
+        // successor PROCESS cannot interleave their mutations.
         val healthPrefs = getSharedPreferences("paylist", MODE_PRIVATE)
+        // Audit 7235948077: the lifecycle record (A03) and the
+        // offer journal (A06) live in their OWN tiny preference
+        // files — separate from the health document, so document
+        // corruption can never touch the fence, and a journal
+        // commit() writes only the two counters it carries.
+        val lifecyclePrefs = getSharedPreferences(CAPTURE_LIFECYCLE_PREFS, MODE_PRIVATE)
+        val journalPrefs = getSharedPreferences(CAPTURE_JOURNAL_PREFS, MODE_PRIVATE)
         val healthStore = object : CaptureHealthStore {
             override fun readCaptureHealth(): String? =
                 healthPrefs.getString(CAPTURE_HEALTH_KEY, null)
@@ -183,6 +204,24 @@ class PaylistApplication : Application(), Configuration.Provider {
                 val ok = healthPrefs.edit()
                     .putString(CAPTURE_HEALTH_KEY, json).commit()
                 check(ok) { "capture-health commit failed" }
+            }
+
+            override fun readCaptureLifecycle(): String? =
+                lifecyclePrefs.getString(CAPTURE_LIFECYCLE_KEY, null)
+
+            override fun writeCaptureLifecycle(json: String) {
+                val ok = lifecyclePrefs.edit()
+                    .putString(CAPTURE_LIFECYCLE_KEY, json).commit()
+                check(ok) { "capture-lifecycle commit failed" }
+            }
+
+            override fun readCaptureHealthJournal(): String? =
+                journalPrefs.getString(CAPTURE_JOURNAL_KEY, null)
+
+            override fun writeCaptureHealthJournal(json: String) {
+                val ok = journalPrefs.edit()
+                    .putString(CAPTURE_JOURNAL_KEY, json).commit()
+                check(ok) { "capture-health journal commit failed" }
             }
 
             override fun <T> withCaptureHealthLock(block: () -> T): T =
