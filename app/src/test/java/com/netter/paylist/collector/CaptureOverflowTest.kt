@@ -2941,4 +2941,399 @@ class CaptureOverflowTest {
         )
     }
 
+    // --- Audit 7239229553: A03 authoritative ownership +
+    // corroborated /proc death proof; A06 per-callback journal
+    // budget + per-instance reconciliation ---
+
+    /** A minimal parseable `/proc/<pid>/stat` body for a fake proc root. */
+    private fun fakeProcStat(pid: Int, startTicks: Long): String =
+        "$pid (fake) S " + (1..18).joinToString(" ") { "0" } +
+            " $startTicks 0"
+
+    @Test
+    fun processLiveness_fakeProcRoot_absenceMustBeCorroborated() {
+        // Audit 7239229553 (A03): a single negative probe
+        // (File.exists()-style) is not death proof. Against a
+        // FAKE proc root — a real directory tree on disk, not
+        // an injected enum:
+        // - a pid whose directory is entirely absent, with the
+        //   root listable, is DEAD (absence corroborated by a
+        //   root listing plus a second ENOENT read);
+        // - a pid whose DIRECTORY exists but whose stat is
+        //   missing is UNKNOWN (the subject is there; its stat
+        //   is not — visibility/race, not death);
+        // - a stat path that is a DIRECTORY is UNKNOWN (an I/O
+        //   error, not absence);
+        // - an unlistable proc root is UNKNOWN (our own view
+        //   cannot even be established);
+        // - a present stat decides by start time: match ALIVE,
+        //   mismatch DEAD (PID reuse).
+        val root = java.nio.file.Files.createTempDirectory("fakeproc")
+        try {
+            val selfDir = root.resolve("self")
+            java.nio.file.Files.createDirectories(selfDir)
+            java.nio.file.Files.write(
+                selfDir.resolve("stat"),
+                fakeProcStat(4242, 111L).toByteArray(),
+            )
+            val target = CaptureProcessIdentity(777, 55L)
+            assertEquals(
+                "corroborated absence is DEAD",
+                ProcessLiveness.DEAD,
+                CaptureProcessIdentitySource.liveness(target, root.toString()),
+            )
+            val dirOnly = root.resolve("777")
+            java.nio.file.Files.createDirectories(dirOnly)
+            assertEquals(
+                "directory present, stat missing: UNKNOWN, not death",
+                ProcessLiveness.UNKNOWN,
+                CaptureProcessIdentitySource.liveness(target, root.toString()),
+            )
+            java.nio.file.Files.createDirectories(dirOnly.resolve("stat"))
+            assertEquals(
+                "stat unreadable (it is a directory): UNKNOWN",
+                ProcessLiveness.UNKNOWN,
+                CaptureProcessIdentitySource.liveness(target, root.toString()),
+            )
+            java.nio.file.Files.delete(dirOnly.resolve("stat"))
+            java.nio.file.Files.write(
+                dirOnly.resolve("stat"),
+                fakeProcStat(777, 55L).toByteArray(),
+            )
+            assertEquals(
+                "matching start: ALIVE",
+                ProcessLiveness.ALIVE,
+                CaptureProcessIdentitySource.liveness(target, root.toString()),
+            )
+            assertEquals(
+                "different start: DEAD (PID reuse)",
+                ProcessLiveness.DEAD,
+                CaptureProcessIdentitySource.liveness(
+                    CaptureProcessIdentity(777, 56L), root.toString(),
+                ),
+            )
+            assertEquals(
+                "missing proc root: UNKNOWN (no trustworthy view)",
+                ProcessLiveness.UNKNOWN,
+                CaptureProcessIdentitySource.liveness(
+                    target, root.resolve("nope").toString(),
+                ),
+            )
+        } finally {
+            root.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun processLiveness_fakeProcRoot_permissionDeniedIsUnknown() {
+        // A stat file that exists but denies the read (EACCES)
+        // is UNKNOWN — never death. Skipped where the test runs
+        // as root, because root reads through permission bits
+        // and the denial cannot be staged.
+        val root = java.nio.file.Files.createTempDirectory("fakeproc")
+        try {
+            val selfDir = root.resolve("self")
+            java.nio.file.Files.createDirectories(selfDir)
+            java.nio.file.Files.write(
+                selfDir.resolve("stat"),
+                fakeProcStat(4242, 111L).toByteArray(),
+            )
+            val dir = root.resolve("888")
+            java.nio.file.Files.createDirectories(dir)
+            val statPath = dir.resolve("stat")
+            java.nio.file.Files.write(
+                statPath, fakeProcStat(888, 9L).toByteArray(),
+            )
+            val statFile = java.io.File(statPath.toUri())
+            statFile.setReadable(false, false)
+            org.junit.Assume.assumeTrue(
+                "chmod denial must actually deny this user",
+                !statFile.canRead(),
+            )
+            assertEquals(
+                "permission-denied stat: UNKNOWN, fence-safe",
+                ProcessLiveness.UNKNOWN,
+                CaptureProcessIdentitySource.liveness(
+                    CaptureProcessIdentity(888, 9L), root.toString(),
+                ),
+            )
+        } finally {
+            root.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun dualWriteFailure_livePredecessorClaim_successorCannotWorkUntilThreadsExit() =
+        runBlocking {
+            // Audit 7239229553 (A03), the acceptance the
+            // previous round missed: BOTH durable fence
+            // channels fail at publish time while a predecessor
+            // thread outlives close. Logging/degraded state is
+            // not exclusion — exclusion now comes from the
+            // process-wide authoritative ownership claim, which
+            // lives in process memory and does not depend on
+            // the failing store. The successor ATTEMPTS work
+            // and provably cannot stage; once the predecessor's
+            // threads actually exit, the claim is released and
+            // the successor proceeds.
+            val health = FakeCaptureHealthStore()
+            coordinator = newCoordinator(healthStore = health)
+            val latch = blockExecutorWith(POST_TIME)
+            val writerLatch = CountDownLatch(1)
+            try {
+                awaitCondition("blocker capture-log row written") {
+                    store.captureLog.values.any {
+                        it.outcome == CaptureOutcome.CAPTURED
+                    }
+                }
+                for (i in 1..3) {
+                    coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+                }
+                captureLogDao.insertBlockLatch = writerLatch
+                coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+                awaitCondition("writer stuck inside the overflow insert") {
+                    captureLogDao.insertEntered.get() >= 1
+                }
+                health.failLifecycleWrites = true
+                health.failDocWrites = true
+                coordinator.close()
+                assertTrue(
+                    "stuck writer outlived close()",
+                    coordinator.isOverflowWriterAlive(),
+                )
+                assertFalse(
+                    "no durable fence exists on either channel",
+                    health.fenceActive(),
+                )
+                assertTrue(
+                    "the failed durable publish is still surfaced",
+                    coordinator.degradedState().reasons.any {
+                        it.contains("fence_publish_failed")
+                    },
+                )
+                val eventsBefore = eventDao.count()
+                val successor = newCoordinator(healthStore = health)
+                try {
+                    assertEquals(
+                        CaptureCoordinator.CaptureReceipt.QUEUED,
+                        successor.capture(
+                            snapshot(postTime = POST_TIME + 9_000L),
+                        ),
+                    )
+                    Thread.sleep(800)
+                    assertEquals(
+                        "successor must not stage while the ownership " +
+                            "claim stands (dual write failure is not a gap)",
+                        eventsBefore, eventDao.count(),
+                    )
+                    assertTrue(
+                        "successor reports itself fenced by the claim",
+                        successor.degradedState().successorFenced,
+                    )
+                    writerLatch.countDown()
+                    awaitCondition(
+                        "successor proceeds once the predecessor's " +
+                            "threads exited and released the claim",
+                    ) {
+                        eventDao.count() == eventsBefore + 1
+                    }
+                } finally {
+                    runCatching { successor.close() }
+                }
+            } finally {
+                captureLogDao.insertBlockLatch = null
+                writerLatch.countDown()
+                latch.countDown()
+            }
+        }
+
+    @Test
+    fun journalBudget_burstOfDrops_totalWaitBoundedPerEpisode() = runBlocking {
+        // Audit 7239229553 (A06): one callback can offer MANY
+        // incident records (a burst of saturation drops). With
+        // the journal store artificially slow (3 s per write),
+        // ten consecutive dropping captures share ONE budget
+        // window: their TOTAL journal waiting stays near
+        // JOURNAL_CALLBACK_BUDGET_MS — not ten per-record
+        // waits. Every skipped wait is counted as journal lag,
+        // and once the store heals the journal still catches
+        // up exactly (a successor finds no UNKNOWN_LOSS).
+        val health = FakeCaptureHealthStore()
+        health.journalWriteDelayMs = 3_000
+        coordinator = newCoordinator(healthStore = health)
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            val started = System.currentTimeMillis()
+            for (i in 4..13) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            val elapsed = System.currentTimeMillis() - started
+            assertTrue(
+                "a 10-record burst waits one budget window, not ten " +
+                    "(was ${elapsed}ms)",
+                elapsed < 1_500,
+            )
+            assertEquals(10, coordinator.counters().droppedOverflow)
+            awaitCondition("skipped waits counted as journal lag") {
+                coordinator.counters().healthJournalTimeouts >= 3
+            }
+        } finally {
+            latch.countDown()
+        }
+        health.journalWriteDelayMs = 0
+        coordinator.close()
+        awaitCondition("journal caught up after the store healed", 15_000L) {
+            val j = JSONObject(health.journal ?: "{}")
+            val d = JSONObject(health.doc ?: "{}")
+            j.optLong("offered", 0L) - j.optLong("dropped", 0L) ==
+                d.optLong("applied_count", 0L)
+        }
+        val successor = newCoordinator(healthStore = health)
+        try {
+            successor.flushHealthIncidents(5_000)
+            assertEquals(
+                "no unknown loss once the journal caught up",
+                null, health.incident(CaptureIncidentCategory.UNKNOWN_LOSS),
+            )
+        } finally {
+            runCatching { successor.close() }
+        }
+    }
+
+    @Test
+    fun reconcile_livePredecessorPending_noFalseUnknownLoss_claimedOnceAfterStop() =
+        runBlocking {
+            // Audit 7239229553 (A06): startup reconciliation
+            // must not call a LIVE predecessor's pending records
+            // a dead process's loss. Phase 1: the predecessor's
+            // health writer is parked inside a durable write
+            // with records still unapplied while a successor
+            // starts — no UNKNOWN_LOSS may appear, neither while
+            // parked nor after the predecessor applies them.
+            // Phase 2: a second predecessor stops with records
+            // never applied — the next start claims the gap
+            // exactly once, and the start after that claims
+            // nothing more (no double counting).
+            val health = FakeCaptureHealthStore()
+            val gate = CountDownLatch(1)
+            health.healthWriteBlockLatch = gate
+            coordinator = newCoordinator(healthStore = health)
+            val latch = blockExecutorWith(POST_TIME)
+            try {
+                for (i in 1..3) {
+                    coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+                }
+                captureLogDao.failNextInserts.set(Int.MAX_VALUE)
+                coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+                awaitCondition("overflow record given up") {
+                    coordinator.counters().overflowRecordDropped == 1L
+                }
+                awaitCondition(
+                    "predecessor health writer parked in its durable write",
+                ) {
+                    health.healthWriteEntered.get() >= 1
+                }
+            } finally {
+                captureLogDao.failNextInserts.set(0)
+                latch.countDown()
+            }
+            val successor = newCoordinator(healthStore = health)
+            try {
+                Thread.sleep(800)
+                assertEquals(
+                    "a live predecessor's pending records are not a loss",
+                    null, health.incident(CaptureIncidentCategory.UNKNOWN_LOSS),
+                )
+                gate.countDown()
+                health.healthWriteBlockLatch = null
+                awaitCondition("predecessor's pending records applied") {
+                    health.incident(
+                        CaptureIncidentCategory.OVERFLOW_RECORD_LOST,
+                    ) != null
+                }
+                successor.flushHealthIncidents(5_000)
+                assertEquals(
+                    "still no unknown loss after the predecessor applied them",
+                    null, health.incident(CaptureIncidentCategory.UNKNOWN_LOSS),
+                )
+            } finally {
+                gate.countDown()
+                health.healthWriteBlockLatch = null
+                runCatching { successor.close() }
+            }
+            coordinator.close()
+
+            // Phase 2: records offered, never applied, owner stopped.
+            health.failDocWrites = true
+            val predecessor2 = newCoordinator(healthStore = health)
+            coordinator = predecessor2
+            val latch2 = CountDownLatch(1)
+            modeReaderLatch = latch2
+            try {
+                val eventsBefore = eventDao.count()
+                predecessor2.capture(snapshot(postTime = POST_TIME + 200_000L))
+                awaitCondition("second predecessor blocker staged") {
+                    eventDao.count() == eventsBefore + 1
+                }
+                for (i in 1..3) {
+                    predecessor2.capture(
+                        snapshot(postTime = POST_TIME + 200_000L + i * 1_000L),
+                    )
+                }
+                captureLogDao.failNextInserts.set(Int.MAX_VALUE)
+                predecessor2.capture(snapshot(postTime = POST_TIME + 204_000L))
+                awaitCondition("second predecessor record given up") {
+                    predecessor2.counters().overflowRecordDropped == 1L
+                }
+                // Give its health writer time to attempt (and
+                // fail) the durable applications.
+                Thread.sleep(1_000)
+            } finally {
+                captureLogDao.failNextInserts.set(0)
+                latch2.countDown()
+                modeReaderLatch = null
+            }
+            predecessor2.close()
+            health.failDocWrites = false
+            val journal = JSONObject(health.journal ?: "{}")
+            val docNow = JSONObject(health.doc ?: "{}")
+            val expectedGap = journal.optLong("offered", 0L) -
+                journal.optLong("dropped", 0L) -
+                docNow.optLong("applied_count", 0L)
+            assertTrue("phase 2 left a real gap", expectedGap > 0L)
+            val claimer = newCoordinator(healthStore = health)
+            try {
+                awaitCondition("gap claimed once the owner has stopped") {
+                    health.incident(CaptureIncidentCategory.UNKNOWN_LOSS) != null
+                }
+                assertEquals(
+                    "the claimed count is exact",
+                    expectedGap,
+                    health.incident(CaptureIncidentCategory.UNKNOWN_LOSS)
+                        ?.optLong("count"),
+                )
+            } finally {
+                runCatching { claimer.close() }
+            }
+            val second = newCoordinator(healthStore = health)
+            try {
+                // Reconciliation is the second instance's health
+                // writer's first action; give it time to run,
+                // then the claim must be unchanged.
+                Thread.sleep(1_500)
+                second.flushHealthIncidents(5_000)
+                assertEquals(
+                    "the claim is not repeated by the next start",
+                    expectedGap,
+                    health.incident(CaptureIncidentCategory.UNKNOWN_LOSS)
+                        ?.optLong("count"),
+                )
+            } finally {
+                runCatching { second.close() }
+            }
+        }
+
 }
