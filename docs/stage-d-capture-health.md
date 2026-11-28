@@ -29,8 +29,11 @@ two layers:
 Incidents aggregate by (category, status, identity) — the
 identity is empty for aggregate component incidents and an
 **observation identity** for per-snapshot loss incidents:
-`obs:<sha256>` over package + post time + the SHA-256 of the
-snapshot's combined text (audit 7235948077, A05). The old
+`obs:` + HMAC-SHA-256 over package + post time + the SHA-256
+of the snapshot's combined text, keyed from the SecretVault
+(audit 7237720579, A05/A06 — the earlier unkeyed form let a
+correct guess of a low-entropy text be verified offline
+against the stored value; the keyed form cannot). The old
 `<package>@<postTimeMs>` identity collided across distinct
 notifications sharing a package and a millisecond, so an
 unrelated record landing could falsely "recover" an earlier
@@ -95,7 +98,14 @@ predecessor's fence, and never bypasses anything else. If the
 store cannot be READ, the successor waits fail-safe: an
 unverifiable fence is never treated as no fence. All
 read-modify-writes serialise process-wide (a file lock in
-production), not per coordinator instance.
+production), not per coordinator instance. Since audit
+7239229553 the durable fence is additionally backed by a
+process-wide in-memory ownership claim
+(`CaptureOwnershipRegistry`): claimed by a predecessor whose
+bounded close gives up with threads alive, before any durable
+write is attempted, and consulted by successors before the
+durable records — so exclusion no longer depends on a fence
+write succeeding (see the 7239229553 section below).
 `degradedState().successorFenced` reports an active — or
 unknown — fence as degradation.
 
@@ -114,7 +124,11 @@ Tightened by the PR #5 audit of 28 Nov 2026:
   journal's own sync is bounded too — since audit 7237720579
   it runs on a dedicated journal thread and the offering
   caller waits at most `JOURNAL_WRITE_BOUND_MS` (250 ms) per
-  sync, at most twice per offer (see the A06 section below).
+  sync, at most twice per offer; since audit 7239229553 all
+  offers joining one sync episode additionally share a single
+  `JOURNAL_CALLBACK_BUDGET_MS` (500 ms) window, so a
+  multi-record callback's total waiting is bounded per
+  callback, not per record (see the A06 sections below).
 - **Durable acceptance boundary.** An incident is ACCEPTED
   (durable) only when its `writeCaptureHealth` call has
   RETURNED — production writes with `SharedPreferences`
@@ -138,7 +152,12 @@ Tightened by the PR #5 audit of 28 Nov 2026:
   anything, the health writer reconciles: `offered − dropped
   − applied` is the exact count of incident records lost
   before the durable boundary, recorded as one aggregate
-  `UNKNOWN_LOSS` incident (see the category table).
+  `UNKNOWN_LOSS` incident (see the category table). Since
+  audit 7239229553 the reconciliation is PER-INSTANCE: a gap
+  is claimed only for an owner whose termination is
+  established, and a still-live owner's pending offers are
+  deferred rather than falsely reported (see that section
+  below).
   Queue-saturation drops are journaled as known-dropped at
   the moment they happen, so they are never double-reported
   as unknown. What the gap counts is stated precisely in the
@@ -365,6 +384,134 @@ Three residual findings from the independent audit of head
   instances over one store by
   `overlappingInstances_journalTotalsExact_noUnknownLoss`;
   no cross-instance claim beyond that construction is made.
+
+## Audit 7239229553 (28 Nov): authoritative ownership, corroborated death proof, per-callback budget, per-instance reconciliation
+
+The follow-up audit of head `5073dbd` kept A03 and A06 open
+with harder acceptance criteria. What changed:
+
+- **A03 — exclusion is now authoritative and independent of
+  persistence.** The previous round's corner was real: when
+  BOTH fence write channels failed (lifecycle record AND
+  health document) while predecessor threads were still
+  alive, the fence existed nowhere durable, and
+  logging/degraded state — the only trace — is not exclusion.
+  Now, at the moment a bounded close gives up with pipeline
+  threads alive, the predecessor FIRST claims ownership in
+  `CaptureOwnershipRegistry`: process memory, claimed before
+  any durable write is attempted, released only when both
+  pipeline threads have actually exited (their exit handlers
+  release it, also in memory, so a store failure cannot
+  strand the claim either). A successor consults the registry
+  BEFORE the durable records: while a foreign claim stands it
+  waits — it does not stage and does not write — whatever the
+  records say, including a cleanly inactive or missing fence.
+  The durable fence (lifecycle record, document fallback,
+  schema validation, `FENCE_PUBLISH_FAILED` visibility) is
+  unchanged and remains the cross-process evidence; the
+  registry is the in-process authority. **Construction
+  boundary, stated plainly:** the registry is authoritative
+  within one process — which is exactly the shape of the
+  failure it closes, because a predecessor whose threads
+  still live is a predecessor in a living process, and its
+  successor in that process sees the claim. A successor in a
+  NEW process starts only after the old process died (the
+  Android process model for this app), when the predecessor's
+  threads are dead by construction; that transition still
+  rests on the durable fence plus the tri-state death proof.
+  Proven by
+  `dualWriteFailure_livePredecessorClaim_successorCannotWorkUntilThreadsExit`:
+  both channels failing, a live stuck writer, a successor
+  that attempts a capture and cannot stage, then proceeds
+  once the predecessor's threads exit.
+- **A03 — /proc death proof is corroborated, not a single
+  negative probe.** The audit rejected `File.exists()` false
+  as positive proof of absence under restricted visibility.
+  The liveness read now classifies failures by kind through
+  `java.nio.file`: `NoSuchFileException` (the open's own
+  ENOENT) is the only absence signal; every other failure
+  (EACCES, I/O, a directory in place of the stat) is UNKNOWN.
+  And a single ENOENT is still not enough: DEAD by absence
+  requires corroboration — a listing of the proc root that
+  SUCCEEDS and does not contain the pid, plus a second,
+  independent stat read that also returns ENOENT. A pid whose
+  directory is present but whose stat is missing is UNKNOWN
+  (the subject is there; its stat is not — visibility, not
+  death). Scope of the proof, stated plainly: the fence only
+  ever asks about this app's OWN predecessor process (same
+  UID); kernel hidepid filtering applies across UIDs, not
+  within one UID, so for a same-UID subject a corroborated
+  ENOENT is positive absence, and denials that do apply to a
+  same-UID subject surface as non-ENOENT failures → UNKNOWN.
+  Proven against a real fake directory tree (not an injected
+  enum) by `processLiveness_fakeProcRoot_absenceMustBeCorroborated`
+  and `processLiveness_fakeProcRoot_permissionDeniedIsUnknown`.
+- **A06 — callback latency is bounded per callback, not per
+  record.** The 250 ms per-sync bound still let one listener
+  callback wait again for every record it offered (a burst of
+  saturation drops = many records). All offers joining the
+  same in-flight journal sync now share ONE budget window,
+  `JOURNAL_CALLBACK_BUDGET_MS` = **500 ms**: once the window
+  is spent, further offers return without waiting (the sync
+  lands late; each skipped wait is counted as journal lag).
+  Total caller waiting attributable to one sync episode is
+  therefore ≤ 500 ms however many records the callback
+  offers during it. Proven by
+  `journalBudget_burstOfDrops_totalWaitBoundedPerEpisode`
+  (ten dropping captures against a 3 s journal write complete
+  in one window, lag counted, journal exact after healing).
+- **A06 — the residual durability/nonblocking tradeoff,
+  stated for owner review.** An offer is undetectable at the
+  next start only if the process dies after the offer but
+  before EITHER durable channel lands — the journal sync, or
+  the health writer's application of the queued operation
+  (which stamps the document's applied counts in the same
+  write as the incident itself). Both channels start at offer
+  time and each is a single minimal `commit()`; on a healthy
+  store the window is zero. Under failing storage the lagging
+  state is surfaced in-process, but a kill inside that state
+  can still lose the KNOWLEDGE of an offer. That is the
+  tradeoff this design accepts — bounded, nonblocking ingress
+  with a next-start-detectable gap, over an unbounded
+  synchronous commit on the listener thread — and it is
+  recorded here for the owner's explicit review. No zero-loss
+  claim is made for that corner.
+- **A06 — reconciliation is per-instance; a live predecessor
+  is never counted as a loss.** The journal now attributes
+  every offer/drop to the instance (and process) that made it
+  (`instances` in the journal value), and the document
+  attributes applications the same way (`applied_by`). A
+  successor's startup reconciliation may claim an owner's gap
+  as `UNKNOWN_LOSS` only once that owner's termination is
+  ESTABLISHED: a same-process owner must have left
+  `CaptureLiveInstances` (registered at construction,
+  unregistered when its health writer terminates — the point
+  after which it can never apply another record); a
+  cross-process owner must be provably DEAD by the tri-state
+  proof. While termination is not established the gap is
+  DEFERRED untouched — the owner may still apply its pending
+  records itself — and a later start claims it exactly once
+  (`reconciled_by` is the durable claim marker; no false
+  `UNKNOWN_LOSS`, no double counting). Journals written
+  before attribution existed reconcile by the legacy global
+  rule, the only reading their data supports. Proven by
+  `reconcile_livePredecessorPending_noFalseUnknownLoss_claimedOnceAfterStop`:
+  a live predecessor parked mid-write with records pending
+  produces no `UNKNOWN_LOSS` at a successor's start nor after
+  it applies them; a stopped predecessor's unapplied gap is
+  then claimed exactly once with the exact count.
+- **A05 — verification items noted (no design change).** The
+  auditor accepted the keyed (HMAC) observation identity
+  structurally and recorded key-loss/rotation and legacy
+  identity migration as verification items. Stated here so
+  the behaviour is explicit: if the SecretVault key is lost
+  or rotated, identities persisted under the old key can no
+  longer be re-derived, so identity-keyed incidents from
+  before the rotation cannot be reconciled by a later rescan
+  (they stay OPEN until an operator disposition); identities
+  persisted by pre-keying builds (the unkeyed form) likewise
+  never match a keyed re-derivation. The mechanism is
+  unchanged this round by design.
 
 ## What is NOT claimed
 
