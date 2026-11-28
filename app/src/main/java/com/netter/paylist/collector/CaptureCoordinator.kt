@@ -138,6 +138,21 @@ data class CaptureCounters(
      * never die silently and strand the outstanding accounting.
      */
     val overflowWriterFailures: Long = 0,
+    /**
+     * Persistent-health incidents that could not be queued for
+     * the health writer (PR #5 audit 28 Nov, comment 7229800304):
+     * the bounded incident queue was full, or the health writer
+     * had already terminated. The incident is then evidenced only
+     * by this counter + a local log line — counted, never silent.
+     */
+    val healthIncidentsDropped: Long = 0,
+    /**
+     * Capture-health store accesses that failed (read, parse or
+     * durable write) — the persistent layer could not be read or
+     * updated, and the failure is surfaced here and in
+     * [CaptureDegradedState] instead of being swallowed.
+     */
+    val healthStoreFailures: Long = 0,
 )
 
 /**
@@ -188,6 +203,36 @@ data class CaptureDegradedState(
      * must not process captures until the fence clears.
      */
     val successorFenced: Boolean = false,
+    /**
+     * The unresolved LOSSES, exposed independently of component
+     * health (PR #5 audit 28 Nov, comment 7229800304): persistent
+     * incidents that represent a specific snapshot whose outcome
+     * is lost or unknown — OPEN `OVERFLOW_RECORD_LOST` and
+     * `UNRESOLVED_AT_CLOSE` incidents (identity-keyed), plus
+     * UNRECOVERABLE `PRE_STAGE_INTERRUPTED` ones. A component
+     * recovering (e.g. the database accepting inserts again)
+     * never removes an entry here; only identity-level
+     * reconciliation or an explicit operator disposition
+     * ([CaptureCoordinator.dismissIncident]) does.
+     */
+    val unresolvedLosses: List<CaptureIncident> = emptyList(),
+)
+
+/**
+ * Outcome of one staging-sweep pass (audit P1-3): per-row
+ * results, so recovery claims can be keyed to what the sweep
+ * actually resolved — a pass with failed or held rows, or with
+ * no rows at all, proves nothing about an unresolved capture.
+ */
+data class SweepResult(
+    /** Staging rows present when the pass started. */
+    val rowsSeen: Int,
+    /** Rows terminally resolved (promoted, or deliberately deleted as already-promoted/corrupt). */
+    val rowsResolved: Int,
+    /** Rows whose processing threw (they stay staged for the next pass). */
+    val rowsFailed: Int,
+    /** Rows deliberately NOT resolved (payload mismatch hold, or a failed promotion). */
+    val rowsHeld: Int,
 )
 
 /** Incident categories in the persistent capture-health document. */
@@ -209,6 +254,12 @@ object CaptureIncidentCategory {
 
     /** A capture was interrupted by close() before its staging outcome was confirmed. */
     const val PRE_STAGE_INTERRUPTED: String = "pre_stage_interrupted"
+
+    /** The stored health document did not parse; its raw value was quarantined, not discarded. */
+    const val HEALTH_DOC_CORRUPT: String = "health_doc_corrupt"
+
+    /** A successor cleared a fence whose owner process was provably dead (an orphaned fence). */
+    const val FENCE_ORPHAN_CLEARED: String = "fence_orphan_cleared"
 }
 
 /** Lifecycle of a persistent capture incident. */
@@ -232,22 +283,118 @@ data class CaptureIncident(
     val count: Long,
     /** Metadata only (package + post time + component) — never notification text. */
     val detail: String,
+    /**
+     * Per-snapshot identity (`<package>@<postTimeMs>`) for
+     * loss/unknown incidents (PR #5 audit 28 Nov): recovery of
+     * such an incident is keyed to THIS identity — proof about a
+     * different snapshot never recovers it. Empty for aggregate
+     * component-health incidents (e.g. DB_PERMANENT_FAILURE).
+     */
+    val identity: String = "",
 )
 
 /**
+ * Identity of an OS process: PID + process start time (clock
+ * ticks since boot, field 22 of `/proc/<pid>/stat`). PID +
+ * start time cannot collide for two distinct processes, and a
+ * reused PID is detected by the start-time mismatch — the same
+ * identity the process-death oracle's markers carry.
+ */
+data class CaptureProcessIdentity(val pid: Int, val startTicks: Long)
+
+/**
+ * Reads process identities from `/proc` (works for the app's own
+ * process on Android and on a Linux JVM). Anything unreadable
+ * degrades to the UNKNOWN identity (-1, -1), which is always
+ * treated as ALIVE by [isAlive]: death must be PROVEN, never
+ * assumed (fail-safe).
+ */
+object CaptureProcessIdentitySource {
+    fun current(): CaptureProcessIdentity {
+        val stat = runCatching {
+            java.io.File("/proc/self/stat").readText()
+        }.getOrNull() ?: return CaptureProcessIdentity(-1, -1)
+        val pid = stat.substringBefore(' ').toIntOrNull() ?: -1
+        return CaptureProcessIdentity(pid, startTicksOf(stat))
+    }
+
+    /** True unless [identity]'s process is PROVABLY gone (or its PID was reused). */
+    fun isAlive(identity: CaptureProcessIdentity): Boolean {
+        if (identity.pid <= 0 || identity.startTicks < 0) return true
+        val stat = runCatching {
+            java.io.File("/proc/${identity.pid}/stat").readText()
+        }.getOrNull() ?: return false
+        val start = startTicksOf(stat)
+        if (start < 0) return true
+        return start == identity.startTicks
+    }
+
+    private fun startTicksOf(stat: String): Long {
+        // Field 22 overall = index 19 of the fields after the
+        // last ") " (comm may itself contain spaces/parens).
+        val afterComm = stat.substringAfterLast(") ").split(" ")
+        return afterComm.getOrNull(19)?.toLongOrNull() ?: -1L
+    }
+}
+
+/** The default process-wide health-document lock (one JVM). */
+object CaptureHealthLock {
+    private val lock = ReentrantLock()
+    fun <T> withLock(block: () -> T): T = lock.withLock(block)
+}
+
+/**
  * Durable store for the capture-health document (PR #5 re-review
- * 28 Nov): a single JSON document holding the persistent
- * incidents + the successor fence. Production backs this with
- * the `paylist` SharedPreferences (the [com.netter.paylist.Store]
- * pattern — `apply()`, never a blocking commit on a caller
- * thread); tests use an in-memory fake. Reads/writes are
- * synchronous and cheap; the coordinator serialises them under
- * its health lock and treats every access as best-effort (a
- * failing health store must never break capture).
+ * 28 Nov; durability contract tightened by the PR #5 audit of
+ * 28 Nov, comment 7229800304): a single JSON document holding
+ * the persistent incidents + the successor fence.
+ *
+ * DURABLE ACCEPTANCE BOUNDARY (the audit's terms): a health
+ * mutation is ACCEPTED (durable) only when [writeCaptureHealth]
+ * has RETURNED normally. Production therefore writes with
+ * `SharedPreferences.commit()` on the dedicated health-writer
+ * thread — the previous `apply()` was an in-memory update whose
+ * disk flush a SIGKILL could beat, i.e. not an acknowledgement.
+ * Callers never write on a caller/ingress thread: incidents are
+ * offered to a bounded queue and the health writer performs the
+ * durable writes. RESIDUAL PRE-DURABLE LOSS, stated honestly: an
+ * incident offered to the queue but not yet written when the
+ * process dies IS lost — the queue is the pre-durable window,
+ * exactly like RECEIVED vs ACCEPTED for captures. [readCaptureHealth]
+ * and [writeCaptureHealth] signal failure by THROWING; the
+ * coordinator counts and surfaces every failure (never a silent
+ * reset, never a blind overwrite of an unreadable document).
+ *
+ * PROCESS-SCOPED SERIALISATION: every read-modify-write of the
+ * document runs inside [withCaptureHealthLock]. The default is a
+ * JVM-wide lock (one app process); production overrides it with
+ * a file lock so predecessor/successor processes serialise too.
+ * A per-coordinator lock cannot do this job (the audit's point:
+ * predecessor and successor are different instances, possibly
+ * different processes).
  */
 interface CaptureHealthStore {
+    /** The stored document, or null when none was ever written. Throws on read failure. */
     fun readCaptureHealth(): String?
+
+    /**
+     * Durably persists [json]: returns only after the value is
+     * committed to durable storage; throws on failure (a false
+     * commit result is a throw, not a silent no-op).
+     */
     fun writeCaptureHealth(json: String)
+
+    /** Identity of the process that owns this store handle. */
+    fun processIdentity(): CaptureProcessIdentity =
+        CaptureProcessIdentitySource.current()
+
+    /** True unless [identity]'s process is provably dead (see [CaptureProcessIdentitySource]). */
+    fun isProcessAlive(identity: CaptureProcessIdentity): Boolean =
+        CaptureProcessIdentitySource.isAlive(identity)
+
+    /** Serialises health-document read-modify-writes across the whole process. */
+    fun <T> withCaptureHealthLock(block: () -> T): T =
+        CaptureHealthLock.withLock(block)
 }
 
 /**
@@ -427,6 +574,29 @@ class CaptureCoordinator(
         /** Periodic staging-sweep interval (matches the 15-minute periodic work). */
         const val SWEEP_INTERVAL_MINUTES: Long = 15
 
+        /** Bounded queue of pending persistent-health incidents (health-writer thread). */
+        const val INCIDENT_QUEUE_CAPACITY: Int = 100
+
+        /** Bounded wait for the health writer to drain during [close]. */
+        const val HEALTH_FLUSH_TIMEOUT_MS: Long = 2_000
+
+        /** Bounded join of the health writer at the end of [close]. */
+        const val HEALTH_WRITER_JOIN_TIMEOUT_MS: Long = 1_000
+
+        /** Successor-fence evaluation poll interval. */
+        const val FENCE_POLL_MS: Long = 25
+
+        /**
+         * A v1 fence carries no process identity, so its owner's
+         * death cannot be proven; it is treated as stale only
+         * when far older than any bounded close (whose joins
+         * total ~12 s) could leave a live thread behind.
+         */
+        const val LEGACY_FENCE_MAX_AGE_MS: Long = 600_000
+
+        /** Cap on the quarantined raw health document kept as evidence. */
+        const val MAX_QUARANTINED_RAW_CHARS: Int = 4_000
+
         /** The legacy `dedupe_key` formula (v2.3, C3 — unchanged). */
         fun legacyDedupeKey(pkg: String, postTimeMs: Long, amount: Long, combined: String): String =
             "$pkg|$postTimeMs|$amount|${combined.take(40).hashCode()}"
@@ -462,6 +632,17 @@ class CaptureCoordinator(
     private val unresolvedAtClose = AtomicLong()
     private val preStageInterruptedAtClose = AtomicLong()
     private val overflowWriterFailures = AtomicLong()
+    private val healthIncidentsDropped = AtomicLong()
+    private val healthStoreFailures = AtomicLong()
+    private val healthDocCorruptions = AtomicLong()
+
+    /** A stored health document failed to parse at least once (see [degradedState]). */
+    @Volatile
+    private var healthDocCorruptSeen: Boolean = false
+
+    /** A fence evaluation found the health store unreadable (fail-safe wait in progress). */
+    @Volatile
+    private var healthStoreUnreadable: Boolean = false
 
     /** This coordinator instance's identity in the health document's fence. */
     private val instanceId: String = UUID.randomUUID().toString()
@@ -851,54 +1032,385 @@ class CaptureCoordinator(
      * counter + [CaptureCounters.overflowRecordDropped] — never
      * silent either way.
      */
-    // --- Persistent capture health (PR #5 re-review 28 Nov) ---
+    // --- Persistent capture health (PR #5 re-review 28 Nov;
+    // durability + recovery-proof contract tightened by the
+    // PR #5 audit of 28 Nov, comment 7229800304) ---
     //
     // The volatile counters above die with the process. The
     // reviewer required the degraded state to be an incident /
     // recovery record that PERSISTS, is operator-visible, and
     // survives restart — so every terminal capture failure also
     // lands in the health document behind [healthStore]:
-    // incidents aggregate by (category, status), distinguish
-    // OPEN (still degrading) from RECOVERED (the failing
-    // component demonstrably worked again) from UNRECOVERABLE
-    // (an outcome that can never be retroactively confirmed),
-    // and the document carries the successor fence. All access
-    // is best-effort: a failing health store never breaks
-    // capture, and no notification text is ever written into it
+    // incidents aggregate by (category, status, identity),
+    // distinguish OPEN (still degrading) from RECOVERED (proof
+    // at the same granularity: component health for component
+    // incidents, the exact snapshot identity for loss incidents)
+    // from UNRECOVERABLE (an outcome that can never be
+    // retroactively confirmed), and the document carries the
+    // successor fence.
+    //
+    // Three audit rules govern every access:
+    // 1. BOUNDED NONBLOCKING INGRESS: no caller thread (above
+    //    all not the listener Binder thread via [recordOverflow])
+    //    ever performs health I/O. Incidents are OFFERED to a
+    //    bounded queue; the dedicated health-writer thread does
+    //    the durable writes. An offer that cannot be queued is
+    //    counted ([CaptureCounters.healthIncidentsDropped]) and
+    //    logged — never silent, never blocking.
+    // 2. NO SILENT RESET, NO BLIND OVERWRITE: a store read that
+    //    FAILS aborts the mutation (the unread document is never
+    //    clobbered); a stored value that does not PARSE is
+    //    quarantined — its raw text is carried into the fresh
+    //    document as evidence and a HEALTH_DOC_CORRUPT incident
+    //    is recorded — instead of being silently reset.
+    // 3. FAILURES ARE STATE: every store failure is counted
+    //    ([CaptureCounters.healthStoreFailures]) and surfaced in
+    //    [degradedState]; a failing health store never breaks
+    //    capture itself, but it is never invisible either.
+    // No notification text is ever written into the document
     // (metadata only: package + post time + component).
     // (healthLock itself is declared next to instanceId, before
-    // the thread properties — see its comment.)
+    // the thread properties — see its comment. It is the INNER
+    // lock; the store's process-wide lock is always taken first.)
 
-    private fun loadHealthDoc(): JSONObject {
-        val raw = runCatching { healthStore?.readCaptureHealth() }.getOrNull()
-        if (!raw.isNullOrBlank()) {
-            runCatching { JSONObject(raw) }.getOrNull()?.let { return it }
+    /** A loaded health document; [corruptRaw] is the unparseable stored value, if any. */
+    private class LoadedHealthDoc(val doc: JSONObject, val corruptRaw: String?)
+
+    private fun emptyHealthDoc(): JSONObject = JSONObject().apply {
+        put("version", 2)
+        put(
+            "fence",
+            JSONObject().apply {
+                put("active", false)
+                put("owner", "")
+                put("owner_pid", 0)
+                put("owner_start", -1L)
+                put("since_ms", 0L)
+                put("worker_alive", false)
+                put("writer_alive", false)
+                put("reason", "")
+            },
+        )
+        put("incidents", JSONArray())
+    }
+
+    /**
+     * Loads the health document (caller holds the store lock).
+     * Returns null ONLY when the store read itself failed — the
+     * caller must then abort any write (fail-safe: never clobber
+     * a document that could not be read). An unparseable stored
+     * value is quarantined into the fresh document (see the
+     * section comment), never silently dropped.
+     */
+    private fun loadHealthDocLocked(): LoadedHealthDoc? {
+        val raw = try {
+            healthStore?.readCaptureHealth()
+        } catch (t: Throwable) {
+            healthStoreFailures.incrementAndGet()
+            logSafely(
+                "capture-health: pembacaan dokumen gagal " +
+                    "(${t.javaClass.simpleName}) — mutasi dibatalkan agar " +
+                    "dokumen yang tidak terbaca tidak tertimpa buta",
+            )
+            return null
         }
-        return JSONObject().apply {
-            put("version", 1)
-            put(
-                "fence",
+        if (raw.isNullOrBlank()) return LoadedHealthDoc(emptyHealthDoc(), null)
+        return try {
+            LoadedHealthDoc(JSONObject(raw), null)
+        } catch (e: Exception) {
+            healthDocCorruptions.incrementAndGet()
+            healthDocCorruptSeen = true
+            val doc = emptyHealthDoc()
+            doc.put(
+                "quarantine",
                 JSONObject().apply {
-                    put("active", false)
-                    put("owner", "")
-                    put("since_ms", 0L)
-                    put("worker_alive", false)
-                    put("writer_alive", false)
-                    put("reason", "")
+                    put("raw", raw.take(MAX_QUARANTINED_RAW_CHARS))
+                    put("truncated", raw.length > MAX_QUARANTINED_RAW_CHARS)
+                    put("at_ms", clock())
+                    put(
+                        "note",
+                        "dokumen kesehatan sebelumnya tidak dapat di-parse; " +
+                            "nilai mentahnya dipertahankan di sini sebagai bukti, " +
+                            "bukan dibuang diam-diam",
+                    )
                 },
             )
-            put("incidents", JSONArray())
+            LoadedHealthDoc(doc, raw)
         }
     }
 
-    private fun mutateHealth(block: (JSONObject) -> Unit) {
+    /**
+     * One serialised health-document read-modify-write: the
+     * store's process-wide lock outside, this instance's
+     * [healthLock] inside (the only order ever taken). Returns
+     * true when the mutation was durably written (the store's
+     * acceptance boundary — see [CaptureHealthStore]). A read
+     * failure aborts without writing; a write failure is
+     * counted + logged. Either way capture itself never breaks.
+     */
+    private fun mutateHealth(block: (JSONObject) -> Unit): Boolean {
+        val store = healthStore ?: return false
+        var corruptRaw: String? = null
+        val ok = try {
+            store.withCaptureHealthLock {
+                healthLock.withLock {
+                    val loaded = loadHealthDocLocked()
+                        ?: return@withLock false
+                    corruptRaw = loaded.corruptRaw
+                    block(loaded.doc)
+                    loaded.doc.put("updated_ms", clock())
+                    store.writeCaptureHealth(loaded.doc.toString())
+                    true
+                }
+            }
+        } catch (t: Throwable) {
+            healthStoreFailures.incrementAndGet()
+            logSafely(
+                "capture-health: penulisan dokumen gagal " +
+                    "(${t.javaClass.simpleName}: ${t.message?.take(80)}) — " +
+                    "status persisten tidak terbarui; kegagalan tercatat, " +
+                    "capture tidak terpengaruh",
+            )
+            false
+        }
+        if (ok && corruptRaw != null) {
+            recordIncident(
+                CaptureIncidentCategory.HEALTH_DOC_CORRUPT,
+                CaptureIncidentStatus.OPEN,
+                "dokumen kesehatan rusak (${corruptRaw!!.length} char) — " +
+                    "nilai mentah di-quarantine di dalam dokumen baru, " +
+                    "tidak dibuang diam-diam",
+            )
+        }
+        return ok
+    }
+
+    /**
+     * Read-only load for diagnostics/fence evaluation: the
+     * parsed document, or null when the store read failed or
+     * the value does not parse. Never writes, never quarantines
+     * (that happens on the next mutation); a corrupt value sets
+     * the volatile corrupt-seen flag for [degradedState].
+     */
+    private fun readHealthDoc(): JSONObject? {
+        val store = healthStore ?: return null
+        return try {
+            store.withCaptureHealthLock {
+                val raw = store.readCaptureHealth()
+                if (raw.isNullOrBlank()) {
+                    emptyHealthDoc()
+                } else {
+                    try {
+                        JSONObject(raw)
+                    } catch (e: Exception) {
+                        healthDocCorruptSeen = true
+                        null
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    // --- Health-writer thread: bounded nonblocking ingress ---
+    //
+    // Every persistent-incident mutation from a pipeline path
+    // is an OFFER to this queue (audit rule 1 above); the single
+    // health-writer thread applies the queued operations, in
+    // order, through [mutateHealth]. Lifecycle mirrors the
+    // overflow writer: [close] flushes (bounded) then terminates
+    // it; the termination handshake under [healthStateLock]
+    // guarantees an offer can never land in a queue whose writer
+    // has already decided to exit — such an offer is counted as
+    // dropped instead.
+
+    /** One queued persistent-health mutation (applied in queue order). */
+    private sealed interface HealthOp {
+        /** Record (or aggregate) an incident under [status]. */
+        class Record(
+            val category: String,
+            val status: String,
+            val detail: String,
+            val identity: String,
+        ) : HealthOp
+
+        /**
+         * Close OPEN incidents of [category] as RECOVERED.
+         * [identity] null = component-level (every OPEN incident
+         * of the category); non-null = ONLY the incident whose
+         * per-snapshot identity matches — proof about one
+         * snapshot never recovers another's loss (audit P1-3).
+         */
+        class Recover(val category: String, val identity: String?) : HealthOp
+    }
+
+    private val incidentQueue = LinkedBlockingQueue<HealthOp>(INCIDENT_QUEUE_CAPACITY)
+
+    /** Guards the health-writer termination handshake (see the overflow writer's). */
+    private val healthStateLock = ReentrantLock()
+
+    /** Guarded by [healthStateLock]: the health writer has exited for good. */
+    private var healthWriterTerminated: Boolean = false
+
+    /** Set by [close]: the health writer exits once its queue is drained. */
+    @Volatile
+    private var healthWriterShutdown: Boolean = false
+
+    /** True while the health writer is applying a batch (read by [flushHealthIncidents]). */
+    @Volatile
+    private var healthWriterBusy: Boolean = false
+
+    private val healthWriter = Thread({ healthWriterLoop() }, "paylist-health-writer").apply {
+        isDaemon = true
+        start()
+    }
+
+    private fun healthWriterLoop() {
+        while (true) {
+            val first = try {
+                incidentQueue.poll(100, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                null
+            }
+            if (first == null) {
+                if (healthWriterShutdown) {
+                    val exit = healthStateLock.withLock {
+                        if (incidentQueue.isEmpty()) {
+                            healthWriterTerminated = true
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    if (exit) return
+                }
+                continue
+            }
+            healthWriterBusy = true
+            try {
+                val batch = ArrayList<HealthOp>()
+                batch.add(first)
+                incidentQueue.drainTo(batch)
+                applyHealthOps(batch)
+            } catch (t: Throwable) {
+                // applyHealthOps → mutateHealth already guards
+                // its store access; this outer guard keeps the
+                // writer alive whatever escapes, and the failure
+                // is counted, not silent.
+                healthStoreFailures.incrementAndGet()
+                logSafely(
+                    "capture-health: penulis kesehatan gagal menerapkan batch " +
+                        "(${t.javaClass.simpleName}) — loop tetap hidup",
+                )
+            } finally {
+                healthWriterBusy = false
+            }
+        }
+    }
+
+    /** Applies one drained batch in ONE serialised document mutation. */
+    private fun applyHealthOps(ops: List<HealthOp>) {
+        if (ops.isEmpty()) return
+        mutateHealth { doc ->
+            for (op in ops) {
+                when (op) {
+                    is HealthOp.Record -> applyRecordIncident(doc, op)
+                    is HealthOp.Recover -> applyRecoverIncident(doc, op)
+                }
+            }
+        }
+    }
+
+    /** The document half of incident recording (caller holds the store lock). */
+    private fun applyRecordIncident(doc: JSONObject, op: HealthOp.Record) {
+        val incidents = doc.optJSONArray("incidents") ?: JSONArray()
+            .also { doc.put("incidents", it) }
+        var found: JSONObject? = null
+        for (i in 0 until incidents.length()) {
+            val item = incidents.optJSONObject(i) ?: continue
+            if (item.optString("category") == op.category &&
+                item.optString("status") == op.status &&
+                item.optString("identity") == op.identity
+            ) {
+                found = item
+                break
+            }
+        }
+        val now = clock()
+        if (found != null) {
+            found.put("count", found.optLong("count", 0) + 1)
+            found.put("last_ms", now)
+            found.put("detail", op.detail)
+        } else {
+            incidents.put(
+                JSONObject().apply {
+                    put("category", op.category)
+                    put("status", op.status)
+                    put("first_ms", now)
+                    put("last_ms", now)
+                    put("count", 1L)
+                    put("detail", op.detail)
+                    put("identity", op.identity)
+                },
+            )
+        }
+        // Bound the document: keep at most 50 incidents,
+        // dropping the oldest RECOVERED ones first.
+        while (incidents.length() > 50) {
+            var dropIdx = 0
+            for (i in 0 until incidents.length()) {
+                if (incidents.optJSONObject(i)
+                        ?.optString("status") == CaptureIncidentStatus.RECOVERED
+                ) {
+                    dropIdx = i
+                    break
+                }
+            }
+            incidents.remove(dropIdx)
+        }
+    }
+
+    /** The document half of incident recovery (caller holds the store lock). */
+    private fun applyRecoverIncident(doc: JSONObject, op: HealthOp.Recover) {
+        val incidents = doc.optJSONArray("incidents") ?: return
+        for (i in 0 until incidents.length()) {
+            val item = incidents.optJSONObject(i) ?: continue
+            if (item.optString("category") == op.category &&
+                item.optString("status") == CaptureIncidentStatus.OPEN &&
+                (op.identity == null || item.optString("identity") == op.identity)
+            ) {
+                item.put("status", CaptureIncidentStatus.RECOVERED)
+                item.put("last_ms", clock())
+            }
+        }
+    }
+
+    /**
+     * Offers one health operation to the health writer (audit
+     * rule 1: bounded, nonblocking, no I/O on the caller). An
+     * offer that cannot be queued — full queue, or the writer
+     * already terminated — is counted in
+     * [CaptureCounters.healthIncidentsDropped] and logged: the
+     * pre-durable window is honest about its losses.
+     */
+    private fun enqueueHealthOp(op: HealthOp) {
         if (healthStore == null) return
-        healthLock.withLock {
-            runCatching {
-                val doc = loadHealthDoc()
-                block(doc)
-                doc.put("updated_ms", clock())
-                healthStore?.writeCaptureHealth(doc.toString())
+        healthStateLock.withLock {
+            if (healthWriterTerminated) {
+                healthIncidentsDropped.incrementAndGet()
+                logSafely(
+                    "capture-health: penulis kesehatan sudah berhenti; " +
+                        "operasi kesehatan tidak terantre (dihitung hilang)",
+                )
+                return
+            }
+            if (!incidentQueue.offer(op)) {
+                healthIncidentsDropped.incrementAndGet()
+                logSafely(
+                    "capture-health: antrean insiden penuh; operasi kesehatan " +
+                        "dihitung hilang (bukti: counter + log ini)",
+                )
             }
         }
     }
@@ -908,66 +1420,76 @@ class CaptureCoordinator(
      * is the status the incident is recorded under: OPEN for
      * component failures that can still recover, UNRECOVERABLE
      * for outcomes that can never be confirmed after the fact.
+     * [identity] keys a loss to ONE snapshot (`<pkg>@<postTimeMs>`);
+     * empty = aggregate component incident.
      */
-    private fun recordIncident(category: String, status: String, detail: String) {
-        mutateHealth { doc ->
-            val incidents = doc.optJSONArray("incidents") ?: JSONArray()
-                .also { doc.put("incidents", it) }
-            var found: JSONObject? = null
-            for (i in 0 until incidents.length()) {
-                val item = incidents.optJSONObject(i) ?: continue
-                if (item.optString("category") == category &&
-                    item.optString("status") == status
-                ) {
-                    found = item
-                    break
-                }
-            }
-            val now = clock()
-            if (found != null) {
-                found.put("count", found.optLong("count", 0) + 1)
-                found.put("last_ms", now)
-                found.put("detail", detail)
-            } else {
-                incidents.put(
-                    JSONObject().apply {
-                        put("category", category)
-                        put("status", status)
-                        put("first_ms", now)
-                        put("last_ms", now)
-                        put("count", 1L)
-                        put("detail", detail)
-                    },
-                )
-            }
-            // Bound the document: keep at most 50 incidents,
-            // dropping the oldest RECOVERED ones first.
-            while (incidents.length() > 50) {
-                var dropIdx = 0
-                for (i in 0 until incidents.length()) {
-                    if (incidents.optJSONObject(i)
-                            ?.optString("status") == CaptureIncidentStatus.RECOVERED
-                    ) {
-                        dropIdx = i
-                        break
-                    }
-                }
-                incidents.remove(dropIdx)
+    private fun recordIncident(
+        category: String,
+        status: String,
+        detail: String,
+        identity: String = "",
+    ) {
+        enqueueHealthOp(HealthOp.Record(category, status, detail, identity))
+    }
+
+    /**
+     * Closes OPEN incidents of [category] as RECOVERED. Callers
+     * must pass the granularity their proof actually has
+     * (audit P1-3): [identity] null ONLY for component-health
+     * incidents whose proof is component-level (a landed insert
+     * proves the database works); a snapshot identity for
+     * loss incidents, where only THAT snapshot's reconciliation
+     * is proof.
+     */
+    private fun recoverIncident(category: String, identity: String?) {
+        enqueueHealthOp(HealthOp.Recover(category, identity))
+    }
+
+    /**
+     * Bounded wait until every queued health operation has been
+     * applied (the durable acceptance boundary for incidents:
+     * when this returns, the writes have RETURNED from the
+     * store). Used by [close] and by the process-death harness,
+     * which must know an incident is durable BEFORE the kill.
+     */
+    internal fun flushHealthIncidents(timeoutMs: Long) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (incidentQueue.isEmpty() && !healthWriterBusy) return
+            try {
+                Thread.sleep(5)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return
             }
         }
     }
 
-    /** Closes OPEN incidents of [category] as RECOVERED (the component works again). */
-    private fun recoverIncidents(category: String) {
+    /**
+     * Explicit operator disposition (audit P1-3): acknowledges
+     * ONE OPEN identity incident as UNRECOVERABLE — the loss /
+     * unknown outcome is kept as history and stops holding the
+     * degraded state, WITHOUT claiming the record was recovered.
+     * This is the only non-proof path out of OPEN for identity
+     * losses. Synchronous (an operator action, never a pipeline
+     * path): applied directly, not via the health queue.
+     */
+    fun dismissIncident(category: String, identity: String) {
         mutateHealth { doc ->
             val incidents = doc.optJSONArray("incidents") ?: return@mutateHealth
             for (i in 0 until incidents.length()) {
                 val item = incidents.optJSONObject(i) ?: continue
                 if (item.optString("category") == category &&
-                    item.optString("status") == CaptureIncidentStatus.OPEN
+                    item.optString("status") == CaptureIncidentStatus.OPEN &&
+                    item.optString("identity") == identity
                 ) {
-                    item.put("status", CaptureIncidentStatus.RECOVERED)
+                    item.put("status", CaptureIncidentStatus.UNRECOVERABLE)
                     item.put("last_ms", clock())
+                    item.put(
+                        "detail",
+                        item.optString("detail") +
+                            " [disposisi operator: diakui tidak terkonfirmasi]",
+                    )
                 }
             }
         }
@@ -976,80 +1498,265 @@ class CaptureCoordinator(
     /** The persistent incidents, as recorded (empty without a health store). */
     private fun persistentIncidents(): List<CaptureIncident> {
         if (healthStore == null) return emptyList()
-        return healthLock.withLock {
-            runCatching {
-                val doc = loadHealthDoc()
-                val incidents = doc.optJSONArray("incidents") ?: JSONArray()
-                (0 until incidents.length()).mapNotNull { i ->
-                    val item = incidents.optJSONObject(i) ?: return@mapNotNull null
-                    CaptureIncident(
-                        category = item.optString("category"),
-                        status = item.optString("status"),
-                        firstAtMs = item.optLong("first_ms"),
-                        lastAtMs = item.optLong("last_ms"),
-                        count = item.optLong("count"),
-                        detail = item.optString("detail"),
-                    )
-                }
-            }.getOrDefault(emptyList())
+        val doc = readHealthDoc() ?: return emptyList()
+        val incidents = doc.optJSONArray("incidents") ?: return emptyList()
+        return (0 until incidents.length()).mapNotNull { i ->
+            val item = incidents.optJSONObject(i) ?: return@mapNotNull null
+            CaptureIncident(
+                category = item.optString("category"),
+                status = item.optString("status"),
+                firstAtMs = item.optLong("first_ms"),
+                lastAtMs = item.optLong("last_ms"),
+                count = item.optLong("count"),
+                detail = item.optString("detail"),
+                identity = item.optString("identity"),
+            )
         }
     }
 
     /** True while ANY coordinator's fence is recorded active. */
     private fun fenceRecordedActive(): Boolean {
         if (healthStore == null) return false
-        return healthLock.withLock {
-            runCatching {
-                loadHealthDoc().optJSONObject("fence")?.optBoolean("active") == true
-            }.getOrDefault(false)
-        }
+        return readHealthDoc()?.optJSONObject("fence")
+            ?.optBoolean("active") == true
     }
 
-    /** True while a PREDECESSOR's fence is active (this instance must wait). */
-    private fun predecessorFenceActive(): Boolean {
-        if (healthStore == null) return false
-        return healthLock.withLock {
-            runCatching {
-                val fence = loadHealthDoc().optJSONObject("fence")
-                fence != null && fence.optBoolean("active") &&
-                    fence.optString("owner") != instanceId
-            }.getOrDefault(false)
+    // --- Successor fence (audit P1-1: process-scoped, fail-safe) ---
+    //
+    // The fence owner is a PROCESS identity (PID + start time),
+    // not a random coordinator UUID: a fence left behind by a
+    // process that was SIGKILLed is recognisably STALE (its
+    // process is provably gone, or its PID was reused) and a
+    // fresh process clears it and proceeds — no indefinite
+    // stall. A fence whose owner process is alive is NEVER
+    // bypassed (no fail-open), and an unreadable health store
+    // means WAIT (fail-safe), never "no fence".
+
+    private enum class FenceVerdict { CLEAR, WAIT, WAIT_STORE_UNREADABLE, STALE }
+
+    /**
+     * Is [fence] (from a freshly loaded document) provably
+     * orphaned? Proof, in order: both thread halves are already
+     * cleared (the predecessor's threads exited — their exit IS
+     * the fence's internal proof); or the owner process is
+     * provably dead / its PID reused; or (legacy v1 fence, no
+     * identity recorded) the fence is far older than any bounded
+     * close could leave a live thread behind.
+     */
+    private fun fenceStaleLocked(fence: JSONObject): Boolean {
+        if (!fence.optBoolean("worker_alive") && !fence.optBoolean("writer_alive")) {
+            return true
+        }
+        val store = healthStore ?: return false
+        val pid = fence.optLong("owner_pid", 0L)
+        if (pid > 0L) {
+            val identity = CaptureProcessIdentity(
+                pid.toInt(),
+                fence.optLong("owner_start", -1L),
+            )
+            if (identity == store.processIdentity()) {
+                // A predecessor coordinator in THIS process: its
+                // threads are real threads here and clear their
+                // halves when they exit — staleness is decided by
+                // the halves above, never by process death (this
+                // process is alive by construction).
+                return false
+            }
+            return !store.isProcessAlive(identity)
+        }
+        val since = fence.optLong("since_ms", 0L)
+        return since > 0L && clock() - since > LEGACY_FENCE_MAX_AGE_MS
+    }
+
+    /** Evaluates a PREDECESSOR's fence from a read-only load. */
+    private fun predecessorFenceVerdict(): FenceVerdict {
+        if (healthStore == null) return FenceVerdict.CLEAR
+        val doc = readHealthDoc() ?: return FenceVerdict.WAIT_STORE_UNREADABLE
+        val fence = doc.optJSONObject("fence") ?: return FenceVerdict.CLEAR
+        if (!fence.optBoolean("active")) return FenceVerdict.CLEAR
+        if (fence.optString("owner") == instanceId) return FenceVerdict.CLEAR
+        return if (fenceStaleLocked(fence)) {
+            FenceVerdict.STALE
+        } else {
+            FenceVerdict.WAIT
         }
     }
 
     /**
+     * Clears a provably orphaned fence: the staleness proof is
+     * RE-RUN inside the store lock on the freshly loaded
+     * document (the fence could have changed since the verdict),
+     * and the clearing is recorded as a FENCE_ORPHAN_CLEARED
+     * incident in the same mutation — visible history, not a
+     * silent takeover.
+     */
+    private fun clearStaleFence() {
+        mutateHealth { doc ->
+            val fence = doc.optJSONObject("fence") ?: return@mutateHealth
+            if (!fence.optBoolean("active") ||
+                fence.optString("owner") == instanceId ||
+                !fenceStaleLocked(fence)
+            ) {
+                return@mutateHealth
+            }
+            val owner = fence.optString("owner")
+            val ownerPid = fence.optLong("owner_pid", 0L)
+            fence.put("active", false)
+            fence.put("worker_alive", false)
+            fence.put("writer_alive", false)
+            applyRecordIncident(
+                doc,
+                HealthOp.Record(
+                    category = CaptureIncidentCategory.FENCE_ORPHAN_CLEARED,
+                    status = CaptureIncidentStatus.RECOVERED,
+                    detail = "pagar penerus yatim dibersihkan: proses pemilik " +
+                        "terbukti mati (owner=$owner pid=$ownerPid)",
+                    identity = owner,
+                ),
+            )
+            logSafely(
+                "pagar penerus yatim dibersihkan: proses pemilik terbukti mati " +
+                    "(owner=$owner pid=$ownerPid); penerus melanjutkan",
+            )
+        }
+    }
+
+    /**
+     * True when the stored health value can be READ but does not
+     * PARSE — the corruption case, distinct from an unreadable
+     * store: the raw bytes exist, so they can be quarantined
+     * (preserved as evidence) and the fence state becomes known.
+     */
+    private fun healthDocReadableButCorrupt(): Boolean {
+        val store = healthStore ?: return false
+        return try {
+            store.withCaptureHealthLock {
+                val raw = store.readCaptureHealth()
+                if (raw.isNullOrBlank()) {
+                    false
+                } else {
+                    try {
+                        JSONObject(raw)
+                        false
+                    } catch (e: Exception) {
+                        true
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * Quarantines a corrupt stored document NOW: an empty
+     * mutation whose load preserves the raw value inside the
+     * fresh document (and whose landing records the
+     * HEALTH_DOC_CORRUPT incident — see [mutateHealth]). After
+     * this, fence evaluation reads a known document instead of
+     * waiting on an unparseable one forever.
+     */
+    private fun quarantineHealthDoc() {
+        mutateHealth { }
+    }
+
+    /**
      * Blocks a replacement coordinator's threads until the
-     * predecessor's fence clears (the predecessor's thread exits
-     * clear their halves — see [onWorkerThreadExit] /
-     * [onWriterThreadExit]). Bounded by [close]: a close during
-     * the wait sets the closed flag and ends the wait, after
-     * which the loops observe the closed state and exit.
+     * predecessor's fence clears — its threads exiting clear
+     * their halves ([onWorkerThreadExit] / [onWriterThreadExit]),
+     * or the fence proves stale ([clearStaleFence]). An
+     * unreadable store waits FAIL-SAFE: an unverifiable fence is
+     * never treated as no fence. A readable-but-corrupt document
+     * is quarantined on the spot (its raw value preserved as
+     * evidence), after which the fence state is known and the
+     * wait can resolve. Bounded by [close]: a close during the
+     * wait sets the closed flag and ends the wait, after which
+     * the loops observe the closed state and exit.
      */
     private fun awaitSuccessorFence() {
         if (healthStore == null) return
-        while (!closedFlag && predecessorFenceActive()) {
-            try {
-                Thread.sleep(25)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return
+        var unreadableLogged = false
+        while (!closedFlag) {
+            when (predecessorFenceVerdict()) {
+                FenceVerdict.CLEAR -> return
+                FenceVerdict.STALE -> clearStaleFence()
+                FenceVerdict.WAIT_STORE_UNREADABLE -> {
+                    if (healthDocReadableButCorrupt()) {
+                        quarantineHealthDoc()
+                    } else {
+                        healthStoreUnreadable = true
+                        if (!unreadableLogged) {
+                            unreadableLogged = true
+                            logSafely(
+                                "capture-health: dokumen tidak terbaca — penerus " +
+                                    "menunggu fail-safe (pagar yang tidak " +
+                                    "terverifikasi tidak pernah diterobos)",
+                            )
+                        }
+                        if (!sleepFencePoll()) return
+                    }
+                }
+                FenceVerdict.WAIT -> if (!sleepFencePoll()) return
             }
         }
     }
 
-    /** Records this instance's fence (called by [close] when a thread outlives it). */
-    private fun setSuccessorFence(workerAlive: Boolean, writerAlive: Boolean, reason: String) {
-        mutateHealth { doc ->
-            doc.put(
-                "fence",
-                JSONObject().apply {
-                    put("active", true)
-                    put("owner", instanceId)
-                    put("since_ms", clock())
-                    put("worker_alive", workerAlive)
-                    put("writer_alive", writerAlive)
-                    put("reason", reason)
-                },
+    /** The fence poll sleep; false when interrupted (the wait ends). */
+    private fun sleepFencePoll(): Boolean = try {
+        Thread.sleep(FENCE_POLL_MS)
+        true
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        false
+    }
+
+    /**
+     * Records this instance's fence when a pipeline thread
+     * outlives [close]'s bounded wait. THE SAMPLING RACE THE
+     * AUDIT FOUND is closed by construction: the `isAlive`
+     * sample and the fence write happen INSIDE the same
+     * store-lock critical section ([mutateHealth]), and an
+     * exiting thread clears its half only through that same
+     * lock — so either the exit-clear lands first (this sample
+     * then reads not-alive and no fence is written) or this
+     * write lands first (the exit-clear then runs and clears
+     * the half). There is no interleaving in which a fence is
+     * published for a thread that already exited and cleared.
+     * The recorded owner is this PROCESS's identity (PID + start
+     * time), so a later process can prove this one dead.
+     */
+    private fun publishSuccessorFenceIfNeeded(reason: String) {
+        var publishedWorker = false
+        var publishedWriter = false
+        val published = mutateHealth { doc ->
+            val workerAlive = captureWorker.isAlive
+            val writerAlive = overflowWriter.isAlive
+            if (workerAlive || writerAlive) {
+                val identity = healthStore?.processIdentity()
+                    ?: CaptureProcessIdentity(-1, -1)
+                doc.put(
+                    "fence",
+                    JSONObject().apply {
+                        put("active", true)
+                        put("owner", instanceId)
+                        put("owner_pid", identity.pid)
+                        put("owner_start", identity.startTicks)
+                        put("since_ms", clock())
+                        put("worker_alive", workerAlive)
+                        put("writer_alive", writerAlive)
+                        put("reason", reason)
+                    },
+                )
+                publishedWorker = workerAlive
+                publishedWriter = writerAlive
+            }
+        }
+        if (published && (publishedWorker || publishedWriter)) {
+            logSafely(
+                "pagar penerus dicatat: worker/penulis pendahulu masih hidup " +
+                    "sesudah close (worker=$publishedWorker, " +
+                    "penulis=$publishedWriter); koordinator pengganti " +
+                    "ter-fence sampai keduanya berhenti",
             )
         }
     }
@@ -1094,6 +1801,10 @@ class CaptureCoordinator(
         runCatching { logger.logEvent(pkg, text) }
     }
 
+    /** Per-snapshot identity for loss incidents: `<package>@<postTimeMs>`. */
+    private fun overflowIdentity(snapshot: NotificationSnapshot): String =
+        "${snapshot.packageName}@${snapshot.postTimeMs}"
+
     private fun recordOverflow(snapshot: NotificationSnapshot?) {
         droppedOverflow.incrementAndGet()
         recordIncident(
@@ -1127,6 +1838,7 @@ class CaptureCoordinator(
                     CaptureIncidentCategory.OVERFLOW_RECORD_LOST,
                     CaptureIncidentStatus.OPEN,
                     "${snapshot.packageName} @${snapshot.postTimeMs} (penulis overflow sudah berhenti)",
+                    identity = overflowIdentity(snapshot),
                 )
                 return
             }
@@ -1138,6 +1850,7 @@ class CaptureCoordinator(
                     CaptureIncidentCategory.OVERFLOW_RECORD_LOST,
                     CaptureIncidentStatus.OPEN,
                     "${snapshot.packageName} @${snapshot.postTimeMs} (antrean penulis overflow penuh)",
+                    identity = overflowIdentity(snapshot),
                 )
             }
         }
@@ -1227,15 +1940,27 @@ class CaptureCoordinator(
             if (settled) {
                 overflowOutstanding.decrementAndGet()
                 if (record.persisted) {
-                    // A landed insert proves the database works
-                    // again: permanent-failure incidents close as
-                    // RECOVERED (and, when the record needed
-                    // retries, so do lost-record incidents — the
-                    // component that lost them is healthy again).
-                    recoverIncidents(CaptureIncidentCategory.DB_PERMANENT_FAILURE)
-                    if (record.attempts > 0) {
-                        recoverIncidents(CaptureIncidentCategory.OVERFLOW_RECORD_LOST)
-                    }
+                    // Recovery proof at the granularity the proof
+                    // actually has (audit P1-3 — the previous code
+                    // recovered OVERFLOW_RECORD_LOST wholesale when
+                    // any retried record landed, although the lost
+                    // records themselves stayed lost):
+                    // - COMPONENT proof: a landed insert proves
+                    //   the database component works again, so the
+                    //   aggregate DB_PERMANENT_FAILURE incident
+                    //   closes.
+                    // - IDENTITY proof: if THIS snapshot had a
+                    //   lost-record incident open, the durable row
+                    //   for THIS snapshot now exists — that exact
+                    //   identity is reconciled, and only that one.
+                    //   A record that merely needed retries was
+                    //   never lost, and an unrelated record's
+                    //   success proves nothing about a lost one.
+                    recoverIncident(CaptureIncidentCategory.DB_PERMANENT_FAILURE, "")
+                    recoverIncident(
+                        CaptureIncidentCategory.OVERFLOW_RECORD_LOST,
+                        overflowIdentity(record.snapshot),
+                    )
                 }
             }
         }
@@ -1312,6 +2037,7 @@ class CaptureCoordinator(
                         CaptureIncidentCategory.OVERFLOW_RECORD_LOST,
                         CaptureIncidentStatus.OPEN,
                         "${snapshot.packageName} @${snapshot.postTimeMs} (antrean retry penuh)",
+                        identity = overflowIdentity(snapshot),
                     )
                     logSafely(
                         "catatan overflow hilang saat retry (${snapshot.packageName})",
@@ -1338,6 +2064,7 @@ class CaptureCoordinator(
                     CaptureIncidentStatus.OPEN,
                     "${snapshot.packageName} @${snapshot.postTimeMs} " +
                         "(retry habis: ${record.attempts} percobaan)",
+                    identity = overflowIdentity(snapshot),
                 )
                 logSafely(
                     "catatan overflow menyerah setelah ${record.attempts} percobaan " +
@@ -1406,6 +2133,8 @@ class CaptureCoordinator(
         unresolvedAtClose = unresolvedAtClose.get(),
         preStageInterruptedAtClose = preStageInterruptedAtClose.get(),
         overflowWriterFailures = overflowWriterFailures.get(),
+        healthIncidentsDropped = healthIncidentsDropped.get(),
+        healthStoreFailures = healthStoreFailures.get(),
     )
 
     /**
@@ -1460,6 +2189,41 @@ class CaptureCoordinator(
                 "(bertahan lintas restart; pulih otomatis bila komponen terkait " +
                 "terbukti bekerja lagi, atau periksa manual)"
         }
+        // Health-store failure state (audit P1-2): the
+        // persistent layer's own failures are degradation too —
+        // surfaced, never swallowed.
+        if (c.healthStoreFailures > 0) {
+            reasons += "penyimpanan status kesehatan capture gagal " +
+                "${c.healthStoreFailures} kali (insiden persisten mungkin tidak " +
+                "terbarui; periksa penyimpanan aplikasi)"
+        }
+        if (c.healthIncidentsDropped > 0) {
+            reasons += "${c.healthIncidentsDropped} insiden kesehatan tidak " +
+                "terantre/tertulis (antrean penuh atau penulis kesehatan sudah " +
+                "berhenti; bukti: counter + log lokal)"
+        }
+        if (healthDocCorruptions.get() > 0 || healthDocCorruptSeen) {
+            reasons += "dokumen kesehatan capture pernah rusak — nilai mentahnya " +
+                "di-quarantine di dalam dokumen sebagai bukti, tidak dibuang " +
+                "diam-diam"
+        }
+        if (healthStoreUnreadable) {
+            reasons += "dokumen kesehatan tidak terbaca saat pemeriksaan pagar — " +
+                "penerus menunggu fail-safe, tidak menerobos"
+        }
+        // Unresolved losses, exposed independently of component
+        // health (audit P1-3): identity-keyed loss/unknown
+        // incidents. A recovered component never removes these;
+        // only identity-level reconciliation or an explicit
+        // operator disposition does.
+        val unresolvedLosses = incidents.filter {
+            (it.category == CaptureIncidentCategory.OVERFLOW_RECORD_LOST &&
+                it.status == CaptureIncidentStatus.OPEN) ||
+                (it.category == CaptureIncidentCategory.UNRESOLVED_AT_CLOSE &&
+                    it.status == CaptureIncidentStatus.OPEN) ||
+                (it.category == CaptureIncidentCategory.PRE_STAGE_INTERRUPTED &&
+                    it.status == CaptureIncidentStatus.UNRECOVERABLE)
+        }
         val fenced = fenceRecordedActive()
         if (fenced) {
             reasons += "pagar penerus aktif: koordinator pendahulu belum berhenti " +
@@ -1475,6 +2239,7 @@ class CaptureCoordinator(
             reasons = reasons,
             persistentIncidents = incidents,
             successorFenced = fenced,
+            unresolvedLosses = unresolvedLosses,
         )
     }
 
@@ -1625,27 +2390,43 @@ class CaptureCoordinator(
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-        // Successor fence (PR #5 re-review 28 Nov): if either
-        // pipeline thread outlived this bounded close, record
-        // the fence in the persistent health document. A
-        // replacement coordinator's threads wait on that fence
-        // (see awaitSuccessorFence) until these threads actually
-        // exit — their exit clears their half of the fence — so
-        // a successor can never run concurrently with a zombie
-        // predecessor worker/writer.
-        val workerAlive = captureWorker.isAlive
-        val writerAlive = overflowWriter.isAlive
-        if (workerAlive || writerAlive) {
-            setSuccessorFence(
-                workerAlive = workerAlive,
-                writerAlive = writerAlive,
-                reason = "close pendahulu melewati batas tunggu " +
-                    "(worker hidup=$workerAlive, penulis hidup=$writerAlive)",
-            )
+        // Successor fence (PR #5 re-review 28 Nov; audit P1-1):
+        // if either pipeline thread outlived this bounded close,
+        // publish the fence — with the liveness sample taken
+        // INSIDE the health store's lock (see
+        // publishSuccessorFenceIfNeeded), so a thread that exits
+        // during the publish cannot leave a stale fence behind.
+        // A replacement coordinator's threads wait on that fence
+        // until the predecessor's threads actually exit (their
+        // exit clears their halves), or until the fence proves
+        // stale (owner process dead), so a successor can never
+        // run concurrently with a live predecessor.
+        publishSuccessorFenceIfNeeded(
+            "close pendahulu melewati batas tunggu",
+        )
+        // Flush + terminate the health writer (audit P1-2): the
+        // incidents this close queued (stranded overflow records,
+        // the active-task settlement) must cross the durable
+        // acceptance boundary before close() returns — close() is
+        // their acceptance point. The writer then exits instead
+        // of looping forever; incidents offered afterwards are
+        // counted as dropped (see enqueueHealthOp), never queued
+        // to a dead writer. If the bounded join expires, the
+        // daemon writer keeps draining in the background — the
+        // incidents still land; only a process death inside that
+        // window loses them (the documented pre-durable window).
+        flushHealthIncidents(HEALTH_FLUSH_TIMEOUT_MS)
+        healthWriterShutdown = true
+        healthWriter.interrupt()
+        try {
+            healthWriter.join(HEALTH_WRITER_JOIN_TIMEOUT_MS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        if (healthWriter.isAlive) {
             logSafely(
-                "pagar penerus dicatat: worker/penulis pendahulu masih hidup " +
-                    "sesudah close (worker=$workerAlive, penulis=$writerAlive); " +
-                    "koordinator pengganti ter-fence sampai keduanya berhenti",
+                "penulis kesehatan masih menguras antrean sesudah close; " +
+                    "insiden terantre tetap ditulis di latar belakang",
             )
         }
     }
@@ -1691,6 +2472,7 @@ class CaptureCoordinator(
                     CaptureIncidentCategory.UNRESOLVED_AT_CLOSE,
                     CaptureIncidentStatus.OPEN,
                     "${active.snapshot?.packageName} @${active.snapshot?.postTimeMs}",
+                    identity = active.snapshot?.let { overflowIdentity(it) } ?: "",
                 )
                 logSafely(
                     "capture tidak terselesaikan saat penutupan: " +
@@ -1727,6 +2509,7 @@ class CaptureCoordinator(
                     CaptureIncidentStatus.UNRECOVERABLE,
                     "${interrupted.snapshot?.packageName} " +
                         "@${interrupted.snapshot?.postTimeMs} (outcome=${interrupted.outcome})",
+                    identity = interrupted.snapshot?.let { overflowIdentity(it) } ?: "",
                 )
             }
             logSafely(
@@ -2173,45 +2956,80 @@ class CaptureCoordinator(
      * a row whose delivery already exists is deleted without a
      * second enqueue; a legacy re-enqueue dedupes by `qkey`.
      */
-    suspend fun sweepOrphanedStaging() {
+    suspend fun sweepOrphanedStaging(): SweepResult {
         val rows = repository.getAllStagingRows()
+        var resolved = 0
+        var failed = 0
+        var held = 0
+        val resolvedIdentities = mutableSetOf<String>()
         for (row in rows) {
             try {
-                sweepOne(row)
+                val outcome = sweepOne(row)
+                if (outcome.resolved) {
+                    resolved++
+                    outcome.identity?.let { resolvedIdentities += it }
+                } else {
+                    held++
+                }
             } catch (e: Exception) {
+                failed++
                 logger.logLocal("sweep staging gagal (${row.legacyQkey}): ${e.message?.take(120)}")
             }
         }
-        // A completed full staging sweep is the recovery proof
-        // for an unresolved-at-close incident (PR #5 re-review
-        // 28 Nov): whatever staging survived was re-promoted or
-        // explicitly deleted by the sweep above.
-        recoverIncidents(CaptureIncidentCategory.UNRESOLVED_AT_CLOSE)
+        // Recovery proof is IDENTITY-LEVEL (audit P1-3 — the
+        // previous code recovered UNRESOLVED_AT_CLOSE
+        // unconditionally after any completed pass): an
+        // unresolved-at-close incident closes ONLY when this
+        // pass terminally resolved a staging row whose event
+        // carries that exact snapshot identity. A pass with
+        // failed rows proves nothing about those rows; an empty
+        // pass proves nothing at all (the unresolved snapshot's
+        // staging may have rolled back — its outcome stays
+        // unknown until rescan, a later resolving sweep, or an
+        // explicit operator disposition).
+        for (identity in resolvedIdentities) {
+            recoverIncident(CaptureIncidentCategory.UNRESOLVED_AT_CLOSE, identity)
+        }
+        return SweepResult(
+            rowsSeen = rows.size,
+            rowsResolved = resolved,
+            rowsFailed = failed,
+            rowsHeld = held,
+        )
     }
 
-    private suspend fun sweepOne(row: CaptureStagingEntity) {
+    /** One sweep row's outcome: terminally resolved, and the snapshot identity it proved (if any). */
+    private class SweepRowOutcome(val resolved: Boolean, val identity: String?)
+
+    private suspend fun sweepOne(row: CaptureStagingEntity): SweepRowOutcome {
+        val event = repository.getEventByDedupeKey(row.dedupeKey)
+        // The snapshot identity this row can prove recovery for:
+        // its event's package + occurrence time — the same
+        // identity the close path recorded for the snapshot.
+        val identity = event?.let { "${it.sourcePackage}@${it.occurredAtMs}" }
         val existing = repository.getDeliveryByQkey(row.legacyQkey)
         if (existing != null) {
             // Already promoted (crash between enqueue and staging
             // delete): delete the orphan row, no second delivery.
             repository.deleteStagingRow(row.legacyQkey)
             sweptOrphaned.incrementAndGet()
-            return
+            return SweepRowOutcome(resolved = true, identity = identity)
         }
-        val event = repository.getEventByDedupeKey(row.dedupeKey)
         if (event == null) {
             // No event row: the staging row cannot be promoted
             // (nothing to deliver). Delete it — counted, visible.
+            // This resolves the ROW but proves nothing about any
+            // unresolved snapshot (identity stays null).
             repository.deleteStagingRow(row.legacyQkey)
             sweptOrphaned.incrementAndGet()
             logger.logLocal("staging tanpa event dihapus: ${row.legacyQkey}")
-            return
+            return SweepRowOutcome(resolved = true, identity = null)
         }
         val parsed = LegacyQkey.parse(row.legacyQkey) ?: run {
             repository.deleteStagingRow(row.legacyQkey)
             sweptOrphaned.incrementAndGet()
             logger.logLocal("staging qkey rusak dihapus: ${row.legacyQkey}")
-            return
+            return SweepRowOutcome(resolved = true, identity = identity)
         }
         // F18: a payload_sha256 mismatch means the staged payload no
         // longer matches the event row — hold the row (`staging_
@@ -2223,7 +3041,7 @@ class CaptureCoordinator(
         ) {
             stagingMismatch.incrementAndGet()
             logger.logLocal("staging_mismatch, tidak dipromosikan: ${row.legacyQkey}")
-            return
+            return SweepRowOutcome(resolved = false, identity = null)
         }
         val payload = try {
             JSONObject(event.legacyPayloadJson ?: "{}")
@@ -2257,8 +3075,13 @@ class CaptureCoordinator(
             bigText = "",
             capturedAtMs = now,
         )
-        if (enqueueStaged(row, delivery, payload, snapshot, parsed.routeIds)) {
+        return if (enqueueStaged(row, delivery, payload, snapshot, parsed.routeIds)) {
             sweptOrphaned.incrementAndGet()
+            SweepRowOutcome(resolved = true, identity = identity)
+        } else {
+            // Promotion failed: the row stays staged and proves
+            // nothing yet — NOT resolved (audit P1-3).
+            SweepRowOutcome(resolved = false, identity = null)
         }
     }
 

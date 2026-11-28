@@ -79,6 +79,9 @@ class PaylistApplication : Application(), Configuration.Provider {
 
         /** SharedPreferences key of the persistent capture-health document. */
         const val CAPTURE_HEALTH_KEY: String = "capture_health_v1"
+
+        /** Monitor serialising capture-health file-lock sections inside this process. */
+        private val HEALTH_FILE_LOCK_MONITOR = Any()
     }
 
     /** This process's boot identity (fresh UUID per process start). */
@@ -155,19 +158,63 @@ class PaylistApplication : Application(), Configuration.Provider {
             override fun logEvent(pkg: String, text: String) = store.logEvent(pkg, text)
             override fun logLocal(text: String) = store.logLocal(text)
         }
-        // PR #5 re-review 28 Nov: the persistent capture-health
-        // document (incidents + successor fence) lives in the
-        // same "paylist" SharedPreferences as the rest of the
-        // Store state; writes are apply() (async, never a
-        // blocking commit on a pipeline thread).
+        // PR #5 re-review 28 Nov; durability contract tightened
+        // by the PR #5 audit of 28 Nov (comment 7229800304): the
+        // persistent capture-health document (incidents +
+        // successor fence) lives in the same "paylist"
+        // SharedPreferences as the rest of the Store state, but
+        // writes are commit() — the durable acceptance boundary
+        // (apply() is only an in-memory update whose disk flush
+        // a SIGKILL can beat). commit() runs ONLY on the
+        // coordinator's health-writer thread (and on close /
+        // operator paths), never on a pipeline caller thread.
+        // A failed commit throws, so the failure is counted and
+        // surfaced instead of swallowed. Document
+        // read-modify-writes serialise process-wide through a
+        // file lock (plus a JVM monitor against same-process
+        // overlap), so a predecessor and a successor PROCESS
+        // cannot interleave their mutations.
         val healthPrefs = getSharedPreferences("paylist", MODE_PRIVATE)
         val healthStore = object : CaptureHealthStore {
             override fun readCaptureHealth(): String? =
                 healthPrefs.getString(CAPTURE_HEALTH_KEY, null)
 
             override fun writeCaptureHealth(json: String) {
-                healthPrefs.edit().putString(CAPTURE_HEALTH_KEY, json).apply()
+                val ok = healthPrefs.edit()
+                    .putString(CAPTURE_HEALTH_KEY, json).commit()
+                check(ok) { "capture-health commit failed" }
             }
+
+            override fun <T> withCaptureHealthLock(block: () -> T): T =
+                synchronized(HEALTH_FILE_LOCK_MONITOR) {
+                    val channel = java.io.RandomAccessFile(
+                        java.io.File(filesDir, "capture_health.lock"), "rw",
+                    ).channel
+                    try {
+                        val lock = try {
+                            channel.lock()
+                        } catch (e: Exception) {
+                            // The JVM monitor above already
+                            // serialises this process; a file-lock
+                            // failure must not break capture —
+                            // proceed under the monitor alone.
+                            null
+                        }
+                        try {
+                            block()
+                        } finally {
+                            try {
+                                lock?.release()
+                            } catch (_: Exception) {
+                            }
+                        }
+                    } finally {
+                        try {
+                            channel.close()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
         }
         CaptureCoordinator(
             repository = repository,
