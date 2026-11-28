@@ -30,6 +30,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.concurrent.withLock
 
 /**
  * Stage D audit P1 (PR #5 review 6049617822): capture loss before
@@ -129,16 +130,84 @@ class CaptureOverflowTest {
         }
     }
 
-    /** In-memory [CaptureHealthStore] (item 5): one JSON document in a var. */
+    /**
+     * In-memory [CaptureHealthStore] (item 5; extended for the
+     * PR #5 audit of 28 Nov): one JSON document in a var, a
+     * controllable process identity + live-process set (fence
+     * staleness is decided against it), failure switches for
+     * reads/writes, a write delay (a slow durable store), and a
+     * one-shot gate that parks a fence PUBLISH write mid-flight
+     * (the deterministic exit-between-sample-and-publish race).
+     * The lock is per-STORE, so two coordinators over this fake
+     * serialise against each other — the process-scoped
+     * serialisation the production file lock provides.
+     */
     private class FakeCaptureHealthStore : CaptureHealthStore {
         @Volatile
         var doc: String? = null
 
-        override fun readCaptureHealth(): String? = doc
+        /** The identity this fake reports for "this process". */
+        @Volatile
+        var selfIdentity = CaptureProcessIdentity(4242, 111L)
+
+        /** Identities [isProcessAlive] reports as alive (starts with [selfIdentity]). */
+        val liveIdentities: MutableSet<CaptureProcessIdentity> =
+            java.util.Collections.synchronizedSet(mutableSetOf(selfIdentity))
+
+        @Volatile
+        var failReads: Boolean = false
+
+        @Volatile
+        var failWrites: Boolean = false
+
+        /** Artificial durable-write latency (a slow store). */
+        @Volatile
+        var writeDelayMs: Long = 0
+
+        /**
+         * One-shot gate on the next write whose document carries
+         * an ACTIVE fence: [fenceWriteEntered] counts down when
+         * the write is parked, the write completes only after
+         * [fenceWriteRelease] opens. Lets a test exit a
+         * predecessor thread BETWEEN the old code's isAlive sample
+         * and its fence publish.
+         */
+        @Volatile
+        var fenceWriteGateArmed: Boolean = false
+        val fenceWriteEntered = CountDownLatch(1)
+        val fenceWriteRelease = CountDownLatch(1)
+
+        private val storeLock = java.util.concurrent.locks.ReentrantLock()
+
+        override fun readCaptureHealth(): String? {
+            if (failReads) throw IllegalStateException("health read down (test)")
+            return doc
+        }
 
         override fun writeCaptureHealth(json: String) {
+            if (failWrites) throw IllegalStateException("health write down (test)")
+            val delay = writeDelayMs
+            if (delay > 0) Thread.sleep(delay)
+            if (fenceWriteGateArmed &&
+                runCatching {
+                    JSONObject(json).optJSONObject("fence")
+                        ?.optBoolean("active") == true
+                }.getOrDefault(false)
+            ) {
+                fenceWriteGateArmed = false
+                fenceWriteEntered.countDown()
+                fenceWriteRelease.await(15, TimeUnit.SECONDS)
+            }
             doc = json
         }
+
+        override fun processIdentity(): CaptureProcessIdentity = selfIdentity
+
+        override fun isProcessAlive(identity: CaptureProcessIdentity): Boolean =
+            liveIdentities.contains(identity)
+
+        override fun <T> withCaptureHealthLock(block: () -> T): T =
+            storeLock.withLock(block)
 
         fun incidents(): List<org.json.JSONObject> {
             val raw = doc ?: return emptyList()
@@ -149,10 +218,21 @@ class CaptureOverflowTest {
         fun incident(category: String): org.json.JSONObject? =
             incidents().firstOrNull { it.optString("category") == category }
 
+        fun incident(category: String, identity: String): org.json.JSONObject? =
+            incidents().firstOrNull {
+                it.optString("category") == category &&
+                    it.optString("identity") == identity
+            }
+
         fun fenceActive(): Boolean {
             val raw = doc ?: return false
             return JSONObject(raw).optJSONObject("fence")
                 ?.optBoolean("active") == true
+        }
+
+        /** Writes a document directly (a predecessor's hand-written state). */
+        fun seedDoc(json: String) {
+            doc = json
         }
     }
 
@@ -1153,5 +1233,635 @@ class CaptureOverflowTest {
         }
         // And the coordinator is still usable afterwards.
         coordinator.sweepNow()
+    }
+
+    // --- Audit 28 Nov P1-1: successor fence (process-scoped) ---
+
+    /** A v2 fence document as a predecessor would have published it. */
+    private fun fenceDoc(
+        ownerInstance: String,
+        ownerIdentity: CaptureProcessIdentity,
+        workerAlive: Boolean = true,
+        writerAlive: Boolean = true,
+    ): String = JSONObject().apply {
+        put("version", 2)
+        put(
+            "fence",
+            JSONObject().apply {
+                put("active", true)
+                put("owner", ownerInstance)
+                put("owner_pid", ownerIdentity.pid)
+                put("owner_start", ownerIdentity.startTicks)
+                put("since_ms", POST_TIME)
+                put("worker_alive", workerAlive)
+                put("writer_alive", writerAlive)
+                put("reason", "close pendahulu melewati batas tunggu")
+            },
+        )
+        put("incidents", org.json.JSONArray())
+    }.toString()
+
+    @Test
+    fun staleFence_deadPredecessorProcess_clearedBySuccessor() = runBlocking {
+        // The fence's owner PROCESS is provably dead (its
+        // identity is not in the live set — the predecessor was
+        // SIGKILLed with the fence active, so no thread of its
+        // will ever clear a half): the successor must clear the
+        // fence and process captures, never stall indefinitely.
+        val health = FakeCaptureHealthStore()
+        health.seedDoc(
+            fenceDoc("predecessor-instance", CaptureProcessIdentity(9999, 5L)),
+        )
+        coordinator = newCoordinator(healthStore = health)
+        assertEquals(
+            CaptureCoordinator.CaptureReceipt.QUEUED,
+            coordinator.capture(snapshot()),
+        )
+        awaitCondition("successor processed after clearing the stale fence") {
+            eventDao.count() == 1
+        }
+        assertFalse("stale fence cleared", health.fenceActive())
+        awaitCondition("orphan clearing recorded as an incident") {
+            health.incident(CaptureIncidentCategory.FENCE_ORPHAN_CLEARED) != null
+        }
+    }
+
+    @Test
+    fun livePredecessorFence_neverBypassed_thenDeathAllowsProgress() = runBlocking {
+        // The fence's owner process is ALIVE: no successor work
+        // may happen while it lives (no fail-open). Once the
+        // process provably dies, the same fence becomes stale
+        // and the successor proceeds.
+        val health = FakeCaptureHealthStore()
+        val live = CaptureProcessIdentity(777, 7L)
+        health.liveIdentities.add(live)
+        health.seedDoc(fenceDoc("live-predecessor", live, writerAlive = false))
+        coordinator = newCoordinator(healthStore = health)
+        coordinator.capture(snapshot())
+        Thread.sleep(800)
+        assertEquals(
+            "no successor work while the predecessor process lives",
+            0, eventDao.count(),
+        )
+        assertTrue("live fence untouched", health.fenceActive())
+        health.liveIdentities.remove(live)
+        awaitCondition("successor proceeds once the predecessor is provably dead") {
+            eventDao.count() == 1
+        }
+        assertFalse(health.fenceActive())
+    }
+
+    @Test
+    fun fencePublishRace_threadExitsDuringPublish_noStaleFence() = runBlocking {
+        // The audit's exit-between-sample-and-publish race, made
+        // deterministic: the predecessor's overflow writer is
+        // stuck (so close() WILL publish a fence), the publish
+        // write is parked mid-flight by the store gate, and the
+        // writer is released while the publish is parked — it
+        // drains, exits, and attempts its exit-clear DURING the
+        // publish. Because the liveness sample and the publish
+        // now happen inside the same store-lock section, the
+        // exit-clear serialises after the publish and clears the
+        // writer half: no stale fence may remain.
+        val health = FakeCaptureHealthStore()
+        coordinator = newCoordinator(healthStore = health)
+        val latch = blockExecutorWith(POST_TIME)
+        val writerLatch = CountDownLatch(1)
+        try {
+            awaitCondition("blocker capture-log row written") {
+                store.captureLog.values.any {
+                    it.outcome == CaptureOutcome.CAPTURED
+                }
+            }
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            captureLogDao.insertBlockLatch = writerLatch
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            awaitCondition("writer stuck inside the overflow insert") {
+                captureLogDao.insertEntered.get() >= 1
+            }
+            health.fenceWriteGateArmed = true
+            val closeThread = Thread { coordinator.close() }
+            closeThread.start()
+            assertTrue(
+                "fence publish reached the store",
+                health.fenceWriteEntered.await(20, TimeUnit.SECONDS),
+            )
+            // The writer exits DURING the parked publish: it
+            // drains its queue and its exit-clear queues up on
+            // the store lock the publish is holding.
+            writerLatch.countDown()
+            Thread.sleep(800)
+            health.fenceWriteRelease.countDown()
+            closeThread.join(20_000)
+            assertFalse("close() returned", closeThread.isAlive)
+            assertFalse(
+                "no stale fence: the exit-clear landed after the publish",
+                health.fenceActive(),
+            )
+            // And a successor is not fenced by the corpse.
+            val successor = newCoordinator(healthStore = health)
+            try {
+                successor.capture(snapshot(postTime = POST_TIME + 9_000L))
+                awaitCondition("successor processed immediately") {
+                    eventDao.count() == 2
+                }
+            } finally {
+                runCatching { successor.close() }
+            }
+        } finally {
+            captureLogDao.insertBlockLatch = null
+            writerLatch.countDown()
+            health.fenceWriteRelease.countDown()
+            latch.countDown()
+        }
+    }
+
+    @Test
+    fun healthStoreUnreadable_fenceCheckFailsSafe() = runBlocking {
+        // The store cannot be READ at all: the fence check must
+        // fail SAFE (the successor waits) — the old code
+        // defaulted unreadable state to "no fence" (fail-open).
+        // Once the store is readable and the fence's owner
+        // proves dead, the successor proceeds.
+        val health = FakeCaptureHealthStore()
+        health.seedDoc(
+            fenceDoc("dead-predecessor", CaptureProcessIdentity(9999, 5L)),
+        )
+        health.failReads = true
+        coordinator = newCoordinator(healthStore = health)
+        coordinator.capture(snapshot())
+        Thread.sleep(800)
+        assertEquals(
+            "unreadable state must fail safe (wait), never read as 'no fence'",
+            0, eventDao.count(),
+        )
+        health.failReads = false
+        awaitCondition("successor proceeds once readable and the fence proves stale") {
+            eventDao.count() == 1
+        }
+    }
+
+    @Test
+    fun concurrentHealthMutations_noLostIncidentCounts() = runBlocking {
+        // Two coordinators over ONE store record incidents
+        // concurrently. The store-scoped lock serialises their
+        // read-modify-writes across instances, so the aggregated
+        // count is exact — a per-instance lock (the old design)
+        // cannot guarantee this.
+        val health = FakeCaptureHealthStore()
+        val a = newCoordinator(healthStore = health)
+        val b = newCoordinator(healthStore = health)
+        val latch = CountDownLatch(1)
+        modeReaderLatch = latch
+        try {
+            a.capture(snapshot(postTime = POST_TIME))
+            b.capture(snapshot(postTime = POST_TIME + 100_000L))
+            awaitCondition("both blockers staged") { eventDao.count() == 2 }
+            // Each coordinator: 3 queued + 7 evictions = 7 drops.
+            for (i in 1..10) {
+                a.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            for (i in 1..10) {
+                b.capture(snapshot(postTime = POST_TIME + 100_000L + i * 1_000L))
+            }
+            assertEquals(7, a.counters().droppedOverflow)
+            assertEquals(7, b.counters().droppedOverflow)
+            a.flushHealthIncidents(10_000)
+            b.flushHealthIncidents(10_000)
+            awaitCondition("all incidents applied") {
+                health.incident(CaptureIncidentCategory.OVERFLOW_SNAPSHOT_DROPPED)
+                    ?.optLong("count") == 14L
+            }
+        } finally {
+            modeReaderLatch = null
+            latch.countDown()
+            runCatching { a.close() }
+            runCatching { b.close() }
+        }
+    }
+
+    // --- Audit 28 Nov P1-2: health durability / callback ---
+
+    @Test
+    fun corruptHealthDoc_quarantinedNotSilentlyReset() = runBlocking {
+        // The stored document does not parse: it must NOT be
+        // silently reset. The next mutation carries the raw
+        // value into the fresh document as a quarantine block,
+        // and the corruption itself becomes a visible incident.
+        val health = FakeCaptureHealthStore()
+        health.seedDoc("{ini bukan json yang valid")
+        coordinator = newCoordinator(healthStore = health)
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            awaitCondition("incident written into a fresh, valid document") {
+                health.incident(CaptureIncidentCategory.OVERFLOW_SNAPSHOT_DROPPED) != null
+            }
+            val quarantine = JSONObject(health.doc!!).optJSONObject("quarantine")
+            assertNotNull("the corrupt raw value is quarantined as evidence", quarantine)
+            assertEquals("{ini bukan json yang valid", quarantine!!.optString("raw"))
+            awaitCondition("corruption itself recorded as an incident") {
+                health.incident(CaptureIncidentCategory.HEALTH_DOC_CORRUPT) != null
+            }
+            assertTrue(coordinator.degradedState().degraded)
+        } finally {
+            latch.countDown()
+        }
+    }
+
+    @Test
+    fun healthWriteFailure_visibleFailureState_captureContinues() = runBlocking {
+        // The health store's durable writes fail: capture and
+        // the Room overflow path continue unaffected, and the
+        // failure is counted + visible in the degraded state —
+        // never swallowed (the old code swallowed read/write
+        // failures and defaulted the fence check to false).
+        val health = FakeCaptureHealthStore()
+        health.failWrites = true
+        coordinator = newCoordinator(healthStore = health)
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            awaitCondition("overflow row still written (Room path unaffected)") {
+                overflowRows().size == 1
+            }
+            awaitCondition("health write failure counted") {
+                coordinator.counters().healthStoreFailures > 0
+            }
+            assertNull("no health document could be written", health.doc)
+            val degraded = coordinator.degradedState()
+            assertTrue(degraded.degraded)
+            assertTrue(
+                "failure state is visible in the degraded reasons",
+                degraded.reasons.any { it.contains("kesehatan") },
+            )
+        } finally {
+            latch.countDown()
+        }
+    }
+
+    @Test
+    fun recordOverflow_callerNotBlockedBySlowHealthStore() = runBlocking {
+        // The audit's callback regression: recordOverflow used
+        // to run the health JSON read-modify-write synchronously
+        // on the caller (the Binder thread). With a 1 s durable
+        // health write, the dropping capture() must still return
+        // immediately — the health writer absorbs the latency.
+        val health = FakeCaptureHealthStore()
+        health.writeDelayMs = 1_000
+        coordinator = newCoordinator(healthStore = health)
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            val started = System.currentTimeMillis()
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            val elapsed = System.currentTimeMillis() - started
+            assertTrue(
+                "the dropping capture() must not pay the health store's " +
+                    "durable-write latency (was ${elapsed}ms)",
+                elapsed < 500,
+            )
+            awaitCondition("incident eventually durable", 15_000) {
+                health.incident(CaptureIncidentCategory.OVERFLOW_SNAPSHOT_DROPPED) != null
+            }
+        } finally {
+            latch.countDown()
+        }
+    }
+
+    @Test
+    fun incidentDurableAcceptance_flushedIncidentVisibleToReplacement() = runBlocking {
+        // The unit-level half of the durable acceptance boundary
+        // (the real process-kill half is the c07 instrumented
+        // scenario): once flushHealthIncidents returns, the
+        // incident's durable write has RETURNED from the store,
+        // so a replacement coordinator with zeroed counters sees
+        // it — this is what "accepted" means for incidents.
+        val health = FakeCaptureHealthStore()
+        coordinator = newCoordinator(healthStore = health)
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+        } finally {
+            latch.countDown()
+        }
+        coordinator.flushHealthIncidents(10_000)
+        coordinator.close()
+        val replacement = newCoordinator(healthStore = health)
+        try {
+            assertTrue(
+                "flushed incident is durable for a replacement coordinator",
+                replacement.degradedState().persistentIncidents.any {
+                    it.category == CaptureIncidentCategory.OVERFLOW_SNAPSHOT_DROPPED &&
+                        it.status == CaptureIncidentStatus.OPEN
+                },
+            )
+        } finally {
+            runCatching { replacement.close() }
+        }
+    }
+
+    // --- Audit 28 Nov P1-3: recovery proof at identity level ---
+
+    @Test
+    fun sweepRecovery_failedPassKeepsUnresolved_resolvingPassRecoversIdentity() =
+        runBlocking {
+            // An unresolved-at-close incident for the blocker's
+            // identity. Its staging row IS durable.
+            val health = FakeCaptureHealthStore()
+            stubbornModeRead.set(true)
+            coordinator = newCoordinator(healthStore = health, closeTimeoutMs = 400L)
+            val latch = blockExecutorWith(POST_TIME)
+            coordinator.close()
+            assertEquals(1, coordinator.counters().unresolvedAtClose)
+            val identity = "$PKG@$POST_TIME"
+            awaitCondition("unresolved incident recorded") {
+                health.incident(
+                    CaptureIncidentCategory.UNRESOLVED_AT_CLOSE, identity,
+                ) != null
+            }
+            // Release the stuck task with the legacy enqueue
+            // DOWN: its own promotion attempt fails and parks, so
+            // the staging row survives for the sweep phase (with
+            // the enqueue up, the released task would promote and
+            // delete the row itself).
+            enqueueShouldFail.set(true)
+            latch.countDown()
+            awaitCondition("stuck worker exited") {
+                !coordinator.isCaptureWorkerAlive()
+            }
+            assertEquals(1, stagingDao.count())
+
+            val successor = newCoordinator(healthStore = health)
+            try {
+                // A sweep whose promotion FAILS (the legacy
+                // enqueue is down) resolves nothing: the incident
+                // must stay OPEN — the old code recovered it after
+                // ANY completed pass.
+                val failedResult = successor.sweepOrphanedStaging()
+                assertEquals(1, failedResult.rowsSeen)
+                assertEquals(0, failedResult.rowsResolved)
+                successor.flushHealthIncidents(5_000)
+                assertEquals(
+                    CaptureIncidentStatus.OPEN,
+                    health.incident(
+                        CaptureIncidentCategory.UNRESOLVED_AT_CLOSE, identity,
+                    )?.optString("status"),
+                )
+                // A resolving sweep promotes the row: THAT
+                // identity — and only that identity — recovers.
+                enqueueShouldFail.set(false)
+                val okResult = successor.sweepOrphanedStaging()
+                assertEquals(1, okResult.rowsResolved)
+                successor.flushHealthIncidents(5_000)
+                assertEquals(
+                    CaptureIncidentStatus.RECOVERED,
+                    health.incident(
+                        CaptureIncidentCategory.UNRESOLVED_AT_CLOSE, identity,
+                    )?.optString("status"),
+                )
+            } finally {
+                enqueueShouldFail.set(false)
+                stubbornModeRead.set(false)
+                runCatching { successor.close() }
+            }
+        }
+
+    @Test
+    fun sweepRecovery_emptyPassRecoversNothing_dispositionIsTheOnlyExit() = runBlocking {
+        // No staging rows at all: a sweep cannot establish
+        // recovery of an unknown pre-stage outcome (the staging
+        // may have rolled back). The incident stays OPEN,
+        // exposed as an unresolved loss, until the explicit
+        // operator disposition — which acknowledges it as
+        // UNRECOVERABLE without ever claiming recovery.
+        val health = FakeCaptureHealthStore()
+        val identity = "$PKG@$POST_TIME"
+        health.seedDoc(
+            JSONObject().apply {
+                put("version", 2)
+                put(
+                    "fence",
+                    JSONObject().apply {
+                        put("active", false)
+                        put("owner", "")
+                        put("owner_pid", 0)
+                        put("owner_start", -1L)
+                        put("since_ms", 0L)
+                        put("worker_alive", false)
+                        put("writer_alive", false)
+                        put("reason", "")
+                    },
+                )
+                put(
+                    "incidents",
+                    org.json.JSONArray().put(
+                        JSONObject().apply {
+                            put("category", CaptureIncidentCategory.UNRESOLVED_AT_CLOSE)
+                            put("status", CaptureIncidentStatus.OPEN)
+                            put("first_ms", POST_TIME)
+                            put("last_ms", POST_TIME)
+                            put("count", 1L)
+                            put("detail", "$PKG @$POST_TIME")
+                            put("identity", identity)
+                        },
+                    ),
+                )
+            }.toString(),
+        )
+        coordinator = newCoordinator(healthStore = health)
+        val result = coordinator.sweepOrphanedStaging()
+        assertEquals(0, result.rowsSeen)
+        coordinator.flushHealthIncidents(5_000)
+        assertEquals(
+            CaptureIncidentStatus.OPEN,
+            health.incident(
+                CaptureIncidentCategory.UNRESOLVED_AT_CLOSE, identity,
+            )?.optString("status"),
+        )
+        assertTrue(
+            "exposed as an unresolved loss, independently of component health",
+            coordinator.degradedState().unresolvedLosses.any {
+                it.category == CaptureIncidentCategory.UNRESOLVED_AT_CLOSE &&
+                    it.identity == identity
+            },
+        )
+        coordinator.dismissIncident(
+            CaptureIncidentCategory.UNRESOLVED_AT_CLOSE, identity,
+        )
+        assertEquals(
+            CaptureIncidentStatus.UNRECOVERABLE,
+            health.incident(
+                CaptureIncidentCategory.UNRESOLVED_AT_CLOSE, identity,
+            )?.optString("status"),
+        )
+        assertTrue(
+            coordinator.degradedState().unresolvedLosses.none {
+                it.category == CaptureIncidentCategory.UNRESOLVED_AT_CLOSE
+            },
+        )
+    }
+
+    @Test
+    fun lostRecordRecovery_unrelatedInsertDoesNotRecover_sameIdentityRedropDoes() =
+        runBlocking {
+            val health = FakeCaptureHealthStore()
+            coordinator = newCoordinator(healthStore = health)
+            val lostIdentity = "$PKG@${POST_TIME + 1_000L}"
+            // Phase 1: V1's overflow record is LOST (the DB fails
+            // across the whole retry budget).
+            var latch = blockExecutorWith(POST_TIME)
+            try {
+                for (i in 1..3) {
+                    coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+                }
+                captureLogDao.failNextInserts.set(Int.MAX_VALUE)
+                coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+                awaitCondition("V1's overflow record given up") {
+                    coordinator.counters().overflowRecordDropped == 1L
+                }
+                captureLogDao.failNextInserts.set(0)
+                awaitCondition("lost incident recorded for V1's identity") {
+                    health.incident(
+                        CaptureIncidentCategory.OVERFLOW_RECORD_LOST, lostIdentity,
+                    ) != null
+                }
+            } finally {
+                captureLogDao.failNextInserts.set(0)
+                latch.countDown()
+            }
+            awaitCondition("first queue drained") { legacyQueue.size == 4 }
+
+            // Phase 2: an UNRELATED overflow record (W1, evicted
+            // by W4) lands successfully. The DB component recovers
+            // — but V1's lost record must NOT: its row still does
+            // not exist, and an unrelated success proves nothing
+            // about it (the old code recovered it wholesale).
+            // (Manual block: blockExecutorWith asserts an event
+            // count of 1, but four events already exist.)
+            val latch2 = CountDownLatch(1)
+            modeReaderLatch = latch2
+            try {
+                coordinator.capture(snapshot(postTime = POST_TIME + 100_000L))
+                awaitCondition("second blocker staged") { eventDao.count() == 5 }
+                for (i in 1..3) {
+                    coordinator.capture(
+                        snapshot(postTime = POST_TIME + 100_000L + i * 1_000L),
+                    )
+                }
+                coordinator.capture(snapshot(postTime = POST_TIME + 104_000L))
+                awaitCondition("unrelated overflow row persisted") {
+                    overflowRows().any { it.postTimeMs == POST_TIME + 101_000L }
+                }
+                coordinator.flushHealthIncidents(5_000)
+                assertEquals(
+                    "the DB component incident recovers on a landed insert",
+                    CaptureIncidentStatus.RECOVERED,
+                    health.incident(CaptureIncidentCategory.DB_PERMANENT_FAILURE)
+                        ?.optString("status"),
+                )
+                assertEquals(
+                    "V1's lost record is still lost",
+                    CaptureIncidentStatus.OPEN,
+                    health.incident(
+                        CaptureIncidentCategory.OVERFLOW_RECORD_LOST, lostIdentity,
+                    )?.optString("status"),
+                )
+                assertTrue(
+                    coordinator.degradedState().unresolvedLosses.any {
+                        it.category == CaptureIncidentCategory.OVERFLOW_RECORD_LOST &&
+                            it.identity == lostIdentity
+                    },
+                )
+            } finally {
+                modeReaderLatch = null
+                latch2.countDown()
+            }
+            awaitCondition("second queue drained") { legacyQueue.size == 8 }
+
+            // Phase 3: identity-level reconciliation — V1's exact
+            // snapshot is dropped by a later saturation and its
+            // overflow row lands this time. THAT snapshot's
+            // evidence now exists, so its incident recovers.
+            val latch3 = CountDownLatch(1)
+            modeReaderLatch = latch3
+            try {
+                coordinator.capture(snapshot(postTime = POST_TIME + 200_000L))
+                awaitCondition("third blocker staged") { eventDao.count() == 9 }
+                for (i in 1..3) {
+                    coordinator.capture(
+                        snapshot(postTime = POST_TIME + 200_000L + i * 1_000L),
+                    )
+                }
+                // Admit V1's snapshot, then evict it with three
+                // more captures.
+                coordinator.capture(snapshot(postTime = POST_TIME + 1_000L))
+                coordinator.capture(snapshot(postTime = POST_TIME + 204_000L))
+                coordinator.capture(snapshot(postTime = POST_TIME + 205_000L))
+                coordinator.capture(snapshot(postTime = POST_TIME + 206_000L))
+                awaitCondition("V1's re-dropped overflow row persisted") {
+                    overflowRows().any { it.postTimeMs == POST_TIME + 1_000L }
+                }
+                coordinator.flushHealthIncidents(5_000)
+                assertEquals(
+                    "identity-level reconciliation recovers V1's incident",
+                    CaptureIncidentStatus.RECOVERED,
+                    health.incident(
+                        CaptureIncidentCategory.OVERFLOW_RECORD_LOST, lostIdentity,
+                    )?.optString("status"),
+                )
+            } finally {
+                modeReaderLatch = null
+                latch3.countDown()
+            }
+        }
+
+    @Test
+    fun restartWithUnrecoverableIncident_staysExposedAsUnresolvedLoss() = runBlocking {
+        // A pre-stage interruption is UNRECOVERABLE by
+        // definition; across a restart it must stay exposed in
+        // unresolvedLosses — a healthy component status must
+        // never hide it.
+        val health = FakeCaptureHealthStore()
+        val routesLatch = CountDownLatch(1)
+        coordinator = newCoordinator(
+            healthStore = health,
+            routesLatch = routesLatch,
+            closeTimeoutMs = 2_000L,
+        )
+        assertEquals(
+            CaptureCoordinator.CaptureReceipt.QUEUED,
+            coordinator.capture(snapshot()),
+        )
+        Thread.sleep(500)
+        coordinator.close()
+        assertEquals(1, coordinator.counters().preStageInterruptedAtClose)
+        routesLatch.countDown()
+        val fresh = newCoordinator(healthStore = health)
+        try {
+            assertTrue(
+                "unrecoverable incident stays exposed across restart",
+                fresh.degradedState().unresolvedLosses.any {
+                    it.category == CaptureIncidentCategory.PRE_STAGE_INTERRUPTED &&
+                        it.status == CaptureIncidentStatus.UNRECOVERABLE &&
+                        it.identity == "$PKG@$POST_TIME"
+                },
+            )
+        } finally {
+            runCatching { fresh.close() }
+        }
     }
 }
