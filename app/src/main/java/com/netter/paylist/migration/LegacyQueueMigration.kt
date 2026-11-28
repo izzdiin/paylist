@@ -139,6 +139,15 @@ data class LegacyQueueItem(
      */
     val privacyReprocessed: Boolean = false,
     val privacyQuarantined: Boolean = false,
+    /**
+     * Quarantine reason marker (`privacy_quarantine_reason`, a
+     * stable code — never content), parsed for the Stage D
+     * per-item quarantine record. Null when the item was never
+     * quarantined by the §7.7 gate.
+     */
+    val privacyQuarantineReason: String? = null,
+    /** Span classes marker (`privacy_span_classes`, comma-joined). */
+    val privacySpanClasses: String? = null,
 ) {
     companion object {
         /**
@@ -184,6 +193,8 @@ data class LegacyQueueItem(
                 hopOutcomesJson = hopOutcomes,
                 privacyReprocessed = o.optBoolean("privacy_reprocessed", false),
                 privacyQuarantined = o.optBoolean("privacy_quarantine", false),
+                privacyQuarantineReason = o.optString("privacy_quarantine_reason").ifEmpty { null },
+                privacySpanClasses = o.optString("privacy_span_classes").ifEmpty { null },
             )
         }
     }

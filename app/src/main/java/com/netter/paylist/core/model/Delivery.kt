@@ -120,6 +120,8 @@ object DeliveryStateMachine {
                 to == DeliveryState.RETRY_WAIT || // network/408/429/5xx (§5)
                 to == DeliveryState.BLOCKED || // nonretryable 4xx / 3xx (§5.4)
                 to == DeliveryState.PENDING || // lease expiry, guarded (§5.1)
+                to == DeliveryState.RAW_UNAVAILABLE || // raw loss, fallback refused (§7.3B, B4/B9/B11)
+                to == DeliveryState.NEEDS_REVIEW || // ambiguous amount + raw lost (§7.3B/B13)
                 to == DeliveryState.HELD_AWAITING_RECONCILIATION // unknown hop (§5.5 row 4)
             DeliveryState.RETRY_WAIT -> to == DeliveryState.PENDING || // claim when due (§5.2)
                 to == DeliveryState.EXPIRED || // heartbeat/test TTL (§5, C6)

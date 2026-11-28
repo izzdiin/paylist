@@ -1,9 +1,13 @@
 package com.netter.paylist.delivery
 
 import com.netter.paylist.Route
+import com.netter.paylist.collector.ConsentStore
+import com.netter.paylist.collector.RawSnapshotStore
+import com.netter.paylist.core.model.DeliveryState
 import com.netter.paylist.core.model.RouteStamp
 import com.netter.paylist.data.TransactionRunner
 import com.netter.paylist.data.dao.AttemptDao
+import com.netter.paylist.data.dao.CaptureLogDao
 import com.netter.paylist.data.dao.DeliveryDao
 import com.netter.paylist.data.dao.EventDao
 import com.netter.paylist.data.entity.AttemptState
@@ -13,6 +17,9 @@ import com.netter.paylist.data.entity.DeliveryEntity
 import com.netter.paylist.data.entity.EventEntity
 import com.netter.paylist.data.entity.HopOutcome
 import com.netter.paylist.data.RouteStampMap
+import com.netter.paylist.parser.Direction
+import com.netter.paylist.parser.DirectionHeuristic
+import com.netter.paylist.privacy.FallbackGate
 import com.netter.paylist.security.SecretProvider
 import com.netter.paylist.security.SecretResult
 import kotlinx.coroutines.CancellationException
@@ -73,6 +80,33 @@ class DeliveryProcessor(
     private val transport: TransportClient,
     private val clock: () -> Long = { System.currentTimeMillis() },
     private val random: () -> Double = { Math.random() },
+    /** Stage D §7.3A: the raw-snapshot store (null = B disabled, A′ only). */
+    private val rawSnapshotStore: RawSnapshotStore? = null,
+    /** Stage D §7.5/§7.3: per-route consent records (null = B unverifiable). */
+    private val consentStore: ConsentStore? = null,
+    /**
+     * F43 B14: automatic A′ fallback on a recorder route requires
+     * this to be true. Defaults FALSE in production wiring
+     * (fail-closed) — set true only when B14 is confirmed against
+     * live `catat.php` semantics.
+     */
+    private val recorderGatePassed: Boolean = false,
+    /** Called when an authorised A′ fallback is dispatched (per-route counter). */
+    private val onFallbackDispatched: (routeId: String) -> Unit = {},
+    /**
+     * Stage D D4: the durable capture log (LH-04/LH-06). Null skips
+     * capture-log cleanup (tests that predate D4); production
+     * always wires the real DAO.
+     */
+    private val captureLogDao: CaptureLogDao? = null,
+    /**
+     * C1 ambiguous-case alert (user decision 2026-11-23): called
+     * with the delivery id when the server answers
+     * `match.status == 'ambiguous'` — after the ACK is durable.
+     * Production wires the local high-priority notification
+     * (sound + vibration) + the badge count.
+     */
+    private val onAmbiguous: (deliveryId: String) -> Unit = {},
 ) {
     companion object {
         /** Due deliveries per worker invocation (§5.4). */
@@ -86,6 +120,15 @@ class DeliveryProcessor(
 
         /** Heartbeat/test retention after terminal state (§4.2 C11). */
         const val RETENTION_MS = 30L * 24 * 60 * 60 * 1000
+
+        /**
+         * Unlinked capture-log retention (addendum 06 LH-06,
+         * LH-D1 = 90 days, owner decision 2026-11-23): unlinked
+         * rows (`event_id` NULL) are auto-deleted 90 days after
+         * `captured_at_ms`. Linked rows live with their event;
+         * payment events are never auto-deleted (C11).
+         */
+        const val UNLINKED_CAPTURE_LOG_RETENTION_MS = 90L * 24 * 60 * 60 * 1000
 
         /**
          * Retry-exhaustion policy (Stage C; the design pins the rule
@@ -155,9 +198,27 @@ class DeliveryProcessor(
         return deliveryDao.countDue(clock()) > 0
     }
 
-    /** Retention cleanup (periodic reconciliation only, §4.2 C11). */
-    suspend fun runRetentionCleanup(): Int =
-        eventDao.deleteExpiredHeartbeatTest(clock() - RETENTION_MS)
+    /** Result of one retention-cleanup run (C11 + LH-06). */
+    data class RetentionCleanupResult(
+        /** Heartbeat/test events deleted (30 days after terminal). */
+        val heartbeatDeleted: Int,
+        /** Unlinked capture-log rows deleted (90 days, LH-D1). */
+        val captureLogDeleted: Int,
+    )
+
+    /**
+     * Retention cleanup (periodic reconciliation only, §4.2 C11 +
+     * LH-06): expired heartbeat/test events (30 days after
+     * terminal) plus unlinked capture-log rows (90 days after
+     * capture). Payment events are never auto-deleted.
+     */
+    suspend fun runRetentionCleanup(): RetentionCleanupResult {
+        val heartbeatDeleted = eventDao.deleteExpiredHeartbeatTest(clock() - RETENTION_MS)
+        val captureLogDeleted = captureLogDao?.deleteUnlinkedOlderThan(
+            clock() - UNLINKED_CAPTURE_LOG_RETENTION_MS,
+        ) ?: 0
+        return RetentionCleanupResult(heartbeatDeleted, captureLogDeleted)
+    }
 
     // --- Per-delivery processing ---
 
@@ -265,12 +326,33 @@ class DeliveryProcessor(
                     return
                 }
             }
-            val payload = try {
-                buildPayload(event, routeId)
+            // The claim body is resolved below, after the unresolved
+            // marker check: a B snapshot must only be taken when
+            // this hop will actually be attempted (§7.3A(d)).
+            // An unresolved marker for this hop means a previous
+            // attempt is still live or orphaned: never open a second
+            // socket for the hop (§8.5). Stop this delivery; startup
+            // recovery resolves the marker, and the lease reclaim
+            // returns the delivery to PENDING afterwards.
+            if (attemptDao.getUnresolvedForHop(delivery.deliveryId, nextIndex).isNotEmpty()) return
+            // Re-POST (rows 8–10) when the hop's previous outcome is
+            // unknown — read from the hop history, not the marker.
+            val isRepost = outcomes.any {
+                it.routeId == routeId &&
+                    (it.outcome == "UNKNOWN_PENDING_RECONCILIATION" || it.outcome == "MATCHED_UNCONFIRMED")
+            }
+            // §7.3A/§7.3B: resolve the claim body. A B delivery
+            // posts raw from the in-memory snapshot; on raw loss
+            // the FallbackGate decides A′ vs hold. A non-B delivery
+            // posts the stored payload.
+            val claim = try {
+                resolveClaimBody(
+                    delivery, event, route, routeId, stamps[routeId], outcomes, isRepost,
+                )
             } catch (e: Exception) {
                 null
             }
-            if (payload == null) {
+            if (claim == null) {
                 val at = clock()
                 transactions.run {
                     deliveryDao.checkpointHopIfLeaseHeld(
@@ -284,17 +366,34 @@ class DeliveryProcessor(
                 }
                 return
             }
-            // An unresolved marker for this hop means a previous
-            // attempt is still live or orphaned: never open a second
-            // socket for the hop (§8.5). Stop this delivery; startup
-            // recovery resolves the marker, and the lease reclaim
-            // returns the delivery to PENDING afterwards.
-            if (attemptDao.getUnresolvedForHop(delivery.deliveryId, nextIndex).isNotEmpty()) return
-            // Re-POST (rows 8–10) when the hop's previous outcome is
-            // unknown — read from the hop history, not the marker.
-            val isRepost = outcomes.any {
-                it.routeId == routeId &&
-                    (it.outcome == "UNKNOWN_PENDING_RECONCILIATION" || it.outcome == "MATCHED_UNCONFIRMED")
+            if (claim is ClaimBody.Hold) {
+                val at = clock()
+                transactions.run {
+                    deliveryDao.checkpointHopIfLeaseHeld(
+                        delivery.deliveryId, leaseOwner, at,
+                        nextIndex, HopOutcome.toJsonArray(outcomes)
+                    )
+                    deliveryDao.holdIfLeaseHeld(
+                        delivery.deliveryId, leaseOwner, at,
+                        claim.state, claim.errorCode, claim.summary,
+                        claim.rawLost, nextIndex, HopOutcome.toJsonArray(outcomes),
+                    )
+                }
+                return
+            }
+            val body = claim as ClaimBody.Body
+            val payload = body.payload
+            val fenceGeneration = body.fenceGeneration
+            val snapshotTaken = body.snapshotTaken
+            if (body.isFallback) {
+                // The raw snapshot is gone; flag the delivery so
+                // the operator knows the posted text is
+                // constructed (§7.3B). A lost lease stops here —
+                // the reclaim returns the delivery to PENDING.
+                if (deliveryDao.markRawLostIfLeaseHeld(
+                        delivery.deliveryId, leaseOwner, clock(),
+                    ) != 1
+                ) return
             }
             // Admission (§8.5): the marker is written before
             // `openConnection()` — the only durable truth that this
@@ -317,11 +416,29 @@ class DeliveryProcessor(
                     urlSha256 = sha256Hex(route.url),
                     dedupeKey = event.dedupeKey,
                     ownerBootId = bootId,
+                    // §7.3B: an authorised fallback dispatch is
+                    // flagged raw_lost on the attempt row.
+                    rawLost = body.isFallback,
+                    // §7.3A(e)/B20: the admission stamp — the fence
+                    // generation recorded at the pre-send gate.
+                    fenceGeneration = fenceGeneration,
                 )
             )
             // Claim for socket open. If the row was abandoned
-            // concurrently, stop: the coordinator owns it now.
-            if (attemptDao.claimForSocketOpen(attemptId) != 1) return
+            // concurrently, stop: the coordinator owns it now. A
+            // taken snapshot is returned to the map — the claim
+            // transaction failed after the take (§7.3A(d)).
+            if (attemptDao.claimForSocketOpen(attemptId) != 1) {
+                snapshotTaken?.let { rawSnapshotStore?.returnSnapshot(it) }
+                return
+            }
+            // §7.3A(e) admission fence: the generation recorded at
+            // the pre-send gate is re-read immediately before the
+            // first write, as the LAST step of the checkpoint
+            // callback — a plain volatile read, no lock held, no
+            // I/O, no suspension point between the read and the
+            // write. A mismatch aborts before any byte is written.
+            var fenceAborted = false
             val result = transport.post(
                 TransportRequest(url = route.url, authSecret = secret, body = payload.toString())
             ) {
@@ -329,17 +446,56 @@ class DeliveryProcessor(
                 // SOCKET_OPEN only; the hop checkpoint lands after the
                 // POST returns (§5.5). A false return aborts the POST
                 // before the first byte is written.
-                attemptDao.markSocketOpen(attemptId) == 1
+                if (attemptDao.markSocketOpen(attemptId) != 1) return@post false
+                val fence = fenceGeneration
+                if (fence != null && rawSnapshotStore?.fence(routeId) != fence) {
+                    fenceAborted = true
+                    return@post false
+                }
+                true
             }
             val finishedAt = clock()
             val durationMs = finishedAt - startedAt
+            if (body.isFallback && result !is TransportResult.CheckpointFailed &&
+                !(result is TransportResult.NetworkError && result.errorCode in NO_POST_ERROR_CODES)
+            ) {
+                // The fallback was actually dispatched (bytes
+                // written or attempted) — count it per route
+                // (§7.3B visibility, `raw_lost_fallback_total`).
+                onFallbackDispatched(routeId)
+            }
             when (result) {
                 is TransportResult.CheckpointFailed -> {
+                    if (fenceAborted) {
+                        // Revocation observed at the final admission
+                        // read (B20 case (a)): zero bytes written,
+                        // snapshot dropped unsent, delivery BLOCKED
+                        // — no further raw POST follows.
+                        transactions.run {
+                            deliveryDao.checkpointHopIfLeaseHeld(
+                                delivery.deliveryId, leaseOwner, finishedAt,
+                                nextIndex, HopOutcome.toJsonArray(outcomes)
+                            )
+                            deliveryDao.blockIfLeaseHeld(
+                                delivery.deliveryId, leaseOwner, finishedAt,
+                                "route_revoked",
+                                "persetujuan dicabut sebelum pengiriman raw; tidak ada byte terkirim",
+                            )
+                        }
+                        attemptDao.markCompleted(
+                            attemptId, finishedAt, null, "CHECKPOINT_FAILED",
+                            "fence_revoked", durationMs, "fence_revoked",
+                            HopOutcome.toJsonArray(outcomes)
+                        )
+                        return
+                    }
                     // The attempt was abandoned (or storage failed)
                     // after admission. Leave the delivery IN_FLIGHT:
                     // the lease reclaim returns it to PENDING. The
                     // attempt row is still completed so it never
-                    // blocks reclaim as an orphan.
+                    // blocks reclaim as an orphan. A taken snapshot
+                    // is returned — the POST never started.
+                    snapshotTaken?.let { rawSnapshotStore?.returnSnapshot(it) }
                     attemptDao.markCompleted(
                         attemptId, finishedAt, null, "CHECKPOINT_FAILED",
                         "checkpoint_failed", durationMs, "checkpoint_failed",
@@ -488,6 +644,14 @@ class DeliveryProcessor(
                     deliveryDao.ackIfLeaseHeld(
                         delivery.deliveryId, leaseOwner, finishedAt, "ambiguous", null
                     )
+                }
+                // C1: the ACK is durable — alert the operator (the
+                // callback must never throw into the worker path).
+                try {
+                    onAmbiguous(delivery.deliveryId)
+                } catch (e: Exception) {
+                    // The alert failed; the ambiguous outcome is
+                    // still durable and visible in history (LH-05).
                 }
                 return false
             }
@@ -732,6 +896,264 @@ class DeliveryProcessor(
                 routes.deviceLabel(), routeId, event.occurredAtMs
             )
             else -> null
+        }
+    }
+
+    // --- Claim body (§7.3A/§7.3B) ---
+
+    /**
+     * The resolved claim body for one hop: either a POST body or a
+     * hold decision. A B delivery posts raw from the in-memory
+     * snapshot; on raw loss the FallbackGate decides A′ vs hold.
+     */
+    private sealed interface ClaimBody {
+        /** The POST body for this hop, resolved. */
+        data class Body(
+            val payload: JSONObject,
+            /** The taken raw snapshot, if any — returned to the store when the POST never starts. */
+            val snapshotTaken: RawSnapshotStore.RawSnapshot?,
+            /** The fence generation recorded at the pre-send gate (B deliveries only). */
+            val fenceGeneration: Long?,
+            /** True when the body is an authorised A′ fallback (raw lost). */
+            val isFallback: Boolean,
+        ) : ClaimBody
+
+        /** Hold the delivery instead of dispatching. */
+        data class Hold(
+            val state: DeliveryState,
+            val errorCode: String,
+            val summary: String,
+            val rawLost: Boolean,
+        ) : ClaimBody
+    }
+
+    /**
+     * Resolves the claim body for one hop (§7.3A/§7.3B).
+     *
+     * Non-B deliveries post the stored payload. A B delivery
+     * re-checks the raw opt-in, then takes the snapshot
+     * (take-don't-copy); on raw loss the §7.3B FallbackGate
+     * decides between an authorised A′ dispatch and a hold.
+     *
+     * Stage D boundary: the §9 status query does not exist yet
+     * (D5/D6 reconciliation), so criterion 5 can only pass when
+     * no POST was ever attempted for the `dedupe_key` — a
+     * fallback re-POST after any prior POST holds
+     * `RAW_UNAVAILABLE` until §9 reconciliation is wired.
+     */
+    private suspend fun resolveClaimBody(
+        delivery: DeliveryEntity,
+        event: EventEntity,
+        route: Route,
+        routeId: String,
+        stamp: RouteStamp?,
+        outcomes: List<HopOutcome>,
+        isRepost: Boolean,
+    ): ClaimBody? {
+        val stored = applyPickedPayloadOverride(
+            delivery.deliveryId, buildPayload(event, routeId),
+        )
+        // Non-B deliveries and legacy imports post the stored payload.
+        if (!delivery.rawEphemeral) {
+            return stored?.let { ClaimBody.Body(it, null, null, false) }
+        }
+        val store = rawSnapshotStore
+        val consent = consentStore
+        val now = clock()
+        // Pre-send consent re-check (§7.3): the raw opt-in must be
+        // valid NOW, not just at capture. Without a consent store
+        // the re-check cannot run — fail closed (B5b/B16).
+        val consentValid = consent?.isRawOptInValid(routeId, now) == true
+        if (!consentValid) {
+            return ClaimBody.Hold(
+                DeliveryState.BLOCKED, "consent_expired",
+                "persetujuan raw rute ${route.name} tidak berlaku saat pengiriman; raw tidak dikirim",
+                rawLost = false,
+            )
+        }
+        // Take the snapshot (take-don't-copy): at most one claim
+        // sees the raw text. The epoch is the capture-time stamp —
+        // a revoked-and-regranted route has a new epoch and the old
+        // snapshot is unclaimable.
+        val epoch = stamp?.consentEpoch ?: -1L
+        val snapshot = store?.take(event.dedupeKey, routeId, epoch)
+        if (snapshot != null) {
+            val fence = store.fence(routeId)
+            val raw = buildRawBody(stored, snapshot) ?: return null
+            return ClaimBody.Body(
+                payload = raw,
+                snapshotTaken = snapshot,
+                fenceGeneration = fence,
+                isFallback = false,
+            )
+        }
+        // Raw lost (evicted / TTL / process restart / cross-process
+        // retry): §7.3B guarded fallback evaluation.
+        return evaluateFallback(
+            delivery, event, route, routeId, stored, outcomes, isRepost, now,
+        )
+    }
+
+    /**
+     * §7.3B guarded fallback evaluation. The caller supplies the
+     * reconciliation evidence it can observe; the §9 status query
+     * is not wired in Stage D, so a prior POST can never be
+     * reconciled here (fail-closed).
+     */
+    private suspend fun evaluateFallback(
+        delivery: DeliveryEntity,
+        event: EventEntity,
+        route: Route,
+        routeId: String,
+        stored: JSONObject?,
+        outcomes: List<HopOutcome>,
+        isRepost: Boolean,
+        now: Long,
+    ): ClaimBody {
+        val amountMinor = stored?.optLong("amount", -1L)?.takeIf { it >= 0 }
+        val amountAmbiguous = stored?.optBoolean("amount_ambiguous", false) == true
+        val amountReliable = amountMinor != null && !amountAmbiguous
+        val direction = storedDirection(stored)
+        val kind = endpointKind(route)
+        val noPriorPost =
+            !isRepost && outcomes.isEmpty() &&
+                attemptDao.getByDeliveryId(delivery.deliveryId).isEmpty()
+        val reconciliation = FallbackGate.ReconciliationEvidence(
+            noPriorPost = noPriorPost,
+            // §9 query not wired in Stage D: no authoritative
+            // answer exists, so a prior POST never reconciles.
+            queryResult = null,
+            writerCoverage = null,
+            unknownHopExists = outcomes.any {
+                it.outcome == "UNKNOWN_PENDING_RECONCILIATION"
+            },
+            bindingMatches = false,
+            durableRecord = false,
+        )
+        val consentValid = consentStore?.isRawOptInValid(routeId, now) == true
+        val input = FallbackGate.FallbackInput(
+            amountReliable = amountReliable,
+            direction = direction,
+            // Criterion 3: the original stable dedupe_key is the
+            // identity; nothing fabricated. Verified identifiers
+            // from the D2b identity parser are advisory-only and
+            // do not gate the fallback.
+            identityReliable = event.dedupeKey.isNotBlank(),
+            endpointKind = kind,
+            recorderGatePassed = recorderGatePassed,
+            reconciliation = reconciliation,
+            consentValid = consentValid,
+        )
+        val decision = FallbackGate.evaluate(input)
+        if (!decision.authorized) {
+            return ClaimBody.Hold(
+                state = decision.holdState ?: DeliveryState.RAW_UNAVAILABLE,
+                errorCode = "fallback_refused",
+                summary = "fallback A′ tidak diizinkan (kriteria gagal: " +
+                    "${decision.failedCriteria.joinToString(", ")})",
+                rawLost = true,
+            )
+        }
+        // Authorised: build the A′ body from structured fields only.
+        val fallback = buildFallbackBody(stored, kind, amountMinor ?: 0L, direction)
+            ?: return ClaimBody.Hold(
+                state = DeliveryState.RAW_UNAVAILABLE,
+                errorCode = "fallback_build_failed",
+                summary = "teks fallback tidak dapat dibangun dari field terstruktur",
+                rawLost = true,
+            )
+        return ClaimBody.Body(fallback, null, null, isFallback = true)
+    }
+
+    /**
+     * Applies a §7.6 picked-payload override (Stage D review): the
+     * event row is immutable, so a picked delivery carries its
+     * chosen amount + recomputed `dedupe_key` in a
+     * `picked_payload:<delivery_id>` document. The override is
+     * applied before the B/non-B branching, so the chosen amount
+     * flows into the raw body, the fallback body, and the §7.3B
+     * evaluation (the §7.6 precedence rule: the pick re-runs the
+     * fallback evaluation with the chosen amount). A missing or
+     * malformed override leaves the stored payload untouched
+     * (fail-closed: the stored first-token amount is never silently
+     * replaced by a partial override).
+     */
+    private suspend fun applyPickedPayloadOverride(
+        deliveryId: String,
+        stored: JSONObject?,
+    ): JSONObject? {
+        if (stored == null) return null
+        val raw = deliveryDao.readCollectorValue(
+            CollectorStateKeys.PICKED_PAYLOAD_PREFIX + deliveryId,
+        ) ?: return stored
+        val override = runCatching { JSONObject(raw) }.getOrNull() ?: return stored
+        if (!override.has("amount") || !override.has("dedupe_key")) return stored
+        stored.put("amount", override.optLong("amount"))
+        stored.put("dedupe_key", override.optString("dedupe_key"))
+        stored.put("amount_ambiguous", false)
+        stored.remove("amount_tokens")
+        return stored
+    }
+
+    /** The raw POST body: the stored payload with the raw title/text restored. */
+    private fun buildRawBody(
+        stored: JSONObject?,
+        snapshot: RawSnapshotStore.RawSnapshot,
+    ): JSONObject? {
+        val base = stored ?: return null
+        val raw = JSONObject(base.toString())
+        raw.put("title", snapshot.title.take(500))
+        raw.put("text", snapshot.text.take(500))
+        // The redaction flags describe the stored text, not the raw body.
+        raw.remove("redacted")
+        raw.remove("inseparable")
+        return raw
+    }
+
+    /**
+     * The A′ fallback body (§7.2/§7.3B). NOTIFY routes post the
+     * stored structured fields (the matcher reads `amount` only);
+     * recorder routes post the §7.2 constructed text. Returns null
+     * when the constructed text needs operator review (a token was
+     * sanitised) — the gate authorised the fallback, but the text
+     * itself is not safe to send as constructed.
+     */
+    private fun buildFallbackBody(
+        stored: JSONObject?,
+        kind: FallbackGate.EndpointKind,
+        amountMinor: Long,
+        direction: Direction?,
+    ): JSONObject? {
+        val base = stored ?: return null
+        if (kind != FallbackGate.EndpointKind.RECORDER) return base
+        // Masked account / reference come from the D2b identity
+        // parser (advisory-only); no confirmed patterns exist yet,
+        // so both are omitted — never fabricated.
+        val built = LegacyPayloadMapper.buildConstructedText(
+            direction ?: Direction.UNKNOWN, amountMinor, null, null,
+        )
+        if (built.needsReview) return null
+        val fallback = JSONObject(base.toString())
+        fallback.put("text", built.text)
+        return fallback
+    }
+
+    /** The capture-time direction stored in the payload (lowercase name), or null. */
+    private fun storedDirection(stored: JSONObject?): Direction? {
+        val raw = stored?.optString("direction")?.takeIf { it.isNotBlank() } ?: return null
+        return try {
+            Direction.valueOf(raw.uppercase())
+        } catch (e: IllegalArgumentException) {
+            null
+        }
+    }
+
+    /** Endpoint kind from the route URL (criterion 4). */
+    private fun endpointKind(route: Route): FallbackGate.EndpointKind {
+        return if (route.url.contains("catat.php")) {
+            FallbackGate.EndpointKind.RECORDER
+        } else {
+            FallbackGate.EndpointKind.NOTIFY
         }
     }
 

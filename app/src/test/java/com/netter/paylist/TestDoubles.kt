@@ -3,16 +3,31 @@ package com.netter.paylist
 import com.netter.paylist.core.model.DeliveryState
 import com.netter.paylist.data.TransactionRunner
 import com.netter.paylist.data.dao.AttemptDao
+import com.netter.paylist.data.dao.AttributionOutcome
+import com.netter.paylist.data.dao.CaptureLogDao
 import com.netter.paylist.data.dao.CollectorStateDao
 import com.netter.paylist.data.dao.DeliveryDao
 import com.netter.paylist.data.dao.DeliveryStateCount
 import com.netter.paylist.data.dao.EventDao
+import com.netter.paylist.data.dao.ExportAuditDao
+import com.netter.paylist.data.dao.MatchResultDao
+import com.netter.paylist.data.dao.OrderRegistryDao
+import com.netter.paylist.data.dao.RegistryImportMetadataDao
 import com.netter.paylist.data.entity.AttemptState
+import com.netter.paylist.data.entity.CaptureLogEntity
+import com.netter.paylist.data.entity.CaptureStagingDao
+import com.netter.paylist.data.entity.CaptureStagingEntity
+import com.netter.paylist.data.entity.ClassificationDao
+import com.netter.paylist.data.entity.ClassificationEntity
 import com.netter.paylist.data.entity.CollectorStateEntity
 import com.netter.paylist.data.entity.DeliveryAttemptEntity
 import com.netter.paylist.data.entity.DeliveryEntity
 import com.netter.paylist.data.entity.EventEntity
+import com.netter.paylist.data.entity.ExportAuditEntity
+import com.netter.paylist.data.entity.MatchResultEntity
+import com.netter.paylist.data.entity.OrderRegistryEntity
 import com.netter.paylist.data.entity.PromotionReceiptEntity
+import com.netter.paylist.data.entity.RegistryImportMetadataEntity
 import java.util.concurrent.locks.Lock
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -41,6 +56,18 @@ class FakeStore {
     val attempts = LinkedHashMap<String, DeliveryAttemptEntity>()
     val collector = LinkedHashMap<String, CollectorStateEntity>()
     val receipts = LinkedHashMap<String, PromotionReceiptEntity>()
+    val staging = LinkedHashMap<String, CaptureStagingEntity>()
+    val classifications = LinkedHashMap<String, ClassificationEntity>()
+    /** Keyed `merchant_id|order_number` (the P3(b) uniqueness scope). */
+    val registry = LinkedHashMap<String, OrderRegistryEntity>()
+    val matchResults = LinkedHashMap<String, MatchResultEntity>()
+    /** Keyed by `registry_version` (the PK). */
+    val registryImports = LinkedHashMap<String, RegistryImportMetadataEntity>()
+    /** Durable capture log (LH-04), keyed by `capture_id`. */
+    val captureLog = LinkedHashMap<String, CaptureLogEntity>()
+
+    /** Export audit rows, keyed by `export_id` (D5 reconciliation export). */
+    val exportAudit = LinkedHashMap<String, ExportAuditEntity>()
 
     data class Snapshot(
         val events: Map<String, EventEntity>,
@@ -51,6 +78,13 @@ class FakeStore {
         val attempts: Map<String, DeliveryAttemptEntity>,
         val collector: Map<String, CollectorStateEntity>,
         val receipts: Map<String, PromotionReceiptEntity>,
+        val staging: Map<String, CaptureStagingEntity>,
+        val classifications: Map<String, ClassificationEntity>,
+        val registry: Map<String, OrderRegistryEntity>,
+        val matchResults: Map<String, MatchResultEntity>,
+        val registryImports: Map<String, RegistryImportMetadataEntity>,
+        val captureLog: Map<String, CaptureLogEntity>,
+        val exportAudit: Map<String, ExportAuditEntity>,
     )
 
     /** Entities are immutable data classes, so a shallow map copy is a full snapshot. */
@@ -63,6 +97,13 @@ class FakeStore {
         attempts.toMap(),
         collector.toMap(),
         receipts.toMap(),
+        staging.toMap(),
+        classifications.toMap(),
+        registry.toMap(),
+        matchResults.toMap(),
+        registryImports.toMap(),
+        captureLog.toMap(),
+        exportAudit.toMap(),
     )
 
     fun restore(s: Snapshot) {
@@ -74,6 +115,13 @@ class FakeStore {
         attempts.clear(); attempts.putAll(s.attempts)
         collector.clear(); collector.putAll(s.collector)
         receipts.clear(); receipts.putAll(s.receipts)
+        staging.clear(); staging.putAll(s.staging)
+        classifications.clear(); classifications.putAll(s.classifications)
+        registry.clear(); registry.putAll(s.registry)
+        matchResults.clear(); matchResults.putAll(s.matchResults)
+        registryImports.clear(); registryImports.putAll(s.registryImports)
+        captureLog.clear(); captureLog.putAll(s.captureLog)
+        exportAudit.clear(); exportAudit.putAll(s.exportAudit)
     }
 }
 
@@ -127,6 +175,14 @@ class FakeEventDao(private val store: FakeStore) : EventDao {
     override suspend fun getBySourceAccountKey(key: String): List<EventEntity> = store.lock.withLock {
         store.events.values.filter { it.sourceAccountKey == key }
     }
+    override suspend fun listPaymentEvents(fromMs: Long?, toMs: Long?): List<EventEntity> =
+        store.lock.withLock {
+            store.events.values
+                .filter { it.category == "payment" }
+                .filter { fromMs == null || it.occurredAtMs >= fromMs }
+                .filter { toMs == null || it.occurredAtMs <= toMs }
+                .sortedWith(compareBy({ it.occurredAtMs }, { it.eventId }))
+        }
     override suspend fun count(): Int = store.lock.withLock { store.events.size }
 
     override suspend fun nullAllSourceAccountKeys(): Int = store.lock.withLock {
@@ -159,9 +215,39 @@ class FakeEventDao(private val store: FakeStore) : EventDao {
                 delivery.legacyQkey?.let { store.deliveriesByQkey.remove(it) }
                 store.attempts.entries.removeIf { it.value.deliveryId == delivery.deliveryId }
             }
+            // FK SET NULL on capture_log (mirrors the real schema).
+            for ((captureId, row) in store.captureLog.toMap()) {
+                if (row.eventId == event.eventId) {
+                    store.captureLog[captureId] = row.copy(eventId = null)
+                }
+            }
             deleted++
         }
         deleted
+    }
+
+    /**
+     * Per-record local deletion (LH-07(e)): cascades to deliveries
+     * + attempts (mirroring the FK CASCADE); linked capture-log
+     * rows are kept with `event_id` SET NULL (mirroring the FK
+     * SET NULL on `capture_log`).
+     */
+    override suspend fun deleteById(id: String): Int = store.lock.withLock {
+        val event = store.events.remove(id) ?: return@withLock 0
+        store.eventsByDedupe.remove(event.dedupeKey)
+        store.eventsByExportRef.remove(event.exportRef)
+        val eventDeliveries = store.deliveries.values.filter { it.eventId == id }
+        for (delivery in eventDeliveries) {
+            store.deliveries.remove(delivery.deliveryId)
+            delivery.legacyQkey?.let { store.deliveriesByQkey.remove(it) }
+            store.attempts.entries.removeIf { it.value.deliveryId == delivery.deliveryId }
+        }
+        for ((captureId, row) in store.captureLog.toMap()) {
+            if (row.eventId == id) {
+                store.captureLog[captureId] = row.copy(eventId = null)
+            }
+        }
+        1
     }
 }
 
@@ -203,6 +289,19 @@ class FakeDeliveryDao(private val store: FakeStore) : DeliveryDao {
             .filter { it.state == DeliveryState.BLOCKED || it.state == DeliveryState.RETRY_WAIT }
             .sortedByDescending { it.updatedAtMs }
             .take(limit)
+    }
+    override suspend fun getAuditSet(): List<DeliveryEntity> = store.lock.withLock {
+        store.deliveries.values
+            .filter {
+                it.lastApplyStatus == "skip" || it.lastApplyStatus == "error" ||
+                    (it.state == DeliveryState.ACKED && it.lastApplyStatus == null)
+            }
+            .sortedByDescending { it.updatedAtMs }
+    }
+    override suspend fun getAmbiguousDeliveryIds(): List<String> = store.lock.withLock {
+        store.deliveries.values
+            .filter { it.lastMatchStatus == "ambiguous" }
+            .map { it.deliveryId }
     }
 
     override suspend fun readCollectorValue(key: String): String? = store.lock.withLock { store.collector[key]?.valueJson }
@@ -330,6 +429,42 @@ class FakeDeliveryDao(private val store: FakeStore) : DeliveryDao {
         1
     }
 
+    override suspend fun holdIfLeaseHeld(
+        id: String,
+        leaseOwner: String,
+        now: Long,
+        to: DeliveryState,
+        errorCode: String?,
+        errorSummary: String?,
+        rawLost: Boolean,
+        nextRouteIndex: Int,
+        hopOutcomesJson: String,
+    ): Int = store.lock.withLock {
+        val row = store.deliveries[id] ?: return@withLock 0
+        if (!leaseHeld(row, leaseOwner, now)) return@withLock 0
+        val held = row.copy(
+            state = to, lastErrorCode = errorCode, lastErrorSummary = errorSummary,
+            rawLost = rawLost, nextRouteIndex = nextRouteIndex,
+            hopOutcomesJson = hopOutcomesJson, updatedAtMs = now,
+        )
+        store.deliveries[id] = held
+        held.legacyQkey?.let { store.deliveriesByQkey[it] = held }
+        1
+    }
+
+    override suspend fun markRawLostIfLeaseHeld(
+        id: String,
+        leaseOwner: String,
+        now: Long,
+    ): Int = store.lock.withLock {
+        val row = store.deliveries[id] ?: return@withLock 0
+        if (!leaseHeld(row, leaseOwner, now)) return@withLock 0
+        val marked = row.copy(rawLost = true, updatedAtMs = now)
+        store.deliveries[id] = marked
+        marked.legacyQkey?.let { store.deliveriesByQkey[it] = marked }
+        1
+    }
+
     override suspend fun checkpointHopIfLeaseHeld(
         id: String,
         leaseOwner: String,
@@ -379,6 +514,32 @@ class FakeDeliveryDao(private val store: FakeStore) : DeliveryDao {
         retried.legacyQkey?.let { store.deliveriesByQkey[it] = retried }
         1
     }
+
+    override suspend fun blockPending(
+        id: String,
+        errorCode: String,
+        errorSummary: String,
+        now: Long,
+    ): Int = store.lock.withLock {
+        val row = store.deliveries[id] ?: return@withLock 0
+        if (row.state != DeliveryState.PENDING) return@withLock 0
+        val blocked = row.copy(
+            state = DeliveryState.BLOCKED, lastErrorCode = errorCode,
+            lastErrorSummary = errorSummary, updatedAtMs = now,
+        )
+        store.deliveries[id] = blocked
+        blocked.legacyQkey?.let { store.deliveriesByQkey[it] = blocked }
+        1
+    }
+
+    override suspend fun updateRouteStamps(id: String, routeStampsJson: String, now: Long): Int =
+        store.lock.withLock {
+            val row = store.deliveries[id] ?: return@withLock 0
+            val updated = row.copy(routeStampsJson = routeStampsJson, updatedAtMs = now)
+            store.deliveries[id] = updated
+            updated.legacyQkey?.let { store.deliveriesByQkey[it] = updated }
+            1
+        }
 
     override suspend fun deleteById(id: String): Int = store.lock.withLock {
         val row = store.deliveries.remove(id) ?: return@withLock 0
@@ -520,4 +681,431 @@ class FakeCollectorStateDao(private val store: FakeStore) : CollectorStateDao {
         if (store.collector.remove(key) != null) 1 else 0
     }
     override suspend fun getAll(): List<CollectorStateEntity> = store.lock.withLock { store.collector.values.toList() }
+}
+
+/** Stage D: fake `capture_staging` DAO (IGNORE insert, -1 on conflict). */
+class FakeCaptureStagingDao(private val store: FakeStore) : CaptureStagingDao {
+    /**
+     * Test hook (PR #5 re-review 27 Nov): when set, [getAll]
+     * throws it — used to prove sweepNow propagates a staging-read
+     * failure instead of swallowing it. Null (the default) changes
+     * nothing for any other suite.
+     */
+    @Volatile
+    var getAllFailure: Throwable? = null
+
+    override suspend fun insert(row: CaptureStagingEntity): Long = store.lock.withLock {
+        if (store.staging.containsKey(row.legacyQkey)) return@withLock -1L
+        store.staging[row.legacyQkey] = row
+        1L
+    }
+
+    override suspend fun getByLegacyQkey(qkey: String): CaptureStagingEntity? =
+        store.lock.withLock { store.staging[qkey] }
+
+    override suspend fun getByDedupeKey(key: String): List<CaptureStagingEntity> =
+        store.lock.withLock { store.staging.values.filter { it.dedupeKey == key } }
+
+    override suspend fun getAll(): List<CaptureStagingEntity> {
+        getAllFailure?.let { throw it }
+        return store.lock.withLock {
+            store.staging.values.sortedBy { it.createdAtMs }
+        }
+    }
+
+    override suspend fun deleteByLegacyQkey(qkey: String): Int = store.lock.withLock {
+        if (store.staging.remove(qkey) != null) 1 else 0
+    }
+
+    override suspend fun count(): Int = store.lock.withLock { store.staging.size }
+}
+
+/** Stage D: fake `classification_results` DAO (plain insert, ABORT on duplicate PK). */
+class FakeClassificationDao(private val store: FakeStore) : ClassificationDao {
+    override suspend fun insert(result: ClassificationEntity): Unit = store.lock.withLock {
+        if (store.classifications.containsKey(result.classificationId)) {
+            throw IllegalStateException("classification_id already exists: ${result.classificationId}")
+        }
+        store.classifications[result.classificationId] = result
+    }
+
+    override suspend fun getByEventId(eventId: String): List<ClassificationEntity> =
+        store.lock.withLock { store.classifications.values.filter { it.eventId == eventId } }
+
+    override suspend fun getByCategory(category: String): List<ClassificationEntity> =
+        store.lock.withLock { store.classifications.values.filter { it.category == category } }
+}
+
+class FakeOrderRegistryDao(private val store: FakeStore) : OrderRegistryDao {
+    override suspend fun lookup(merchantId: String, orderNumber: String): OrderRegistryEntity? =
+        store.lock.withLock { store.registry["$merchantId|$orderNumber"] }
+
+    override suspend fun getByMerchant(merchantId: String): List<OrderRegistryEntity> =
+        store.lock.withLock { store.registry.values.filter { it.merchantId == merchantId } }
+
+    override suspend fun countByMerchant(merchantId: String): Int =
+        store.lock.withLock { store.registry.values.count { it.merchantId == merchantId } }
+
+    override suspend fun deleteByMerchant(merchantId: String): Int = store.lock.withLock {
+        val keys = store.registry.keys.filter { it.startsWith("$merchantId|") }
+        keys.forEach { store.registry.remove(it) }
+        keys.size
+    }
+
+    override suspend fun insertAll(rows: List<OrderRegistryEntity>): Unit = store.lock.withLock {
+        for (row in rows) {
+            val key = "${row.merchantId}|${row.orderNumber}"
+            if (store.registry.containsKey(key)) {
+                throw IllegalStateException("order_registry PK conflict: $key")
+            }
+            store.registry[key] = row
+        }
+    }
+
+    /**
+     * Mirrors Room's transaction serialisation for the default
+     * `replaceSnapshot` (manual lock/unlock — `withLock` cannot
+     * hold a suspend call; the nested DAO calls re-lock on the
+     * same thread, as `FakeTransactionRunner` does).
+     */
+    override suspend fun replaceSnapshot(merchantId: String, rows: List<OrderRegistryEntity>) {
+        store.lock.lock()
+        try {
+            super.replaceSnapshot(merchantId, rows)
+        } finally {
+            store.lock.unlock()
+        }
+    }
+}
+
+class FakeMatchResultDao(private val store: FakeStore) : MatchResultDao {
+    override suspend fun insert(result: MatchResultEntity): Unit = store.lock.withLock {
+        if (store.matchResults.containsKey(result.matchId)) {
+            throw IllegalStateException("match_id already exists: ${result.matchId}")
+        }
+        // The unique index on attributed_order_key (NULLs distinct).
+        val key = result.attributedOrderKey
+        if (key != null && store.matchResults.values.any { it.attributedOrderKey == key }) {
+            throw IllegalStateException("attributed_order_key conflict: $key")
+        }
+        store.matchResults[result.matchId] = result
+    }
+
+    // Room @Update silently no-ops when the row is missing.
+    override suspend fun update(result: MatchResultEntity): Unit = store.lock.withLock {
+        if (store.matchResults.containsKey(result.matchId)) {
+            store.matchResults[result.matchId] = result
+        }
+    }
+
+    override suspend fun updateAdvisory(
+        matchId: String,
+        status: String,
+        ruleId: String,
+        reviewReason: String?,
+    ): Int = store.lock.withLock {
+        val row = store.matchResults[matchId] ?: return@withLock 0
+        store.matchResults[matchId] = row.copy(
+            advisoryMatchStatus = status,
+            ruleId = ruleId,
+            reviewReason = reviewReason,
+        )
+        1
+    }
+
+    override suspend fun getById(id: String): MatchResultEntity? =
+        store.lock.withLock { store.matchResults[id] }
+
+    override suspend fun getByEventId(eventId: String): List<MatchResultEntity> =
+        store.lock.withLock { store.matchResults.values.filter { it.eventId == eventId } }
+
+    override suspend fun getByOrder(merchantId: String, orderNumber: String): List<MatchResultEntity> =
+        store.lock.withLock {
+            store.matchResults.values.filter {
+                it.merchantId == merchantId && it.orderNumber == orderNumber
+            }
+        }
+
+    override suspend fun getNeedingReview(): List<MatchResultEntity> =
+        store.lock.withLock {
+            store.matchResults.values.filter {
+                it.advisoryMatchStatus ==
+                    com.netter.paylist.data.entity.AdvisoryMatchStatus.AMBIGUOUS ||
+                    it.advisoryMatchStatus ==
+                    com.netter.paylist.data.entity.AdvisoryMatchStatus.MANUAL_REVIEW
+            }.sortedByDescending { it.createdAtMs }
+        }
+
+    override suspend fun getAttributed(merchantId: String, orderNumber: String): MatchResultEntity? =
+        store.lock.withLock {
+            store.matchResults.values.firstOrNull {
+                it.merchantId == merchantId && it.orderNumber == orderNumber &&
+                    it.attributionStatus == com.netter.paylist.data.entity.AttributionStatus.ATTRIBUTED
+            }
+        }
+
+    /**
+     * Mirrors Room's transaction serialisation for the default
+     * `attribute` (manual lock/unlock — see [FakeOrderRegistryDao]).
+     */
+    override suspend fun attribute(
+        candidate: MatchResultEntity,
+        verifiedSameBankTransaction: Boolean,
+    ): AttributionOutcome {
+        store.lock.lock()
+        try {
+            return super.attribute(candidate, verifiedSameBankTransaction)
+        } finally {
+            store.lock.unlock()
+        }
+    }
+
+    override suspend fun attributeExisting(
+        candidate: MatchResultEntity,
+        verifiedSameBankTransaction: Boolean,
+        reviewNote: String,
+    ): AttributionOutcome {
+        store.lock.lock()
+        try {
+            return super.attributeExisting(candidate, verifiedSameBankTransaction, reviewNote)
+        } finally {
+            store.lock.unlock()
+        }
+    }
+}
+
+class FakeRegistryImportMetadataDao(private val store: FakeStore) : RegistryImportMetadataDao {
+    override suspend fun insert(metadata: RegistryImportMetadataEntity): Unit = store.lock.withLock {
+        // REPLACE on the composite PK (merchant_id, registry_version).
+        store.registryImports["${metadata.merchantId}|${metadata.registryVersion}"] = metadata
+    }
+
+    override suspend fun getByVersion(merchantId: String, version: String): RegistryImportMetadataEntity? =
+        store.lock.withLock { store.registryImports["$merchantId|$version"] }
+
+    override suspend fun getActive(merchantId: String): RegistryImportMetadataEntity? =
+        store.lock.withLock {
+            store.registryImports.values.firstOrNull {
+                it.merchantId == merchantId &&
+                    it.status == com.netter.paylist.data.entity.RegistrySnapshotStatus.ACTIVE
+            }
+        }
+
+    override suspend fun getHistory(merchantId: String): List<RegistryImportMetadataEntity> =
+        store.lock.withLock {
+            store.registryImports.values
+                .filter { it.merchantId == merchantId }
+                .sortedByDescending { it.importedAtMs }
+        }
+
+    override suspend fun supersedeActive(merchantId: String): Int = store.lock.withLock {
+        var count = 0
+        for ((version, meta) in store.registryImports.toMap()) {
+            if (meta.merchantId == merchantId &&
+                meta.status == com.netter.paylist.data.entity.RegistrySnapshotStatus.ACTIVE
+            ) {
+                store.registryImports[version] =
+                    meta.copy(status = com.netter.paylist.data.entity.RegistrySnapshotStatus.SUPERSEDED)
+                count++
+            }
+        }
+        count
+    }
+
+    override suspend fun deleteRegistryRows(merchantId: String): Int = store.lock.withLock {
+        val keys = store.registry.keys.filter { it.startsWith("$merchantId|") }
+        keys.forEach { store.registry.remove(it) }
+        keys.size
+    }
+
+    override suspend fun insertRegistryRows(rows: List<OrderRegistryEntity>): Unit = store.lock.withLock {
+        for (row in rows) {
+            val key = "${row.merchantId}|${row.orderNumber}"
+            if (store.registry.containsKey(key)) {
+                throw IllegalStateException("order_registry PK conflict: $key")
+            }
+            store.registry[key] = row
+        }
+    }
+
+    /**
+     * Mirrors Room's transaction serialisation + rollback for the
+     * default `swapSnapshot` (manual lock/unlock — see
+     * [FakeOrderRegistryDao]).
+     */
+    override suspend fun swapSnapshot(
+        metadata: RegistryImportMetadataEntity,
+        rows: List<OrderRegistryEntity>,
+    ) {
+        store.lock.lock()
+        val snapshot = store.snapshot()
+        try {
+            super.swapSnapshot(metadata, rows)
+        } catch (e: Throwable) {
+            store.restore(snapshot)
+            throw e
+        } finally {
+            store.lock.unlock()
+        }
+    }
+}
+
+/**
+ * Fake [CaptureLogDao] (Stage D D4): mirrors the real SQL filter
+ * semantics in Kotlin — date/amount ranges, package/outcome exact
+ * match, delivery-state + route via the current (non-superseded)
+ * deliveries, structured-field query (package substring or exact
+ * amount), `post_time_ms` DESC, LIMIT/OFFSET.
+ */
+class FakeCaptureLogDao(private val store: FakeStore) : CaptureLogDao {
+    override suspend fun insert(row: CaptureLogEntity): Long = store.lock.withLock {
+        if (store.captureLog.containsKey(row.captureId)) return@withLock -1L
+        store.captureLog[row.captureId] = row
+        1L
+    }
+
+    override suspend fun getById(id: String): CaptureLogEntity? =
+        store.lock.withLock { store.captureLog[id] }
+
+    override suspend fun listByEventId(eventId: String): List<CaptureLogEntity> =
+        store.lock.withLock {
+            store.captureLog.values
+                .filter { it.eventId == eventId }
+                .sortedByDescending { it.postTimeMs }
+        }
+
+    private fun currentDeliveries(eventId: String?): List<DeliveryEntity> {
+        if (eventId == null) return emptyList()
+        return store.deliveries.values.filter {
+            it.eventId == eventId &&
+                it.state != DeliveryState.DISCARDED && it.state != DeliveryState.EXPIRED
+        }
+    }
+
+    private fun matches(
+        row: CaptureLogEntity,
+        fromMs: Long?,
+        toMs: Long?,
+        minAmount: Long?,
+        maxAmount: Long?,
+        packageName: String?,
+        outcome: String?,
+        state: DeliveryState?,
+        routeId: String?,
+        query: String?,
+        matchStatus: String?,
+    ): Boolean {
+        if (fromMs != null && row.postTimeMs < fromMs) return false
+        if (toMs != null && row.postTimeMs > toMs) return false
+        if (minAmount != null && (row.amountMinor ?: Long.MIN_VALUE) < minAmount) return false
+        if (maxAmount != null && (row.amountMinor ?: Long.MAX_VALUE) > maxAmount) return false
+        if (packageName != null && row.sourcePackage != packageName) return false
+        if (outcome != null && row.outcome != outcome) return false
+        val joined = currentDeliveries(row.eventId)
+        if (state != null && joined.none { it.state == state }) return false
+        if (routeId != null && joined.none { it.routeIdsJson.contains("\"$routeId\"") }) return false
+        if (matchStatus != null && joined.none { it.lastMatchStatus == matchStatus }) return false
+        if (query != null) {
+            val packageHit = row.sourcePackage.contains(query, ignoreCase = true)
+            val amountHit = row.amountMinor?.toString() == query
+            if (!packageHit && !amountHit) return false
+        }
+        return true
+    }
+
+    override suspend fun listHistory(
+        fromMs: Long?,
+        toMs: Long?,
+        minAmount: Long?,
+        maxAmount: Long?,
+        packageName: String?,
+        outcome: String?,
+        state: DeliveryState?,
+        routeId: String?,
+        query: String?,
+        limit: Int,
+        offset: Int,
+        matchStatus: String?,
+    ): List<CaptureLogEntity> = store.lock.withLock {
+        store.captureLog.values
+            .filter {
+                matches(it, fromMs, toMs, minAmount, maxAmount, packageName, outcome, state, routeId, query, matchStatus)
+            }
+            .sortedByDescending { it.postTimeMs }
+            .drop(offset)
+            .take(limit)
+    }
+
+    override suspend fun countHistory(
+        fromMs: Long?,
+        toMs: Long?,
+        minAmount: Long?,
+        maxAmount: Long?,
+        packageName: String?,
+        outcome: String?,
+        state: DeliveryState?,
+        routeId: String?,
+        query: String?,
+        matchStatus: String?,
+    ): Int = store.lock.withLock {
+        store.captureLog.values.count {
+            matches(it, fromMs, toMs, minAmount, maxAmount, packageName, outcome, state, routeId, query, matchStatus)
+        }
+    }
+
+    override suspend fun distinctPackages(): List<String> = store.lock.withLock {
+        store.captureLog.values.map { it.sourcePackage }.distinct().sorted()
+    }
+
+    override suspend fun count(): Int = store.lock.withLock { store.captureLog.size }
+
+    override suspend fun countCollisionsFor(
+        packageName: String,
+        postTimeMs: Long,
+        amountMinor: Long?,
+    ): Int = store.lock.withLock {
+        store.captureLog.values.count {
+            it.outcome == "COLLISION" && it.sourcePackage == packageName &&
+                it.postTimeMs == postTimeMs && it.amountMinor == amountMinor
+        }
+    }
+
+    override suspend fun deleteById(id: String): Int = store.lock.withLock {
+        if (store.captureLog.remove(id) != null) 1 else 0
+    }
+
+    override suspend fun deleteUnlinkedOlderThan(cutoffMs: Long): Int = store.lock.withLock {
+        val doomed = store.captureLog.values.filter {
+            it.eventId == null && it.capturedAtMs < cutoffMs
+        }
+        doomed.forEach { store.captureLog.remove(it.captureId) }
+        doomed.size
+    }
+
+    override suspend fun deleteUnlinkedByOutcome(outcome: String): Int = store.lock.withLock {
+        val doomed = store.captureLog.values.filter {
+            it.eventId == null && it.outcome == outcome
+        }
+        doomed.forEach { store.captureLog.remove(it.captureId) }
+        doomed.size
+    }
+}
+
+/** Fake [ExportAuditDao] (D5 reconciliation export audit). */
+class FakeExportAuditDao(private val store: FakeStore) : ExportAuditDao {
+    override suspend fun insert(audit: ExportAuditEntity) = store.lock.withLock {
+        store.exportAudit[audit.exportId] = audit
+    }
+
+    override suspend fun getById(id: String): ExportAuditEntity? = store.lock.withLock {
+        store.exportAudit[id]
+    }
+
+    override suspend fun getRecent(limit: Int): List<ExportAuditEntity> = store.lock.withLock {
+        store.exportAudit.values.sortedByDescending { it.exportedAtMs }.take(limit)
+    }
+
+    override suspend fun countByStatus(status: String): Int = store.lock.withLock {
+        store.exportAudit.values.count { it.status == status }
+    }
 }

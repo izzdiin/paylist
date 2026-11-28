@@ -29,15 +29,24 @@ data class ParserInput(
 
 /**
  * Structured result of parsing one notification. Stage A carries amount +
- * currency only; the P3 identity fields (`bank_reference`, `order_number`,
- * sender/recipient, purpose, source account — design §3.1) are added by
- * Stage D, gated by the §3.1.3 evidence bar.
+ * currency only; Stage D adds the amount-token list and the ambiguity
+ * flag (design §7.6); the P3 identity fields (`bank_reference`,
+ * `order_number`, sender/recipient, purpose, source account — design
+ * §3.1) are added by Stage D, gated by the §3.1.3 evidence bar.
  */
 data class ParsedEvent(
     /** Amount in integer minor units (rupiah), or null when unparseable. */
     val amount: Long?,
     /** Currency code as captured (e.g. `IDR`), or null. */
     val currency: String?,
+    /**
+     * True when ≥2 currency tokens with different values were found
+     * (design §7.6): the event is `amount_ambiguous` and its
+     * delivery is created `NEEDS_REVIEW`, never `PENDING`.
+     */
+    val amountAmbiguous: Boolean = false,
+    /** Every currency token found, in position order (empty when none). */
+    val tokens: List<AmountToken> = emptyList(),
 )
 
 /**

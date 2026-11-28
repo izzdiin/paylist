@@ -82,6 +82,29 @@ interface DeliveryDao {
     @Query("SELECT * FROM deliveries WHERE state IN ('BLOCKED', 'RETRY_WAIT') ORDER BY updated_at_ms DESC LIMIT :limit")
     suspend fun getRecentProblematic(limit: Int): List<DeliveryEntity>
 
+    /**
+     * The §8.8 operator-reconciliation audit set (addendum 06
+     * LH-T07): deliveries whose server outcome needs operator
+     * attention — `last_apply_status` in {`skip`, `error`}, or
+     * ACKED with no apply status recorded (null-after-ACK, never
+     * assumed `'ok'`, §5.4).
+     */
+    @Query(
+        "SELECT * FROM deliveries WHERE last_apply_status IN ('skip', 'error') " +
+            "OR (state = 'ACKED' AND last_apply_status IS NULL) " +
+            "ORDER BY updated_at_ms DESC",
+    )
+    suspend fun getAuditSet(): List<DeliveryEntity>
+
+    /**
+     * Delivery ids whose server outcome was ambiguous (C1 badge,
+     * user decision 2026-11-23): `last_match_status = 'ambiguous'`.
+     * The badge counts these minus operator acknowledgements
+     * (`ambiguous_reviewed:<delivery_id>` collector docs).
+     */
+    @Query("SELECT delivery_id FROM deliveries WHERE last_match_status = 'ambiguous'")
+    suspend fun getAmbiguousDeliveryIds(): List<String>
+
     // --- Claim (one transaction: mode gate + consent join + lease) ---
 
     @Query("SELECT value_json FROM collector_state WHERE key = :key")
@@ -221,6 +244,49 @@ interface DeliveryDao {
     ): Int
 
     /**
+     * `IN_FLIGHT →` a held state (`RAW_UNAVAILABLE` / `NEEDS_REVIEW`
+     * / `BLOCKED`), only while the caller's lease is held and
+     * unexpired (Stage D §7.3B: the FallbackGate hold). Sets the
+     * `raw_lost` flag when the hold follows a lost raw snapshot.
+     * The caller validates the transition against
+     * `DeliveryStateMachine` before calling.
+     */
+    @Query(
+        "UPDATE deliveries SET state = :to, last_error_code = :errorCode, " +
+            "last_error_summary = :errorSummary, raw_lost = :rawLost, " +
+            "next_route_index = :nextRouteIndex, hop_outcomes_json = :hopOutcomesJson, " +
+            "updated_at_ms = :now WHERE delivery_id = :id AND state = 'IN_FLIGHT' " +
+            "AND lease_owner = :leaseOwner AND lease_until_ms > :now",
+    )
+    suspend fun holdIfLeaseHeld(
+        id: String,
+        leaseOwner: String,
+        now: Long,
+        to: DeliveryState,
+        errorCode: String?,
+        errorSummary: String?,
+        rawLost: Boolean,
+        nextRouteIndex: Int,
+        hopOutcomesJson: String,
+    ): Int
+
+    /**
+     * Sets `raw_lost = 1` on a delivery whose raw snapshot was
+     * lost but whose fallback dispatch was authorised (§7.3B),
+     * only while the caller's lease is held and unexpired.
+     */
+    @Query(
+        "UPDATE deliveries SET raw_lost = 1, updated_at_ms = :now " +
+            "WHERE delivery_id = :id AND state = 'IN_FLIGHT' " +
+            "AND lease_owner = :leaseOwner AND lease_until_ms > :now",
+    )
+    suspend fun markRawLostIfLeaseHeld(
+        id: String,
+        leaseOwner: String,
+        now: Long,
+    ): Int
+
+    /**
      * `IN_FLIGHT → HELD_AWAITING_RECONCILIATION`, only while the
      * caller's lease is held and unexpired (§5.5 rows 4/8b/9/10:
      * unknown hop, reconciliation only). Persists the hop checkpoint
@@ -291,6 +357,32 @@ interface DeliveryDao {
             "WHERE delivery_id = :id AND state = 'BLOCKED'",
     )
     suspend fun retryManual(id: String, now: Long): Int
+
+    /**
+     * `PENDING → BLOCKED` for the route-lifecycle sweep (D5, F16/F21):
+     * revocation, route delete/disable, or config change blocks
+     * pending deliveries outside the worker (no lease is held).
+     * The caller validates the transition against
+     * `DeliveryStateMachine` before calling.
+     */
+    @Query(
+        "UPDATE deliveries SET state = 'BLOCKED', last_error_code = :errorCode, " +
+            "last_error_summary = :errorSummary, updated_at_ms = :now " +
+            "WHERE delivery_id = :id AND state = 'PENDING'",
+    )
+    suspend fun blockPending(id: String, errorCode: String, errorSummary: String, now: Long): Int
+
+    /**
+     * Re-stamps a delivery's route stamps (D5, F21 re-approval):
+     * after re-grant or URL change, the operator's explicit
+     * reactivation refreshes the stamp so the claim-time check
+     * passes against current consent/config.
+     */
+    @Query(
+        "UPDATE deliveries SET route_stamps_json = :routeStampsJson, updated_at_ms = :now " +
+            "WHERE delivery_id = :id",
+    )
+    suspend fun updateRouteStamps(id: String, routeStampsJson: String, now: Long): Int
 
     /** Local-only deletion (Stage D UI). */
     @Query("DELETE FROM deliveries WHERE delivery_id = :id")

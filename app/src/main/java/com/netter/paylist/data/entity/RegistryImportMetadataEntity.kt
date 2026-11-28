@@ -3,7 +3,6 @@ package com.netter.paylist.data.entity
 import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
-import androidx.room.PrimaryKey
 
 /** Registry freshness values (design §4.6). */
 object RegistryFreshness {
@@ -39,13 +38,18 @@ object RegistrySnapshotStatus {
  */
 @Entity(
     tableName = "registry_imports",
+    // Composite key: distinct merchants may reuse the same version
+    // string ("v1"); a registry_version-only PK let one merchant's
+    // import REPLACE another merchant's metadata row (D2b, F52/F46b).
+    // The v1 schema is unreleased (no shipped app has this table),
+    // so the key changes in place with no migration.
+    primaryKeys = ["merchant_id", "registry_version"],
     indices = [
         Index(value = ["merchant_id", "status"]),
     ],
 )
 data class RegistryImportMetadataEntity(
-    /** Primary key: the registry version. */
-    @PrimaryKey
+    /** Part of the composite primary key (`merchant_id`, `registry_version`). */
     @ColumnInfo(name = "registry_version")
     val registryVersion: String,
 

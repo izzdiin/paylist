@@ -2,15 +2,35 @@ package com.netter.paylist
 
 import android.app.Application
 import androidx.work.Configuration
+import com.netter.paylist.collector.AmountReview
+import com.netter.paylist.collector.CaptureCoordinator
+import com.netter.paylist.collector.CaptureHealthStore
+import com.netter.paylist.collector.CaptureLogSink
+import com.netter.paylist.collector.ConsentStore
+import com.netter.paylist.collector.PrivacyGate
+import com.netter.paylist.collector.RawSnapshotStore
+import com.netter.paylist.collector.RouteLifecycle
+import com.netter.paylist.collector.StoreLegacySweep
+import com.netter.paylist.collector.StoreQuarantineQueue
+import com.netter.paylist.collector.StoreReviewRoutes
+import com.netter.paylist.collector.StoreRouteQueueStore
+import com.netter.paylist.export.ReconciliationExport
+import com.netter.paylist.export.ReconciliationExportRunner
+import com.netter.paylist.export.StoreConsentSnapshotSource
+import com.netter.paylist.data.EventRepository
 import com.netter.paylist.data.PaylistDatabase
 import com.netter.paylist.data.entity.CollectorStateEntity
 import com.netter.paylist.data.entity.CollectorStateKeys
+import com.netter.paylist.delivery.ReviewNotifier
 import com.netter.paylist.delivery.StoreRouteSource
 import com.netter.paylist.delivery.SyncScheduler
 import com.netter.paylist.delivery.SyncWorkerFactory
 import com.netter.paylist.migration.CutoverCommit
 import com.netter.paylist.migration.CutoverCoordinator
 import com.netter.paylist.migration.CutoverMode
+import com.netter.paylist.history.HistoryRepository
+import com.netter.paylist.migration.LegacyEnqueue
+import com.netter.paylist.migration.LegacyQkey
 import com.netter.paylist.migration.LegacyQueueMigration
 import com.netter.paylist.migration.LegacyQueueSnapshotSource
 import com.netter.paylist.privacy.GateBackedInspector
@@ -43,12 +63,48 @@ class PaylistApplication : Application(), Configuration.Provider {
 
     companion object {
         /**
-         * Stage D flips this to true when it wires capture to Room.
-         * Until then [runCutover] refuses: activating the worker
-         * while capture still targets the legacy queue would stop
-         * new payments from delivering at all.
+         * Stage D audit (PR #5 review 6049617822, 25 Nov 2026)
+         * restored this to false: the Stage D capture-to-Room
+         * wiring must NOT activate while the PR #4 safety fixes
+         * are unintegrated. Until this is true [runCutover]
+         * refuses: activating the worker while capture still
+         * targets the legacy queue would stop new payments from
+         * delivering at all.
+         *
+         * Flip to true ONLY when PR #4 and Stage D are combined on
+         * one branch with all R01–R08, process-death and Stage D
+         * tests green.
          */
         const val CAPTURE_TO_ROOM_READY: Boolean = false
+
+        /** SharedPreferences key of the persistent capture-health document. */
+        const val CAPTURE_HEALTH_KEY: String = "capture_health_v1"
+
+        /** SharedPreferences file of the successor-fence lifecycle record (audit A03: separate from the health document). */
+        const val CAPTURE_LIFECYCLE_PREFS: String = "paylist_capture_lifecycle"
+
+        /** Key of the lifecycle record inside [CAPTURE_LIFECYCLE_PREFS]. */
+        const val CAPTURE_LIFECYCLE_KEY: String = "capture_lifecycle_v1"
+
+        /** SharedPreferences file of the health offer journal (audit A06). */
+        const val CAPTURE_JOURNAL_PREFS: String = "paylist_capture_journal"
+
+        /** Key of the offer journal inside [CAPTURE_JOURNAL_PREFS]. */
+        const val CAPTURE_JOURNAL_KEY: String = "capture_health_journal_v1"
+
+        /**
+         * Vault entry id of the capture OBSERVATION KEY (audit
+         * 7237720579, A05/A06): the durable HMAC key for
+         * observation identities. It lives in the SecretVault
+         * (Keystore-encrypted, its own prefs file) — never in
+         * the health document, the lifecycle record, the
+         * journal, or Room, i.e. never alongside the identities
+         * it derives.
+         */
+        const val OBSERVATION_KEY_ENTRY: String = "capture-observation-key"
+
+        /** Monitor serialising capture-health file-lock sections inside this process. */
+        private val HEALTH_FILE_LOCK_MONITOR = Any()
     }
 
     /** This process's boot identity (fresh UUID per process start). */
@@ -57,6 +113,46 @@ class PaylistApplication : Application(), Configuration.Provider {
     val db: PaylistDatabase by lazy { PaylistDatabase.create(this) }
 
     val store: Store by lazy { Store(this) }
+
+    /**
+     * The durable observation key (audit 7237720579,
+     * A05/A06), loaded (or created) once per process from the
+     * SecretVault. When the vault cannot persist it
+     * (Keystore unavailable), the fallback is a
+     * process-lifetime random key: identities then stay keyed
+     * and unguessable, they just do not survive a restart —
+     * the unkeyed derivation is never used in production.
+     */
+    val observationKey: ByteArray? by lazy { loadOrCreateObservationKey() }
+
+    private fun loadOrCreateObservationKey(): ByteArray? {
+        val vault = SecretVault(this)
+        when (val existing = vault.secretFor(OBSERVATION_KEY_ENTRY)) {
+            is com.netter.paylist.security.SecretResult.Present -> {
+                val decoded = runCatching {
+                    java.util.Base64.getDecoder().decode(existing.value)
+                }.getOrNull()
+                if (decoded != null && decoded.size == 32) return decoded
+                // A malformed entry is replaced below.
+            }
+            else -> Unit
+        }
+        val fresh = ByteArray(32).also {
+            java.security.SecureRandom().nextBytes(it)
+        }
+        val stored = vault.putSecret(
+            OBSERVATION_KEY_ENTRY,
+            java.util.Base64.getEncoder().encodeToString(fresh),
+        )
+        return if (stored) {
+            fresh
+        } else {
+            // Vault write failed (e.g. Keystore invalidated):
+            // keep the key for this process only — still keyed,
+            // never a silent downgrade to unkeyed identities.
+            fresh
+        }
+    }
 
     val modeGate: ModeGate by lazy {
         ModeGate {
@@ -99,7 +195,283 @@ class PaylistApplication : Application(), Configuration.Provider {
 
     /** The single legacy sender (mode-gated, vault-backed secrets). */
     val sender: Sender by lazy {
-        Sender(this, modeGate, SecretVault(this))
+        Sender(
+            this, modeGate, SecretVault(this),
+            rawSnapshotStore = rawSnapshotStore,
+            consentStore = consentStore,
+            onAmbiguous = onLegacyAmbiguous,
+        )
+    }
+
+    /** The capture coordinator (Stage D, design §8.3): listener → Room/legacy. */
+    val captureCoordinator: CaptureCoordinator by lazy {
+        val transactions = db.transactionRunner()
+        val repository = EventRepository(
+            db.eventDao(),
+            db.deliveryDao(),
+            db.captureStagingDao(),
+            db.classificationDao(),
+            transactions,
+        )
+        val legacyEnqueue = LegacyEnqueue { payload, kind, routeIds ->
+            if (kind != LegacyQkey.KIND_CHAIN) return@LegacyEnqueue false
+            sender.enqueueChainSync(payload, routeIds)
+        }
+        val logSink = object : CaptureLogSink {
+            override fun logEvent(pkg: String, text: String) = store.logEvent(pkg, text)
+            override fun logLocal(text: String) = store.logLocal(text)
+        }
+        // PR #5 re-review 28 Nov; durability contract tightened
+        // by the PR #5 audits of 28 Nov (comments 7229800304 and
+        // 7235948077): the persistent capture-health document
+        // (incidents) lives in the same "paylist"
+        // SharedPreferences as the rest of the Store state, but
+        // writes are commit() — the durable acceptance boundary
+        // (apply() is only an in-memory update whose disk flush
+        // a SIGKILL can beat). commit() for the document runs
+        // ONLY on the coordinator's health-writer thread (and on
+        // close / operator paths), never on a pipeline caller
+        // thread; the offer journal's minimal counter commits
+        // run on the coordinator's dedicated journal thread,
+        // with offering callers waiting at most
+        // JOURNAL_WRITE_BOUND_MS for a sync (audit 7237720579,
+        // A06 — the bounded form of the A06 marker that makes
+        // pre-durable loss detectable). A failed commit
+        // throws, so the failure is counted and surfaced instead
+        // of swallowed. Document read-modify-writes serialise
+        // process-wide through a file lock (plus a JVM monitor
+        // against same-process overlap), so a predecessor and a
+        // successor PROCESS cannot interleave their mutations.
+        val healthPrefs = getSharedPreferences("paylist", MODE_PRIVATE)
+        // Audit 7235948077: the lifecycle record (A03) and the
+        // offer journal (A06) live in their OWN tiny preference
+        // files — separate from the health document, so document
+        // corruption can never touch the fence, and a journal
+        // commit() writes only the two counters it carries.
+        val lifecyclePrefs = getSharedPreferences(CAPTURE_LIFECYCLE_PREFS, MODE_PRIVATE)
+        val journalPrefs = getSharedPreferences(CAPTURE_JOURNAL_PREFS, MODE_PRIVATE)
+        val healthStore = object : CaptureHealthStore {
+            override fun readCaptureHealth(): String? =
+                healthPrefs.getString(CAPTURE_HEALTH_KEY, null)
+
+            override fun writeCaptureHealth(json: String) {
+                val ok = healthPrefs.edit()
+                    .putString(CAPTURE_HEALTH_KEY, json).commit()
+                check(ok) { "capture-health commit failed" }
+            }
+
+            override fun readCaptureLifecycle(): String? =
+                lifecyclePrefs.getString(CAPTURE_LIFECYCLE_KEY, null)
+
+            override fun writeCaptureLifecycle(json: String) {
+                val ok = lifecyclePrefs.edit()
+                    .putString(CAPTURE_LIFECYCLE_KEY, json).commit()
+                check(ok) { "capture-lifecycle commit failed" }
+            }
+
+            override fun readCaptureHealthJournal(): String? =
+                journalPrefs.getString(CAPTURE_JOURNAL_KEY, null)
+
+            override fun writeCaptureHealthJournal(json: String) {
+                val ok = journalPrefs.edit()
+                    .putString(CAPTURE_JOURNAL_KEY, json).commit()
+                check(ok) { "capture-health journal commit failed" }
+            }
+
+            override fun <T> withCaptureHealthLock(block: () -> T): T =
+                synchronized(HEALTH_FILE_LOCK_MONITOR) {
+                    val channel = java.io.RandomAccessFile(
+                        java.io.File(filesDir, "capture_health.lock"), "rw",
+                    ).channel
+                    try {
+                        val lock = try {
+                            channel.lock()
+                        } catch (e: Exception) {
+                            // The JVM monitor above already
+                            // serialises this process; a file-lock
+                            // failure must not break capture —
+                            // proceed under the monitor alone.
+                            null
+                        }
+                        try {
+                            block()
+                        } finally {
+                            try {
+                                lock?.release()
+                            } catch (_: Exception) {
+                            }
+                        }
+                    } finally {
+                        try {
+                            channel.close()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+        }
+        CaptureCoordinator(
+            repository = repository,
+            modeReader = { coordinator.getMode() },
+            legacyEnqueue = legacyEnqueue,
+            routesProvider = { store.routes() },
+            deviceIdProvider = { store.deviceLabel() },
+            logger = logSink,
+            onRoomEnqueued = { SyncScheduler.requestSync(this) },
+            privacyGate = privacyGate,
+            rawSnapshotStore = rawSnapshotStore,
+            consentStore = consentStore,
+            captureLogDao = db.captureLogDao(),
+            healthStore = healthStore,
+            observationKeyProvider = { observationKey },
+        )
+    }
+
+    /**
+     * The Stage D D4 history read model (addendum 06, LH-01–LH-03):
+     * capture log + linked events/deliveries/attempts, in-app
+     * viewing only — no export capability (LH-07(c), F55).
+     */
+    val historyRepository: HistoryRepository by lazy {
+        HistoryRepository(
+            captureLogDao = db.captureLogDao(),
+            eventDao = db.eventDao(),
+            deliveryDao = db.deliveryDao(),
+            attemptDao = db.attemptDao(),
+            collectorStateDao = db.collectorStateDao(),
+        )
+    }
+
+    /**
+     * C1 ambiguous-case alert (user decision 2026-11-23): the Room
+     * worker path fires with a delivery id; the amount/package are
+     * resolved via the history repository on a fresh thread (the
+     * worker thread never blocks on the resolve). When the resolve
+     * fails, the alert still fires with generic text.
+     */
+    private val onRoomAmbiguous: (deliveryId: String) -> Unit = { deliveryId ->
+        Thread {
+            val info = try {
+                runBlocking { historyRepository.ambiguousCaseInfo(deliveryId) }
+            } catch (e: Exception) {
+                null
+            }
+            ReviewNotifier.notifyAmbiguous(this, deliveryId, info?.first, info?.second)
+        }.start()
+    }
+
+    /**
+     * C1 ambiguous-case alert, legacy sender path: the case is
+     * recorded durably (collector doc, for the badge) and the
+     * alert fires with the payload's amount/package.
+     */
+    private val onLegacyAmbiguous: (qkey: String, dedupeKey: String, amountMinor: Long?, sourcePackage: String?) -> Unit =
+        { qkey, dedupeKey, amount, pkg ->
+            try {
+                runBlocking {
+                    historyRepository.recordLegacyAmbiguous(qkey, dedupeKey, amount, pkg)
+                }
+            } catch (e: Exception) {
+                store.logLocal("gagal mencatat kasus ambigu legacy: ${e.message?.take(120)}")
+            }
+            ReviewNotifier.notifyAmbiguous(this, "legacy:$qkey", amount, pkg)
+        }
+
+    /** Per-route consent records (§7.5 C22(l), §7.3 P6 opt-in). */
+    val consentStore: ConsentStore by lazy {
+        ConsentStore(db.collectorStateDao())
+    }
+
+    /** The Stage D PrivacyGate, bound to the consent store (B-eligibility). */
+    val privacyGate: PrivacyGate by lazy {
+        PrivacyGate(consentStore)
+    }
+
+    /**
+     * The single §7.3A raw-snapshot store, shared by the capture
+     * executor (put) and the claim paths (take). One instance for
+     * the whole process.
+     */
+    val rawSnapshotStore: RawSnapshotStore by lazy {
+        RawSnapshotStore()
+    }
+
+    /**
+     * The Stage D operator review surface (§7.6/§7.3B/§7.7):
+     * amount picks, RAW_UNAVAILABLE authorise/discard, quarantine
+     * approve/discard. The coordinator is the quarantine record
+     * store; the legacy sweep/queue adapters hold SenderLock.
+     * `recorderGatePassed` stays false until B14 passes against
+     * live `catat.php` semantics (fail-closed).
+     */
+    val amountReview: AmountReview by lazy {
+        AmountReview(
+            deliveryDao = db.deliveryDao(),
+            eventDao = db.eventDao(),
+            collectorStateDao = db.collectorStateDao(),
+            matchResultDao = db.matchResultDao(),
+            transactions = db.transactionRunner(),
+            quarantineStore = coordinator,
+            legacySweep = StoreLegacySweep(store),
+            quarantineQueue = StoreQuarantineQueue(store),
+            routes = StoreReviewRoutes(store),
+            consentStore = consentStore,
+            privacyGate = privacyGate,
+            recorderGatePassed = false,
+        )
+    }
+
+    /**
+     * The Stage D route lifecycle (§7.5/F21): revoke/delete/
+     * disable/enable + the BLOCKED sweep and explicit reactivation.
+     */
+    val routeLifecycle: RouteLifecycle by lazy {
+        RouteLifecycle(
+            deliveryDao = db.deliveryDao(),
+            transactions = db.transactionRunner(),
+            consentStore = consentStore,
+            routes = StoreRouteSource(store),
+            queueStore = StoreRouteQueueStore(store),
+            rawSnapshotStore = rawSnapshotStore,
+        )
+    }
+
+    /**
+     * The §7.7A reconciliation export (Q1 REQUIRED) — the only
+     * export path in the app (F55). Quarantined dedupe keys come
+     * from the coordinator's quarantine records (unresolved only).
+     */
+    val reconciliationExport: ReconciliationExport by lazy {
+        val routeSource = StoreRouteSource(store)
+        ReconciliationExport(
+            eventDao = db.eventDao(),
+            deliveryDao = db.deliveryDao(),
+            matchResultDao = db.matchResultDao(),
+            classificationDao = db.classificationDao(),
+            routes = routeSource,
+            consentSource = StoreConsentSnapshotSource(consentStore, routeSource),
+            quarantinedDedupeKeys = {
+                runBlocking {
+                    coordinator.listAll()
+                        .filter { it.resolution == null }
+                        .map { it.dedupeKey }
+                        .toSet()
+                }
+            },
+        )
+    }
+
+    /** Streams a frozen export to SAF with per-row revalidation + audit. */
+    val exportRunner: ReconciliationExportRunner by lazy {
+        ReconciliationExportRunner(reconciliationExport, db.exportAuditDao())
+    }
+
+    /** Read-only held-count aggregates for the Diagnostics screen (D5). */
+    val diagnosticsRepository: DiagnosticsRepository by lazy {
+        DiagnosticsRepository(
+            deliveryDao = db.deliveryDao(),
+            queueSnapshot = { store.queue() },
+            ambiguousCount = { historyRepository.ambiguousCount() },
+        )
     }
 
     override fun onCreate() {
@@ -107,10 +479,37 @@ class PaylistApplication : Application(), Configuration.Provider {
         Thread { startup() }.start()
     }
 
+    /**
+     * Per-route `raw_lost_fallback_total` counters (§7.3B
+     * visibility): how many authorised A′ fallbacks were actually
+     * dispatched per route in this process. Surfaced in
+     * diagnostics (D5); the durable per-delivery record is the
+     * `raw_lost` flag on the delivery + attempt rows.
+     */
+    val rawLostFallbackTotals: MutableMap<String, java.util.concurrent.atomic.AtomicLong> =
+        java.util.concurrent.ConcurrentHashMap()
+
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder()
             .setWorkerFactory(
-                SyncWorkerFactory(db, StoreRouteSource(store), SecretVault(this))
+                SyncWorkerFactory(
+                    db, StoreRouteSource(store), SecretVault(this),
+                    rawSnapshotStore = rawSnapshotStore,
+                    consentStore = consentStore,
+                    // F43 B14: fail-closed — automatic A′ fallback
+                    // on recorder routes is NOT permitted until B14
+                    // passes against live catat.php semantics.
+                    recorderGatePassed = false,
+                    onFallbackDispatched = { routeId ->
+                        rawLostFallbackTotals
+                            .computeIfAbsent(routeId) {
+                                java.util.concurrent.atomic.AtomicLong()
+                            }
+                            .incrementAndGet()
+                        store.logLocal("fallback A′ terkirim (raw hilang) rute $routeId")
+                    },
+                    onAmbiguous = onRoomAmbiguous,
+                )
             )
             .build()
 
@@ -148,6 +547,30 @@ class PaylistApplication : Application(), Configuration.Provider {
             store.logLocal("pemulihan awal gagal: ${e.message?.take(120)}")
         }
         try {
+            // PR #5 re-review 28 Nov: surface the PERSISTENT
+            // capture-health state at startup — incidents recorded
+            // by a previous process are operator-visible in the
+            // local log (and via degradedState()) instead of dying
+            // with that process's volatile counters.
+            val health = captureCoordinator.degradedState()
+            if (health.degraded) {
+                store.logLocal(
+                    "kesehatan capture TERDEGRADASI saat mulai: " +
+                        health.reasons.joinToString("; ").take(900),
+                )
+            }
+            if (health.persistentIncidents.isNotEmpty()) {
+                store.logLocal(
+                    "insiden capture persisten: " +
+                        health.persistentIncidents.joinToString("; ") {
+                            "${it.category}=${it.status} x${it.count}"
+                        }.take(600),
+                )
+            }
+        } catch (e: Exception) {
+            store.logLocal("cek kesehatan capture gagal: ${e.message?.take(120)}")
+        }
+        try {
             val routesStore = SharedPreferencesKeyValueStore(
                 getSharedPreferences("paylist", MODE_PRIVATE)
             )
@@ -164,10 +587,68 @@ class PaylistApplication : Application(), Configuration.Provider {
             store.logLocal("migrasi secret gagal: ${e.message?.take(120)}")
         }
         try {
+            // Stage D D5: one-time upgrade migration (§7.5) — routes
+            // that already exist from v2.3 carry their working
+            // consent forward (the operator already runs the
+            // listener; the upgrade must not silently stop billing
+            // capture). Guarded by the collector marker doc; never
+            // re-grants a revoked route. Fresh installs get no
+            // grant until the operator completes consent in
+            // RouteEditActivity.
+            val marker = runBlocking {
+                db.collectorStateDao().get(RouteLifecycle.UPGRADE_MIGRATION_KEY)
+            }
+            if (marker == null) {
+                val granted = runBlocking {
+                    routeLifecycle.migrateUpgradeConsent(store.routes().map { it.id })
+                }
+                runBlocking {
+                    db.collectorStateDao().put(
+                        CollectorStateEntity(
+                            RouteLifecycle.UPGRADE_MIGRATION_KEY,
+                            JSONObject().apply {
+                                put("granted", granted)
+                                put("at_ms", System.currentTimeMillis())
+                            }.toString(),
+                            System.currentTimeMillis(),
+                        )
+                    )
+                }
+                if (granted > 0) {
+                    store.logLocal("migrasi persetujuan: $granted rute lama diaktifkan")
+                }
+            }
+        } catch (e: Exception) {
+            store.logLocal("migrasi persetujuan gagal: ${e.message?.take(120)}")
+        }
+        try {
             SyncScheduler.schedulePeriodic(this)
             SyncScheduler.scheduleHeartbeat(this)
         } catch (e: Exception) {
             store.logLocal("jadwal WorkManager gagal: ${e.message?.take(120)}")
+        }
+        try {
+            // Stage D: re-promote staging rows orphaned by a process
+            // death between staging and enqueue, then sweep
+            // periodically on the capture executor.
+            runBlocking { captureCoordinator.sweepOrphanedStaging() }
+            captureCoordinator.startPeriodicSweep()
+        } catch (e: Exception) {
+            store.logLocal("sweep staging gagal: ${e.message?.take(120)}")
+        }
+        try {
+            // Stage D D3: recover amount picks interrupted by a
+            // crash between the Room hold and the legacy sweep —
+            // re-sweep and release/block each HELD delivery.
+            val (released, blocked, held) =
+                runBlocking { amountReview.recoverHeldPicks() }
+            if (released > 0 || blocked > 0 || held > 0) {
+                store.logLocal(
+                    "pemulihan pick review: $released dilepas, $blocked diblokir, $held masih ditahan"
+                )
+            }
+        } catch (e: Exception) {
+            store.logLocal("pemulihan pick review gagal: ${e.message?.take(120)}")
         }
     }
 

@@ -15,6 +15,15 @@ android {
         versionCode = 4
         versionName = "2.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Process-death oracle phases (PR #5 re-review 28 Nov):
+        // CaptureDeathPhaseA kills its own process, so the phases
+        // must NEVER run under connectedDebugAndroidTest — they run
+        // only through scripts/capture_death_tests.sh, as separate
+        // `am instrument` invocations with the runner's death
+        // checks. Same pattern as the Stage C oracle on the audit
+        // branch.
+        testInstrumentationRunnerArguments["notClass"] =
+            "com.netter.paylist.CaptureDeathPhaseA,com.netter.paylist.CaptureDeathPhaseB"
     }
 
     buildTypes {
