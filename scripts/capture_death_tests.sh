@@ -87,6 +87,16 @@
 # for persisted incidents; the residual pre-flush loss window is
 # documented in the CaptureHealthStore contract.
 #
+# Scenario c08 (PR #5 audit 7235948077, A06) covers the other
+# side of that boundary: PhaseA drives the same overflow drop
+# with the health store's durable write GATED (the writer parks
+# inside the write; the incident is offered and journaled but
+# never durable, no flush), then kills itself. PhaseB requires
+# the incident itself to be ABSENT (it is genuinely lost — no
+# zero-loss claim) and an UNKNOWN_LOSS incident, reconciled at
+# startup from the durable offer journal, to expose the loss
+# with its exact count.
+#
 # Usage: run on a machine with an emulator (or device) attached and
 # Gradle 8.9 on PATH (the CI job provides both). Exits 0 only when
 # every PhaseB passes; a PhaseA death-check failure — including a
@@ -165,6 +175,7 @@ PHASE_B="com.netter.paylist.CaptureDeathPhaseB"
 SCENARIOS=(
   "c01KillAfterStagingBeforeDelivery:c01RecoveryCompletesExactlyOnce"
   "c07KillAfterDurableIncident:c07IncidentSurvivedKill"
+  "c08KillBeforeDurableIncident:c08UnknownLossExposedAfterRestart"
 )
 
 # Negative control: PhaseA writes the marker but deliberately does

@@ -220,6 +220,107 @@ class CaptureDeathPhaseA {
     }
 
     /**
+     * c08 (PR #5 audit 7235948077, A06): the PRE-durable window
+     * must not be silent. Drives the same overflow drop as c07,
+     * but the health store's durable write is GATED: the health
+     * writer parks inside writeCaptureHealth, so the offered
+     * incident is journaled (the offer journal's commit()
+     * returns) yet NEVER crosses the durable boundary — no
+     * flush, no completed write. The marker is written and the
+     * process kills itself with the incident still in flight.
+     * PhaseB must then find NO overflow incident in the health
+     * document (it is genuinely lost) and an UNKNOWN_LOSS
+     * incident exposing exactly that loss — the loss is visible,
+     * not silent, and nothing claims the incident itself
+     * survived.
+     */
+    @Test
+    fun c08KillBeforeDurableIncident() = runBlocking {
+        val db = CaptureDeathHarness.openTestDb(ctx)
+        val gate = CaptureDeathHarness.HealthWriteGate()
+        val coordinator = CaptureDeathHarness.newCoordinator(
+            ctx, db, blockingEnqueue(), executorCapacity = 1,
+            healthWriteGate = gate,
+        )
+        CaptureDeathHarness.postPaymentNotification(
+            ctx, CaptureDeathHarness.NOTIF_ID_1, "Rp150.000",
+        )
+        CaptureDeathHarness.awaitCondition("first notification in the shade") {
+            CaptureDeathHarness.activeSnapshots(ctx).isNotEmpty()
+        }
+        val first = CaptureDeathHarness.activeSnapshots(ctx).single()
+        assertEquals(
+            CaptureCoordinator.CaptureReceipt.QUEUED,
+            coordinator.capture(first),
+        )
+        CaptureDeathHarness.awaitCondition("first capture durably staged") {
+            runBlocking { db.eventDao().count() == 1 }
+        }
+        CaptureDeathHarness.postPaymentNotification(
+            ctx, CaptureDeathHarness.NOTIF_ID_2, "Rp200.000",
+        )
+        CaptureDeathHarness.awaitCondition("second notification in the shade") {
+            CaptureDeathHarness.activeSnapshots(ctx).size >= 2
+        }
+        val second = CaptureDeathHarness.activeSnapshots(ctx)
+            .first { it.postTimeMs != first.postTimeMs }
+        assertEquals(
+            CaptureCoordinator.CaptureReceipt.QUEUED,
+            coordinator.capture(second),
+        )
+        CaptureDeathHarness.postPaymentNotification(
+            ctx, CaptureDeathHarness.NOTIF_ID_3, "Rp300.000",
+        )
+        CaptureDeathHarness.awaitCondition("third notification in the shade") {
+            CaptureDeathHarness.activeSnapshots(ctx).size >= 3
+        }
+        val third = CaptureDeathHarness.activeSnapshots(ctx)
+            .first {
+                it.postTimeMs != first.postTimeMs &&
+                    it.postTimeMs != second.postTimeMs
+            }
+        coordinator.capture(third)
+        assertEquals(1L, coordinator.counters().droppedOverflow)
+        // The incident has been OFFERED and the health writer is
+        // parked INSIDE the durable write: the write has not
+        // returned, so nothing about the incident is durable.
+        org.junit.Assert.assertTrue(
+            "the health writer must be parked inside the durable write",
+            gate.entered.await(20, java.util.concurrent.TimeUnit.SECONDS),
+        )
+        // The A06 marker, by contrast, IS durable: the offer
+        // journal recorded the offer synchronously at offer time.
+        val journalRaw = ctx.getSharedPreferences(
+            PaylistApplication.CAPTURE_JOURNAL_PREFS, Context.MODE_PRIVATE,
+        ).getString(PaylistApplication.CAPTURE_JOURNAL_KEY, null)
+        org.junit.Assert.assertNotNull("the offer journal must be durable", journalRaw)
+        org.junit.Assert.assertTrue(
+            "the journal must record at least the dropped-snapshot offer",
+            org.json.JSONObject(journalRaw!!).optLong("offered", 0L) >= 1L,
+        )
+        // And the health document carries NO overflow incident:
+        // the loss PhaseB must expose is genuinely pre-durable.
+        val healthRaw = ctx.getSharedPreferences("paylist", Context.MODE_PRIVATE)
+            .getString(PaylistApplication.CAPTURE_HEALTH_KEY, null)
+        if (healthRaw != null) {
+            val incidents = org.json.JSONObject(healthRaw)
+                .optJSONArray("incidents")
+            if (incidents != null) {
+                for (i in 0 until incidents.length()) {
+                    org.junit.Assert.assertTrue(
+                        "no incident may be durable before the kill",
+                        incidents.getJSONObject(i)
+                            .optString("category") != "overflow_snapshot_dropped",
+                    )
+                }
+            }
+        }
+        CaptureDeathHarness.writeMarker(ctx, "c08")
+        Process.killProcess(Process.myPid())
+        fail("the process must have died")
+    }
+
+    /**
      * NEGATIVE CONTROL — do NOT add a kill here. Drives to the
      * same crash window as c01 and writes the marker, then returns
      * NORMALLY without killing. The runner (clean-pass /

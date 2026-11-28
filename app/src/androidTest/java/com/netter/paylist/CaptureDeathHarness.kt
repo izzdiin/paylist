@@ -109,8 +109,31 @@ object CaptureDeathHarness {
     /** Fresh state for PhaseA: empty prefs, no test DB, empty shade. */
     fun clearAllDurableState(ctx: Context) {
         ctx.getSharedPreferences("paylist", Context.MODE_PRIVATE).edit().clear().commit()
+        // The audit-7235948077 stores (lifecycle record + offer
+        // journal) live in their own preference files — a
+        // scenario's fresh state must clear them too, or a
+        // previous scenario's journal would leak into the next
+        // one's reconciliation.
+        ctx.getSharedPreferences(
+            PaylistApplication.CAPTURE_LIFECYCLE_PREFS, Context.MODE_PRIVATE,
+        ).edit().clear().commit()
+        ctx.getSharedPreferences(
+            PaylistApplication.CAPTURE_JOURNAL_PREFS, Context.MODE_PRIVATE,
+        ).edit().clear().commit()
         ctx.deleteDatabase(TEST_DB_NAME)
         notificationManager(ctx).cancelAll()
+    }
+
+    /**
+     * A gate on the harness health store's durable write (c08):
+     * the first write parks inside the store — the offered
+     * incident is journaled but NEVER becomes durable — until
+     * [release] opens. PhaseA kills the process instead of
+     * releasing it.
+     */
+    class HealthWriteGate {
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
     }
 
     /**
@@ -186,22 +209,70 @@ object CaptureDeathHarness {
         db: PaylistDatabase,
         legacyEnqueue: LegacyEnqueue,
         executorCapacity: Int = CaptureCoordinator.EXECUTOR_CAPACITY,
+        healthWriteGate: HealthWriteGate? = null,
     ): CaptureCoordinator {
         val store = Store(ctx)
         val consentStore = ConsentStore(db.collectorStateDao())
         consentStore.grant(ROUTE_ID)
         val healthPrefs = ctx.getSharedPreferences("paylist", Context.MODE_PRIVATE)
+        val lifecyclePrefs = ctx.getSharedPreferences(
+            PaylistApplication.CAPTURE_LIFECYCLE_PREFS, Context.MODE_PRIVATE,
+        )
+        val journalPrefs = ctx.getSharedPreferences(
+            PaylistApplication.CAPTURE_JOURNAL_PREFS, Context.MODE_PRIVATE,
+        )
         // The production durability contract (PR #5 audit
         // 28 Nov): health writes are commit() — a durable
         // acknowledgement a SIGKILL cannot beat — never apply().
+        // The lifecycle record and the offer journal (audit
+        // 7235948077) follow the same contract in their own
+        // preference files, exactly like production.
         val healthStore = object : CaptureHealthStore {
             override fun readCaptureHealth(): String? =
                 healthPrefs.getString(PaylistApplication.CAPTURE_HEALTH_KEY, null)
 
             override fun writeCaptureHealth(json: String) {
+                if (healthWriteGate != null) {
+                    healthWriteGate.entered.countDown()
+                    // Parked: this write does not complete until
+                    // the gate opens. c08 never opens it — the
+                    // kill is the exit — so the offered incident
+                    // provably never crosses the durable boundary
+                    // in PhaseA's process.
+                    val deadline = System.currentTimeMillis() + 120_000L
+                    while (System.currentTimeMillis() < deadline &&
+                        healthWriteGate.release.count > 0L
+                    ) {
+                        try {
+                            healthWriteGate.release.await(
+                                50, java.util.concurrent.TimeUnit.MILLISECONDS,
+                            )
+                        } catch (_: InterruptedException) {
+                            // Swallowed on purpose (parked write).
+                        }
+                    }
+                }
                 val ok = healthPrefs.edit()
                     .putString(PaylistApplication.CAPTURE_HEALTH_KEY, json).commit()
                 check(ok) { "capture-health commit failed" }
+            }
+
+            override fun readCaptureLifecycle(): String? =
+                lifecyclePrefs.getString(PaylistApplication.CAPTURE_LIFECYCLE_KEY, null)
+
+            override fun writeCaptureLifecycle(json: String) {
+                val ok = lifecyclePrefs.edit()
+                    .putString(PaylistApplication.CAPTURE_LIFECYCLE_KEY, json).commit()
+                check(ok) { "capture-lifecycle commit failed" }
+            }
+
+            override fun readCaptureHealthJournal(): String? =
+                journalPrefs.getString(PaylistApplication.CAPTURE_JOURNAL_KEY, null)
+
+            override fun writeCaptureHealthJournal(json: String) {
+                val ok = journalPrefs.edit()
+                    .putString(PaylistApplication.CAPTURE_JOURNAL_KEY, json).commit()
+                check(ok) { "capture-health journal commit failed" }
             }
         }
         return CaptureCoordinator(

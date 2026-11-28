@@ -269,6 +269,68 @@ class CaptureDeathPhaseB {
         }
     }
 
+    /**
+     * c08 recovery (PR #5 audit 7235948077, A06): PhaseA died
+     * with an incident offered and journaled but NEVER durable.
+     * This fresh process must find: (1) NO overflow incident in
+     * the health document — the pre-durable incident itself is
+     * genuinely lost, and this scenario does not pretend
+     * otherwise; (2) an UNKNOWN_LOSS incident, recorded by the
+     * new coordinator's startup reconciliation from the offer
+     * journal, exposing the loss with its exact count. Silent
+     * loss is the failure this scenario exists to catch.
+     */
+    @Test
+    fun c08UnknownLossExposedAfterRestart() = runBlocking {
+        requireFreshProcess("c08")
+        val db = CaptureDeathHarness.openTestDb(ctx)
+        try {
+            val coordinator = CaptureDeathHarness.newCoordinator(
+                ctx, db, CaptureDeathHarness.durableLegacyEnqueue(ctx),
+            )
+            try {
+                CaptureDeathHarness.awaitCondition(
+                    "unknown loss exposed by startup reconciliation",
+                ) {
+                    coordinator.degradedState().persistentIncidents.any {
+                        it.category == "unknown_loss" &&
+                            it.status == "OPEN" &&
+                            it.count >= 1L
+                    }
+                }
+                val raw = ctx.getSharedPreferences("paylist", Context.MODE_PRIVATE)
+                    .getString(PaylistApplication.CAPTURE_HEALTH_KEY, null)
+                assertNotNull("the reconciled health document must exist", raw)
+                val incidents = org.json.JSONObject(raw!!)
+                    .optJSONArray("incidents")
+                assertNotNull(incidents)
+                var unknownLossFound = false
+                for (i in 0 until incidents!!.length()) {
+                    val item = incidents.getJSONObject(i)
+                    assertTrue(
+                        "the pre-durable overflow incident itself must NOT " +
+                            "be durable — only its loss is exposed",
+                        item.optString("category") != "overflow_snapshot_dropped",
+                    )
+                    if (item.optString("category") == "unknown_loss" &&
+                        item.optString("status") == "OPEN" &&
+                        item.optLong("count") >= 1L
+                    ) {
+                        unknownLossFound = true
+                    }
+                }
+                assertTrue(
+                    "the unknown_loss incident must be in the durable document",
+                    unknownLossFound,
+                )
+            } finally {
+                coordinator.close()
+            }
+        } finally {
+            db.close()
+        }
+    }
+
     @Test
     fun c06NegativeControlMustFail() = runBlocking {
         // Negative control (see CaptureDeathPhaseA): PhaseA wrote
