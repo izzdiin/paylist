@@ -153,6 +153,17 @@ data class CaptureCounters(
      * [CaptureDegradedState] instead of being swallowed.
      */
     val healthStoreFailures: Long = 0,
+    /**
+     * Offer-journal syncs that exceeded the bounded caller wait
+     * (audit 7237720579, A06): the journal write continued on
+     * the journal thread and landed late, but the offering
+     * caller did not wait for it. A non-zero value means the
+     * health store is slower than the declared bound (or
+     * failing) — and that offers made inside such a window are
+     * exposed to the declared residual gap if the process dies
+     * before the sync lands.
+     */
+    val healthJournalTimeouts: Long = 0,
 )
 
 /**
@@ -281,12 +292,25 @@ object CaptureIncidentCategory {
     const val FENCE_ORPHAN_CLEARED: String = "fence_orphan_cleared"
 
     /**
-     * Health incidents were OFFERED by a previous process but
-     * never durably applied before it died (audit 7235948077,
-     * A06): the offer journal survived, the queued incidents did
-     * not. The count is exact (journal offered − journal
-     * accounted − document applied), but WHICH incidents they
-     * were is unknowable — hence UNKNOWN. Aggregate (no
+     * A close-time fence publish failed on the lifecycle
+     * channel AND on the health-document fallback channel
+     * (audit 7237720579, A03 residual): a successor cannot be
+     * trusted to see the fence, so the failure is recorded as
+     * an incident and surfaced in the degraded state rather
+     * than passing silently.
+     */
+    const val FENCE_PUBLISH_FAILED: String = "fence_publish_failed"
+
+    /**
+     * Health-incident RECORD operations were OFFERED by a
+     * previous process but never durably applied before it
+     * died (audit 7235948077, A06): the offer journal survived,
+     * the queued incidents did not. The count is exact
+     * (journal offered − journal accounted − document
+     * applied), but WHICH incidents they were is unknowable —
+     * hence UNKNOWN. The count is of incident RECORDS (the
+     * persistent health evidence), never of payments or
+     * captures (audit 7237720579, A06(b)). Aggregate (no
      * identity); closes only by explicit operator disposition,
      * never by proof.
      */
@@ -317,20 +341,25 @@ data class CaptureIncident(
     /**
      * Per-snapshot OBSERVATION identity for loss/unknown
      * incidents (PR #5 audit 28 Nov; strengthened by audit
-     * 7235948077, A05): `obs:<sha256>` over package + post time
-     * + the SHA-256 of the snapshot's full combined text — the
-     * same components the dedupe key discriminates with (the
-     * amount is a pure function of the text, and the full-text
-     * hash is strictly stronger than the dedupe key's 40-char
-     * prefix hash). Two distinct notifications sharing a package
-     * AND a millisecond get DIFFERENT identities; the same
-     * notification re-observed by a rescan gets the SAME one.
-     * Privacy: the identity is a hash of hashes — no raw text,
-     * no OTP, no content is persisted in it. Recovery of an
-     * identity-keyed incident is keyed to THIS identity — proof
-     * about a different snapshot never recovers it. Empty for
-     * aggregate component-health incidents (e.g.
-     * DB_PERMANENT_FAILURE).
+     * 7235948077, A05; KEYED by audit 7237720579, A05/A06):
+     * `obs:` + HMAC-SHA-256, under the durable vault-held key,
+     * over package + post time + the SHA-256 of the snapshot's
+     * full combined text — the same components the dedupe key
+     * discriminates with (the amount is a pure function of the
+     * text, and the full-text hash is strictly stronger than
+     * the dedupe key's 40-char prefix hash). Two distinct
+     * notifications sharing a package AND a millisecond get
+     * DIFFERENT identities; the same notification re-observed
+     * by a rescan gets the SAME one. Privacy: only the keyed
+     * derivation is persisted — no raw text, no OTP, no
+     * content, and no UNKEYED hash of the text (an unkeyed
+     * deterministic hash of low-entropy text could be guessed
+     * offline from the known package + post time; the keyed
+     * one cannot be verified against a guess without the key).
+     * Recovery of an identity-keyed incident is keyed to THIS
+     * identity — proof about a different snapshot never
+     * recovers it. Empty for aggregate component-health
+     * incidents (e.g. DB_PERMANENT_FAILURE).
      */
     val identity: String = "",
 )
@@ -345,11 +374,20 @@ data class CaptureIncident(
 data class CaptureProcessIdentity(val pid: Int, val startTicks: Long)
 
 /**
+ * Tri-state process liveness (audit 7237720579, A03 residual).
+ * Only [DEAD] is a death PROOF — the sole state allowed to
+ * clear a successor fence. [UNKNOWN] (any read/parse/visibility
+ * failure) retains the fence: a proof failure is never a proof
+ * of death.
+ */
+enum class ProcessLiveness { ALIVE, DEAD, UNKNOWN }
+
+/**
  * Reads process identities from `/proc` (works for the app's own
  * process on Android and on a Linux JVM). Anything unreadable
- * degrades to the UNKNOWN identity (-1, -1), which is always
- * treated as ALIVE by [isAlive]: death must be PROVEN, never
- * assumed (fail-safe).
+ * degrades to the UNKNOWN identity (-1, -1), whose liveness is
+ * always [ProcessLiveness.UNKNOWN]: death must be PROVEN,
+ * never assumed (fail-safe).
  */
 object CaptureProcessIdentitySource {
     fun current(): CaptureProcessIdentity {
@@ -360,15 +398,63 @@ object CaptureProcessIdentitySource {
         return CaptureProcessIdentity(pid, startTicksOf(stat))
     }
 
-    /** True unless [identity]'s process is PROVABLY gone (or its PID was reused). */
-    fun isAlive(identity: CaptureProcessIdentity): Boolean {
-        if (identity.pid <= 0 || identity.startTicks < 0) return true
-        val stat = runCatching {
-            java.io.File("/proc/${identity.pid}/stat").readText()
-        }.getOrNull() ?: return false
+    /** True unless [identity]'s process is PROVABLY dead ([liveness] == DEAD). */
+    fun isAlive(identity: CaptureProcessIdentity): Boolean =
+        liveness(identity) != ProcessLiveness.DEAD
+
+    /**
+     * The tri-state liveness of [identity] (audit 7237720579,
+     * A03 residual — the previous boolean treated EVERY read
+     * failure as death):
+     *
+     * - [ProcessLiveness.DEAD] only on POSITIVE evidence: the
+     *   `/proc/<pid>/stat` file does not exist AND its `/proc`
+     *   directory is gone too (a permission or visibility
+     *   failure leaves the directory in place or fails
+     *   differently), or the stat parses and its start time
+     *   differs (the PID was reused by a different process).
+     * - [ProcessLiveness.ALIVE] when the stat parses and the
+     *   start time matches exactly.
+     * - [ProcessLiveness.UNKNOWN] for everything else: an
+     *   invalid identity, an unreadable SELF stat (our own
+     *   /proc view cannot be trusted this call), a permission
+     *   denial, a transient I/O error, or an unparseable stat.
+     *   UNKNOWN always retains the fence.
+     */
+    fun liveness(identity: CaptureProcessIdentity): ProcessLiveness {
+        if (identity.pid <= 0 || identity.startTicks < 0) {
+            return ProcessLiveness.UNKNOWN
+        }
+        // If our own stat cannot be read/parsed, this call's
+        // view of /proc is unreliable — prove nothing.
+        val selfStat = runCatching {
+            java.io.File("/proc/self/stat").readText()
+        }.getOrNull() ?: return ProcessLiveness.UNKNOWN
+        if (startTicksOf(selfStat) < 0) return ProcessLiveness.UNKNOWN
+        val statFile = java.io.File("/proc/${identity.pid}/stat")
+        val stat = try {
+            statFile.readText()
+        } catch (e: java.io.FileNotFoundException) {
+            // Positive absence requires the directory to be
+            // gone as well; a bare stat-file miss under a live
+            // directory is a visibility artefact, not death.
+            return if (java.io.File("/proc/${identity.pid}").exists()) {
+                ProcessLiveness.UNKNOWN
+            } else {
+                ProcessLiveness.DEAD
+            }
+        } catch (t: Throwable) {
+            return ProcessLiveness.UNKNOWN
+        }
         val start = startTicksOf(stat)
-        if (start < 0) return true
-        return start == identity.startTicks
+        if (start < 0) return ProcessLiveness.UNKNOWN
+        return if (start == identity.startTicks) {
+            ProcessLiveness.ALIVE
+        } else {
+            // Same PID, different start: the original process
+            // is provably gone (PID reuse).
+            ProcessLiveness.DEAD
+        }
     }
 
     private fun startTicksOf(stat: String): Long {
@@ -381,6 +467,21 @@ object CaptureProcessIdentitySource {
 
 /** The default process-wide health-document lock (one JVM). */
 object CaptureHealthLock {
+    private val lock = ReentrantLock()
+    fun <T> withLock(block: () -> T): T = lock.withLock(block)
+}
+
+/**
+ * The process-wide OFFER-JOURNAL lock (one JVM): serialises
+ * journal read-modify-writes across coordinator instances.
+ * Deliberately NOT the health-document lock (audit
+ * 7237720579, A06): a health writer stuck inside a document
+ * commit holds the document lock, and the journal must still
+ * advance in exactly that state — saturation drops are
+ * journaled at the moment they happen, behind no document
+ * write.
+ */
+object CaptureJournalLock {
     private val lock = ReentrantLock()
     fun <T> withLock(block: () -> T): T = lock.withLock(block)
 }
@@ -400,27 +501,40 @@ object CaptureHealthLock {
  *    AUTHORITATIVE lifecycle exclusion (audit 7235948077, A03).
  *    It lives apart from the health document precisely so that
  *    a corrupt or lost health document can never open the
- *    exclusion: fence evaluation reads ONLY this record (plus,
+ *    exclusion: fence evaluation reads this record (plus,
  *    for stores written before the separation, a one-time
- *    adoption of the legacy in-document fence). An unparseable
- *    lifecycle record is never overwritten or cleared — the
- *    successor waits fail-safe.
+ *    adoption of the legacy in-document fence — and, since
+ *    audit 7237720579, an active in-document fence from an
+ *    owner the record has not adopted-and-retired, which is
+ *    the fallback a predecessor publishes when THIS record's
+ *    write channel is failing). An unparseable or
+ *    schema-invalid lifecycle record is never overwritten or
+ *    cleared — the successor waits fail-safe.
  * 3. The OFFER JOURNAL ([readCaptureHealthJournal] /
- *    [writeCaptureHealthJournal]): two counters — health
- *    operations OFFERED vs offers known-DROPPED in process —
- *    written synchronously (commit() in production)
- *    at offer time, before the operation is queued. At the
- *    next start, journal-minus-applied is the exact count of
- *    incidents that were offered but never durably applied
- *    before the process died; the coordinator exposes that gap
- *    as an UNKNOWN_LOSS incident instead of losing it silently
- *    (audit 7235948077, A06). The journal write is a single-key
- *    commit() to a dedicated minimal store: it happens only on
- *    incident-offer paths (failures and drops — never on the
- *    per-capture hot path), and it is the price of making the
- *    pre-durable window DETECTABLE. The incidents in that
- *    window are still lost; what is not lost any more is the
- *    KNOWLEDGE that they were lost, and how many.
+ *    [writeCaptureHealthJournal]): two counters — incident
+ *    RECORD operations OFFERED vs offers known-DROPPED in
+ *    process (recover operations are never journaled; audit
+ *    7237720579, A06(b)). Writes run on the coordinator's
+ *    dedicated journal thread as read-modify-writes under a
+ *    dedicated journal lock (never the document lock, so a
+ *    writer stuck in a document commit cannot stall the
+ *    journal) that add only the writing instance's
+ *    unsynced delta, so overlapping instances sum exactly;
+ *    offering callers wait for a sync at most
+ *    `JOURNAL_WRITE_BOUND_MS`, never for an unbounded
+ *    commit() (audit 7237720579, A06(a)). At the next start,
+ *    journal-minus-applied is the exact count of incident
+ *    records that were offered but never durably applied
+ *    before the process died; the coordinator exposes that
+ *    gap as an UNKNOWN_LOSS incident instead of losing it
+ *    silently (audit 7235948077, A06). The journal is a
+ *    single-key commit() to a dedicated minimal store; it is
+ *    advanced only on incident-offer paths (failures and
+ *    drops — never on the per-capture hot path), and it is
+ *    the price of making the pre-durable window DETECTABLE.
+ *    The incidents in that window are still lost; what is
+ *    not lost any more is the KNOWLEDGE that they were lost,
+ *    and how many.
  *
  * DURABLE ACCEPTANCE BOUNDARY (the audit's terms): a health
  * mutation is ACCEPTED (durable) only when [writeCaptureHealth]
@@ -486,9 +600,15 @@ interface CaptureHealthStore {
     fun processIdentity(): CaptureProcessIdentity =
         CaptureProcessIdentitySource.current()
 
-    /** True unless [identity]'s process is provably dead (see [CaptureProcessIdentitySource]). */
-    fun isProcessAlive(identity: CaptureProcessIdentity): Boolean =
-        CaptureProcessIdentitySource.isAlive(identity)
+    /**
+     * Tri-state liveness of [identity]'s process (audit
+     * 7237720579, A03 residual). Only
+     * [ProcessLiveness.DEAD] — positively established absence
+     * or PID reuse — may clear a fence; ALIVE and UNKNOWN both
+     * retain it.
+     */
+    fun processLiveness(identity: CaptureProcessIdentity): ProcessLiveness =
+        CaptureProcessIdentitySource.liveness(identity)
 
     /** Serialises health-document read-modify-writes across the whole process. */
     fun <T> withCaptureHealthLock(block: () -> T): T =
@@ -644,6 +764,17 @@ class CaptureCoordinator(
      * coordinators in older tests); production always wires it.
      */
     private val healthStore: CaptureHealthStore? = null,
+    /**
+     * Supplies the durable key for KEYED observation
+     * identities (audit 7237720579, A05/A06). Production wires
+     * the SecretVault-held key (see PaylistApplication); the
+     * key is loaded once and the provider is cheap to call.
+     * Null (bare coordinators in older tests) falls back to
+     * the unkeyed derivation — safe there because incident
+     * recording, the only persistence of identities, is
+     * disabled without a health store.
+     */
+    private val observationKeyProvider: () -> ByteArray? = { null },
 ) {
     companion object {
         /** Executor work-queue capacity (design §8.3 (6′), proposed value). */
@@ -685,6 +816,20 @@ class CaptureCoordinator(
         /** Successor-fence evaluation poll interval. */
         const val FENCE_POLL_MS: Long = 25
 
+        /** Lifecycle-channel attempts before a fence publish falls back to the health document. */
+        const val FENCE_PUBLISH_ATTEMPTS: Int = 3
+
+        /**
+         * The declared bound on how long an incident-offering
+         * caller waits for an offer-journal sync (audit
+         * 7237720579, A06): the sync itself runs on the
+         * dedicated journal thread and may land later; the
+         * CALLER never waits longer than this per sync, and an
+         * offer performs at most two such waits (offered +
+         * dropped accounting).
+         */
+        const val JOURNAL_WRITE_BOUND_MS: Long = 250
+
         /** Cap on the quarantined raw health document kept as evidence. */
         const val MAX_QUARANTINED_RAW_CHARS: Int = 4_000
 
@@ -698,27 +843,57 @@ class CaptureCoordinator(
             return digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
         }
 
+        /** HMAC-SHA-256 of [input] under [key], lowercase hex. */
+        fun hmacSha256Hex(key: ByteArray, input: String): String {
+            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+            mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
+            val out = mac.doFinal(input.toByteArray(Charsets.UTF_8))
+            return out.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+        }
+
         /**
-         * The stable, privacy-safe OBSERVATION identity of one
-         * notification observation (audit 7235948077, A05):
-         * `obs:` + SHA-256 over package + post time + the
-         * SHA-256 of the full combined text. It discriminates
-         * with the same components as the dedupe key (package,
-         * time, and content — the amount is a pure function of
-         * the content, and the full-content hash is stronger
-         * than the dedupe key's 40-char prefix hash), so two
-         * DISTINCT notifications that merely share a package and
-         * a millisecond have different identities, while the
-         * SAME notification re-observed by a rescan — identical
-         * package, post time and text — has the same one (rescan
-         * idempotency). Only hashes are persisted: no raw text,
-         * no OTP, no title.
+         * The UNKEYED observation identity (legacy form): `obs:`
+         * + SHA-256 over package + post time + the SHA-256 of
+         * the full combined text. Kept for bare coordinators
+         * (no durable key wired) whose identities are never
+         * persisted — incident recording is disabled without a
+         * health store. Production NEVER uses this form: the
+         * persisted derivation is the KEYED overload below
+         * (audit 7237720579, A05/A06 — an unkeyed deterministic
+         * hash of low-entropy text, e.g. an OTP-only
+         * notification, is offline-guessable from the known
+         * package + post time; the keyed one is not verifiable
+         * against any guess without the key).
          */
         fun observationIdentity(
             packageName: String,
             postTimeMs: Long,
             contentSha256: String,
         ): String = "obs:" + sha256Hex("$packageName|$postTimeMs|$contentSha256")
+
+        /**
+         * The KEYED observation identity (audit 7237720579,
+         * A05/A06): `obs:` + HMAC-SHA-256, under [key], over the
+         * same components as the unkeyed form. It discriminates
+         * exactly as strongly (distinct notifications sharing a
+         * package and a millisecond differ; the same
+         * notification re-observed by a rescan is identical),
+         * but the persisted value cannot be verified against a
+         * guessed text without the key — so a pre-consent /
+         * pure-auth loss leaves no offline-guessable fingerprint
+         * of the raw text. The key is held in the SecretVault
+         * (see PaylistApplication) and is never persisted
+         * alongside the identities it derives.
+         */
+        fun observationIdentity(
+            packageName: String,
+            postTimeMs: Long,
+            contentSha256: String,
+            key: ByteArray,
+        ): String = "obs:" + hmacSha256Hex(
+            key,
+            "$packageName|$postTimeMs|$contentSha256",
+        )
 
         /** The observation identity of a live snapshot (see the three-arg form). */
         fun observationIdentity(snapshot: NotificationSnapshot): String =
@@ -755,6 +930,7 @@ class CaptureCoordinator(
     private val overflowWriterFailures = AtomicLong()
     private val healthIncidentsDropped = AtomicLong()
     private val healthStoreFailures = AtomicLong()
+    private val healthJournalTimeouts = AtomicLong()
     private val healthDocCorruptions = AtomicLong()
 
     /** A stored health document failed to parse at least once (see [degradedState]). */
@@ -777,6 +953,41 @@ class CaptureCoordinator(
      */
     private val healthLock = ReentrantLock()
 
+    /**
+     * This instance's observation identity for one snapshot:
+     * KEYED (HMAC) when a key provider yields a key, unkeyed
+     * only for bare coordinators (see the constructor param).
+     * Every identity this coordinator persists goes through
+     * here — never through the unkeyed companion form directly.
+     */
+    private fun obsIdentity(snapshot: NotificationSnapshot): String {
+        val key = observationKeyProvider()
+        return if (key != null) {
+            observationIdentity(
+                snapshot.packageName,
+                snapshot.postTimeMs,
+                sha256Hex(snapshot.combined),
+                key,
+            )
+        } else {
+            observationIdentity(snapshot)
+        }
+    }
+
+    /** [obsIdentity] for a snapshot reconstructed from stored event fields (the sweep path). */
+    private fun obsIdentity(
+        packageName: String,
+        postTimeMs: Long,
+        contentSha256: String,
+    ): String {
+        val key = observationKeyProvider()
+        return if (key != null) {
+            observationIdentity(packageName, postTimeMs, contentSha256, key)
+        } else {
+            observationIdentity(packageName, postTimeMs, contentSha256)
+        }
+    }
+
     // --- Offer journal state (audit 7235948077, A06) ---
     //
     // Declared here, before every pipeline thread, for the same
@@ -795,10 +1006,10 @@ class CaptureCoordinator(
     /** [offered, dropped] totals read from the durable journal at construction, or null. */
     private val journalSnapshotAtInit: LongArray? = readJournalSnapshot()
 
-    /** Total health operations offered, across all processes (seeded from the journal). */
+    /** Total incident RECORD operations offered, across all processes (seeded from the journal). */
     private val healthOfferCount = AtomicLong(journalSnapshotAtInit?.get(0) ?: 0L)
 
-    /** Total offered operations known-dropped in process, across all processes (seeded from the journal). */
+    /** Total offered RECORD operations known-dropped in process, across all processes (seeded from the journal). */
     private val healthDroppedCount = AtomicLong(journalSnapshotAtInit?.get(1) ?: 0L)
 
     private fun readJournalSnapshot(): LongArray? {
@@ -816,6 +1027,208 @@ class CaptureCoordinator(
             }
         } catch (t: Throwable) {
             null
+        }
+    }
+
+    // --- Bounded, cross-instance-exact journal sync (audit
+    // 7237720579, A06) ---
+    //
+    // The previous design wrote the journal SYNCHRONOUSLY on
+    // the offering thread, under the ingress state lock, with
+    // ABSOLUTE per-instance counter values. Three defects,
+    // per the audit: (a) a slow commit() blocked the caller —
+    // the listener thread on the overflow path — precisely
+    // during overload, and serialised every other offer behind
+    // it; (b) absolute writes from two overlapping instances
+    // (a predecessor still draining while its successor starts)
+    // could overwrite each other's totals, so counts across
+    // instances were not exact; (c) recover operations were
+    // journaled as "offered", inflating the gap with
+    // maintenance traffic.
+    //
+    // Now: ONE dedicated journal thread owns every journal
+    // write. A caller that needs the journal synced submits (or
+    // joins) the in-flight sync and waits at most
+    // [JOURNAL_WRITE_BOUND_MS] for it; a slower store makes the
+    // sync land LATE (the thread keeps writing until the
+    // counters are durable), never blocks the caller longer.
+    // The sync itself is a read-modify-write under a
+    // DEDICATED JOURNAL LOCK that adds only THIS instance's
+    // not-yet-synced DELTA
+    // to the durable totals — so overlapping instances' offers
+    // sum exactly, each delta applied once, whatever the
+    // interleaving. Only incident RECORD operations are
+    // journaled; recoveries are maintenance and never enter
+    // the offered/dropped accounting (the gap therefore counts
+    // lost health-incident records — never payments, never
+    // captures; see [reconcilePreDurableLoss]).
+
+    /** Guards [journalFuture] and the synced baselines below. */
+    private val journalLock = ReentrantLock()
+
+    /** The in-flight journal sync on [journalExecutor], or null when the journal is synced. */
+    private var journalFuture: java.util.concurrent.Future<*>? = null
+
+    /** This instance's offered total already added to the durable journal. */
+    private var journalSyncedOffered: Long = journalSnapshotAtInit?.get(0) ?: 0L
+
+    /** This instance's dropped total already added to the durable journal. */
+    private var journalSyncedDropped: Long = journalSnapshotAtInit?.get(1) ?: 0L
+
+    /** True while a journal sync is known to be lagging behind the counters (slow storage). */
+    @Volatile
+    private var journalLagging: Boolean = false
+
+    /** Owns every journal write; created lazily, threads start on first submit. */
+    private val journalExecutor: java.util.concurrent.ExecutorService =
+        java.util.concurrent.Executors.newSingleThreadExecutor(
+            daemonFactory("paylist-health-journal"),
+        )
+
+    /**
+     * Adds this instance's unsynced counter delta to the
+     * durable journal (ONE journal-locked read-modify-write;
+     * runs on the journal thread). Returns false when the
+     * store failed — the delta stays unsynced and a later
+     * offer retries; the failure is counted + logged here so
+     * it is never silent.
+     */
+    private fun syncJournalOnce(): Boolean {
+        val store = healthStore ?: return true
+        val offeredNow = healthOfferCount.get()
+        val droppedNow = healthDroppedCount.get()
+        val deltaOffered = offeredNow - journalSyncedOffered
+        val deltaDropped = droppedNow - journalSyncedDropped
+        if (deltaOffered < 0 || deltaDropped < 0) {
+            // Counters never move backwards within an instance;
+            // a negative delta means the baselines are wrong —
+            // refuse to write a regressed journal.
+            healthStoreFailures.incrementAndGet()
+            logSafely(
+                "capture-health: delta jurnal negatif (ditawari=$deltaOffered, " +
+                    "hilang=$deltaDropped) — sinkronisasi jurnal dibatalkan",
+            )
+            return false
+        }
+        if (deltaOffered == 0L && deltaDropped == 0L) return true
+        return try {
+            CaptureJournalLock.withLock {
+                val raw = store.readCaptureHealthJournal()
+                val json = if (raw.isNullOrBlank()) {
+                    JSONObject()
+                } else {
+                    JSONObject(raw)
+                }
+                val newOffered = json.optLong("offered", 0L) + deltaOffered
+                val newDropped = json.optLong("dropped", 0L) + deltaDropped
+                store.writeCaptureHealthJournal(
+                    JSONObject().apply {
+                        put("offered", newOffered)
+                        put("dropped", newDropped)
+                    }.toString(),
+                )
+                journalSyncedOffered = offeredNow
+                journalSyncedDropped = droppedNow
+            }
+            true
+        } catch (t: Throwable) {
+            healthStoreFailures.incrementAndGet()
+            logSafely(
+                "capture-health: sinkronisasi jurnal penawaran gagal " +
+                    "(${t.javaClass.simpleName}) — delta belum tersinkron, " +
+                    "penawaran berikutnya mencoba lagi; deteksi kehilangan " +
+                    "pra-durable menurun selama kegagalan ini",
+            )
+            false
+        }
+    }
+
+    /**
+     * The journal thread's drain loop: syncs until the durable
+     * journal covers the live counters, then releases the
+     * in-flight handle. A store failure ends the drain (the
+     * next offer resubmits); a slow store simply makes the
+     * loop's one write take long — callers never wait for more
+     * than the bounded wait in [writeJournalBounded].
+     */
+    private fun drainJournalWrites() {
+        while (true) {
+            val offeredAtSync = healthOfferCount.get()
+            val droppedAtSync = healthDroppedCount.get()
+            if (!syncJournalOnce()) {
+                journalLock.withLock {
+                    journalFuture = null
+                    journalLagging = true
+                }
+                return
+            }
+            val settled = journalLock.withLock {
+                if (healthOfferCount.get() == offeredAtSync &&
+                    healthDroppedCount.get() == droppedAtSync
+                ) {
+                    journalFuture = null
+                    journalLagging = false
+                    true
+                } else {
+                    false
+                }
+            }
+            if (settled) return
+        }
+    }
+
+    /**
+     * Ensures a journal sync is in flight and waits for it —
+     * at most [JOURNAL_WRITE_BOUND_MS] (audit 7237720579,
+     * A06: measured, bounded caller latency under slow or
+     * failing storage). On timeout the sync keeps running on
+     * the journal thread and lands late; the lag is counted
+     * ([CaptureCounters.healthJournalTimeouts]) and exposed in
+     * [degradedState]. The declared residual window: an offer
+     * whose sync is still lagging when the process dies is not
+     * yet journaled, so that one incident can escape the
+     * next start's gap — the window exists ONLY while storage
+     * is slower than the bound (or failing), and the lagging
+     * state is itself surfaced in-process. On a healthy store
+     * the sync completes inside the wait and the window is
+     * zero, exactly as with the old synchronous write.
+     */
+    private fun writeJournalBounded() {
+        if (healthStore == null) return
+        val future = journalLock.withLock {
+            journalFuture ?: try {
+                journalExecutor.submit { drainJournalWrites() }
+                    .also { journalFuture = it }
+            } catch (t: Throwable) {
+                // Executor shut down (post-close offers): the
+                // delta stays unsynced; counted as a lag, never
+                // a crash on a caller thread.
+                journalLagging = true
+                healthJournalTimeouts.incrementAndGet()
+                logSafely(
+                    "capture-health: thread jurnal sudah berhenti; " +
+                        "penawaran sesudah close tidak terjurnal " +
+                        "(tercatat sebagai lag jurnal)",
+                )
+                return
+            }
+        }
+        try {
+            future.get(JOURNAL_WRITE_BOUND_MS, TimeUnit.MILLISECONDS)
+        } catch (e: java.util.concurrent.TimeoutException) {
+            journalLagging = true
+            healthJournalTimeouts.incrementAndGet()
+            logSafely(
+                "capture-health: penulisan jurnal melampaui batas " +
+                    "${JOURNAL_WRITE_BOUND_MS}ms (penyimpanan lambat) — " +
+                    "penawaran lanjut tanpa menunggu; jurnal mengejar " +
+                    "di thread jurnal dan lag ini tercatat",
+            )
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (t: Throwable) {
+            // The drain guards its own store access; anything
+            // escaping it is counted there already.
         }
     }
 
@@ -1518,13 +1931,18 @@ class CaptureCoordinator(
 
     /**
      * Applies one drained batch in ONE serialised document
-     * mutation. The batch size is added to the document's
-     * `applied_count` in the SAME write, so the count is durable
-     * exactly when the batch is — the reconciliation baseline
-     * for the offer journal (audit A06).
+     * mutation. The batch's RECORD count is added to the
+     * document's `applied_count` in the SAME write, so the
+     * count is durable exactly when the batch is — the
+     * reconciliation baseline for the offer journal (audit
+     * A06). Only RECORD operations count (audit 7237720579):
+     * recoveries are maintenance — they were never journaled
+     * as offered, so counting them as applied would corrupt
+     * the gap in the other direction.
      */
     private fun applyHealthOps(ops: List<HealthOp>) {
         if (ops.isEmpty()) return
+        val recordCount = ops.count { it is HealthOp.Record }
         mutateHealth { doc ->
             for (op in ops) {
                 when (op) {
@@ -1533,15 +1951,15 @@ class CaptureCoordinator(
                 }
             }
             // A06 accounting: the document counts how many
-            // offered operations it has durably applied. A
-            // COUNT, not a highest-sequence stamp: drops are
+            // offered RECORD operations it has durably applied.
+            // A COUNT, not a highest-sequence stamp: drops are
             // accounted out of order (the moment they happen),
             // so only order-independent totals reconcile
             // exactly at the next start (see
             // [reconcilePreDurableLoss]).
             doc.put(
                 "applied_count",
-                doc.optLong("applied_count", 0L) + ops.size,
+                doc.optLong("applied_count", 0L) + recordCount,
             )
         }
     }
@@ -1629,89 +2047,89 @@ class CaptureCoordinator(
     }
 
     /**
-     * Advances the durable offer journal (caller holds
-     * [healthStateLock]). The journal is the A06 marker: a
-     * minimal two-counter document whose write is synchronous
-     * (production commit()) precisely so that it survives the
-     * process death it exists to detect. A failed journal write
-     * is counted as a store failure — the offer still proceeds;
-     * only the loss-detection degrades, and visibly.
-     */
-    private fun writeJournalLocked() {
-        val store = healthStore ?: return
-        try {
-            store.writeCaptureHealthJournal(
-                JSONObject().apply {
-                    put("offered", healthOfferCount.get())
-                    put("dropped", healthDroppedCount.get())
-                }.toString(),
-            )
-        } catch (t: Throwable) {
-            healthStoreFailures.incrementAndGet()
-            logSafely(
-                "capture-health: penulisan jurnal penawaran gagal " +
-                    "(${t.javaClass.simpleName}) — deteksi kehilangan " +
-                    "pra-durable menurun, tercatat sebagai kegagalan store",
-            )
-        }
-    }
-
-    /**
      * Offers one health operation to the health writer (audit
      * rule 1: bounded, nonblocking, no document I/O on the
-     * caller). The ONE synchronous durable write on this path is
-     * the offer journal (audit rule 4 / A06): the offer is
-     * journaled BEFORE it is queued, so a process death anywhere
+     * caller). RECORD operations are journaled (audit A06):
+     * the offer counter is raised and a journal sync is awaited
+     * — BOUNDED by [JOURNAL_WRITE_BOUND_MS] on the dedicated
+     * journal thread, never an unbounded synchronous commit
+     * under the ingress lock (audit 7237720579: the old design
+     * reintroduced blocking precisely during overload, and its
+     * absolute per-instance writes were not exact across
+     * overlapping instances). The sync precedes the queue
+     * offer, so on a healthy store a process death anywhere
      * after this point leaves a reconcilable gap instead of a
-     * silent loss. An offer that cannot be queued — full queue,
-     * or the writer already terminated — is counted in
+     * silent loss. An offer that cannot be queued — full
+     * queue, or the writer already terminated — is counted in
      * [CaptureCounters.healthIncidentsDropped], logged, and
      * journaled as DROPPED (known-lost in process), so the
      * next start does not double-report it as unknown.
+     * RECOVER operations are maintenance: they are queued the
+     * same way but are NEVER journaled as offered and never
+     * counted as applied — the journal gap counts lost
+     * incident records only (audit 7237720579, A06(b)).
      */
     private fun enqueueHealthOp(op: HealthOp) {
         if (healthStore == null) return
-        healthStateLock.withLock {
+        val isRecord = op is HealthOp.Record
+        if (isRecord) {
             healthOfferCount.incrementAndGet()
-            writeJournalLocked()
+            writeJournalBounded()
+        }
+        var droppedNow = false
+        var writerGone = false
+        healthStateLock.withLock {
             if (healthWriterTerminated) {
-                healthDroppedCount.incrementAndGet()
-                writeJournalLocked()
+                droppedNow = true
+                writerGone = true
+            } else if (!incidentQueue.offer(op)) {
+                droppedNow = true
+            }
+            if (droppedNow) {
+                if (isRecord) healthDroppedCount.incrementAndGet()
                 healthIncidentsDropped.incrementAndGet()
-                logSafely(
+            }
+        }
+        if (droppedNow) {
+            if (isRecord) writeJournalBounded()
+            logSafely(
+                if (writerGone) {
                     "capture-health: penulis kesehatan sudah berhenti; " +
-                        "operasi kesehatan tidak terantre (dihitung hilang)",
-                )
-                return
-            }
-            if (!incidentQueue.offer(op)) {
-                healthDroppedCount.incrementAndGet()
-                writeJournalLocked()
-                healthIncidentsDropped.incrementAndGet()
-                logSafely(
+                        "operasi kesehatan tidak terantre (dihitung hilang)"
+                } else {
                     "capture-health: antrean insiden penuh; operasi kesehatan " +
-                        "dihitung hilang (bukti: counter + log ini)",
-                )
-            }
+                        "dihitung hilang (bukti: counter + log ini)"
+                },
+            )
         }
     }
 
     /**
      * Startup reconciliation of the pre-durable window (audit
      * 7235948077, A06), run by the health writer before it
-     * applies anything: operations a PREVIOUS process offered
-     * (journal `offered`), minus the ones it accounted as
-     * dropped in process (journal `dropped`), minus the ones
-     * the document durably applied (`applied_count`), are an
-     * exact count of incidents lost before the durable
-     * boundary. All three are order-independent totals, so the
-     * count is exact even though drops are accounted out of
-     * order. The gap is recorded as one aggregate UNKNOWN_LOSS
-     * incident — WHICH incidents they were is unknowable, and
-     * the record says so — and `applied_count` is advanced to
-     * the accounted total so the gap is reported exactly once.
-     * No gap, no incident: a clean close (which flushes the
-     * queue) leaves offered − dropped == applied.
+     * applies anything: incident RECORD operations a PREVIOUS
+     * process offered (journal `offered`), minus the ones it
+     * accounted as dropped in process (journal `dropped`),
+     * minus the ones the document durably applied
+     * (`applied_count`), are an exact count of health-incident
+     * records lost before the durable boundary. WHAT THE GAP
+     * COUNTS — stated precisely (audit 7237720579, A06(b)):
+     * health-incident RECORD operations, and nothing else.
+     * Recover operations are never journaled and never counted
+     * as applied, so maintenance traffic cannot inflate or
+     * deflate the gap; and the gap is about incident RECORDS
+     * (the persistent evidence), never about payments or
+     * captures — a lost incident record does not mean a lost
+     * payment, and this reconciliation makes no claim about
+     * either. All three inputs are order-independent totals,
+     * so the count is exact even though drops are accounted
+     * out of order. The gap is recorded as one aggregate
+     * UNKNOWN_LOSS incident — WHICH incidents they were is
+     * unknowable, and the record says so — and `applied_count`
+     * is advanced to the accounted total so the gap is
+     * reported exactly once. No gap, no incident: a clean
+     * close (which flushes the queue) leaves offered −
+     * dropped == applied.
      */
     private fun reconcilePreDurableLoss() {
         val snapshot = journalSnapshotAtInit ?: return
@@ -1880,9 +2298,18 @@ class CaptureCoordinator(
     // whose empty fence let a successor in while its predecessor
     // was alive. Both are now impossible by construction:
     //
-    // - Fence evaluation reads ONLY the lifecycle record. The
+    // - Fence evaluation reads the lifecycle record. The
     //   health document can be corrupt, quarantined, or lost
-    //   without any effect on the exclusion.
+    //   without any effect on the exclusion — with ONE bounded
+    //   exception (audit 7237720579): an ACTIVE in-document
+    //   fence from an owner the lifecycle record has not
+    //   already adopted-and-retired is honored, because that
+    //   is where a predecessor publishes its fence when the
+    //   lifecycle write channel itself is failing (the
+    //   fallback channel), and where pre-separation stores
+    //   kept it. A document fence from the SAME owner as an
+    //   inactive lifecycle record is a retired leftover and is
+    //   ignored.
     // - A fence is cleared ONLY by proof: both thread halves
     //   cleared by the threads' own exits (recorded in the same
     //   authoritative record), or the owner PROCESS provably
@@ -1906,6 +2333,16 @@ class CaptureCoordinator(
     @Volatile
     private var lifecycleCorruptSeen: Boolean = false
 
+    /**
+     * A close-time fence publish failed on BOTH durable
+     * channels while predecessor threads were still alive
+     * (audit 7237720579): the fence may be invisible to a
+     * successor, so the state is degraded until a later publish
+     * succeeds.
+     */
+    @Volatile
+    private var fencePublishFailed: Boolean = false
+
     /** The result of evaluating the fence state. */
     private sealed class LifecycleEval {
         /** No active fence: the way is clear. */
@@ -1923,6 +2360,45 @@ class CaptureCoordinator(
 
     private enum class FenceVerdict {
         CLEAR, WAIT, WAIT_STORE_UNREADABLE, WAIT_LIFECYCLE_CORRUPT, STALE,
+    }
+
+    /**
+     * Lifecycle-record SCHEMA validation (audit 7237720579,
+     * A03 residual): JSON parsing alone is not validation — a
+     * record can parse and still be meaningless (wrong types,
+     * missing fields, inconsistent ownership). Every required
+     * field must be present with the right JSON type, and a
+     * record claiming known ownership must carry a usable
+     * identity. A schema-invalid record takes the corrupt
+     * path: preserved untouched, successor waits fail-safe.
+     */
+    private fun isValidLifecycleSchema(fence: JSONObject): Boolean {
+        fun number(key: String): Boolean {
+            val value = fence.opt(key) ?: return false
+            return value is Number
+        }
+        fun bool(key: String): Boolean = fence.opt(key) is Boolean
+        fun text(key: String): Boolean = fence.opt(key) is String
+        if (!number("version") || !bool("active") || !text("owner") ||
+            !number("owner_pid") || !number("owner_start") ||
+            !bool("owner_known") || !number("since_ms") ||
+            !bool("worker_alive") || !bool("writer_alive") ||
+            !text("reason")
+        ) {
+            return false
+        }
+        // Consistency: known ownership requires a usable
+        // process identity (a positive PID and a non-negative
+        // start time); without one the record cannot support
+        // any liveness proof and is not a valid fence.
+        if (fence.optBoolean("owner_known")) {
+            if (fence.optLong("owner_pid", 0L) <= 0L ||
+                fence.optLong("owner_start", -1L) < 0L
+            ) {
+                return false
+            }
+        }
+        return true
     }
 
     /** An inactive lifecycle fence (the record's empty state). */
@@ -2005,6 +2481,16 @@ class CaptureCoordinator(
         } catch (t: Throwable) {
             return LifecycleEval.Unreadable
         }
+        // The owner of an INACTIVE lifecycle record, when one
+        // exists: an in-document fence from that SAME owner was
+        // already adopted from the document and retired in this
+        // record, so the document copy is a leftover and must
+        // not resurrect it. An in-document fence from a
+        // DIFFERENT owner was never adopted — above all the
+        // fallback fence a predecessor published into the
+        // document when the lifecycle write channel itself was
+        // failing (audit 7237720579) — and it binds.
+        var inactiveLifecycleOwner: String? = null
         if (!raw.isNullOrBlank()) {
             val fence = try {
                 JSONObject(raw)
@@ -2016,27 +2502,50 @@ class CaptureCoordinator(
                 lifecycleCorruptSeen = true
                 return LifecycleEval.Corrupt
             }
-            return if (fence.optBoolean("active")) {
-                LifecycleEval.Active(fence)
-            } else {
-                LifecycleEval.Clear
+            if (!isValidLifecycleSchema(fence)) {
+                // Parses as JSON but violates the schema
+                // (audit 7237720579): same corrupt path —
+                // preserved, never acted on.
+                lifecycleCorruptSeen = true
+                return LifecycleEval.Corrupt
             }
+            if (fence.optBoolean("active")) {
+                return LifecycleEval.Active(fence)
+            }
+            inactiveLifecycleOwner = fence.optString("owner")
         }
-        // No lifecycle record yet: a store written before the
-        // separation may carry the fence inside the health
-        // document — adopt or evaluate it, never ignore it.
+        // No lifecycle record yet, or an inactive one: a store
+        // written before the separation may carry the fence
+        // inside the health document — and so may a predecessor
+        // whose lifecycle writes failed at publish time (the
+        // fallback channel). Adopt or evaluate it, never
+        // ignore it (subject to the retired-leftover rule
+        // above).
         val healthRaw = try {
             store.readCaptureHealth()
         } catch (t: Throwable) {
             return LifecycleEval.Unreadable
         }
         if (healthRaw.isNullOrBlank()) {
-            if (adopt) writeLifecycleLocked(emptyLifecycleFence())
+            if (adopt && inactiveLifecycleOwner == null) {
+                writeLifecycleLocked(emptyLifecycleFence())
+            }
             return LifecycleEval.Clear
         }
         val healthDoc = try {
             JSONObject(healthRaw)
         } catch (e: Exception) {
+            if (inactiveLifecycleOwner != null) {
+                // Post-separation the lifecycle record is the
+                // authority and it says INACTIVE; a corrupt
+                // document cannot resurrect a fence here (its
+                // corruption is quarantined as an incident by
+                // the health path, separately). The
+                // unknown-owner conservatism below guards only
+                // the UNSEPARATED state, where the document was
+                // the fence's only home.
+                return LifecycleEval.Clear
+            }
             val fence = unknownOwnerFence(
                 "dokumen kesehatan rusak saat catatan pagar belum " +
                     "terpisah — kepemilikan pendahulu tidak dapat " +
@@ -2047,7 +2556,17 @@ class CaptureCoordinator(
         }
         val legacy = healthDoc.optJSONObject("fence")
         if (legacy == null || !legacy.optBoolean("active")) {
-            if (adopt) writeLifecycleLocked(emptyLifecycleFence())
+            if (adopt && inactiveLifecycleOwner == null) {
+                writeLifecycleLocked(emptyLifecycleFence())
+            }
+            return LifecycleEval.Clear
+        }
+        if (inactiveLifecycleOwner != null &&
+            legacy.optString("owner") == inactiveLifecycleOwner
+        ) {
+            // The same fence the inactive lifecycle record
+            // already adopted and retired: a leftover document
+            // copy, not a live fence.
             return LifecycleEval.Clear
         }
         val fence = emptyLifecycleFence()
@@ -2087,12 +2606,20 @@ class CaptureCoordinator(
                         return@withLock false
                     }
                     val fence: JSONObject = if (!raw.isNullOrBlank()) {
-                        try {
+                        val parsed = try {
                             JSONObject(raw)
                         } catch (e: Exception) {
                             lifecycleCorruptSeen = true
                             return@withLock false
                         }
+                        if (!isValidLifecycleSchema(parsed)) {
+                            // Schema-invalid (audit
+                            // 7237720579): evidence, never
+                            // overwritten by a mutation.
+                            lifecycleCorruptSeen = true
+                            return@withLock false
+                        }
+                        parsed
                     } else {
                         when (val eval = evaluateLifecycleFenceLocked(adopt = true)) {
                             is LifecycleEval.Active -> eval.fence
@@ -2147,7 +2674,12 @@ class CaptureCoordinator(
             // process is alive by construction).
             return false
         }
-        return !store.isProcessAlive(identity)
+        // Audit 7237720579 (A03 residual): ONLY a positively
+        // proven DEAD clears the fence. ALIVE retains it, and
+        // UNKNOWN — a permission denial, a transient I/O error,
+        // a /proc visibility restriction, an unparseable stat —
+        // retains it too: a failed proof is not a proof.
+        return store.processLiveness(identity) == ProcessLiveness.DEAD
     }
 
     /** Evaluates a PREDECESSOR's fence from the lifecycle record. */
@@ -2174,13 +2706,18 @@ class CaptureCoordinator(
      * RE-RUN inside the store lock on the freshly loaded record
      * (the fence could have changed since the verdict), and the
      * clearing is recorded as a FENCE_ORPHAN_CLEARED incident —
-     * visible history, not a silent takeover.
+     * visible history, not a silent takeover. Both fence
+     * locations are attempted: the lifecycle record, and the
+     * health document (the legacy / fallback location, audit
+     * 7237720579 — a fence published there by a predecessor
+     * whose lifecycle channel failed must clear by the same
+     * proof, never strand a successor).
      */
     private fun clearStaleFence() {
         var didClear = false
         var clearedOwner = ""
         var clearedPid = 0L
-        val written = mutateLifecycle { fence ->
+        mutateLifecycle { fence ->
             if (!fence.optBoolean("active") ||
                 fence.optString("owner") == instanceId ||
                 !fenceStale(fence)
@@ -2194,7 +2731,24 @@ class CaptureCoordinator(
             fence.put("writer_alive", false)
             didClear = true
         }
-        if (written && didClear) {
+        if (!didClear) {
+            mutateHealth { doc ->
+                val fence = doc.optJSONObject("fence")
+                if (fence != null &&
+                    fence.optBoolean("active", false) &&
+                    fence.optString("owner") != instanceId &&
+                    fenceStale(fence)
+                ) {
+                    clearedOwner = fence.optString("owner")
+                    clearedPid = fence.optLong("owner_pid", 0L)
+                    fence.put("active", false)
+                    fence.put("worker_alive", false)
+                    fence.put("writer_alive", false)
+                    didClear = true
+                }
+            }
+        }
+        if (didClear) {
             recordIncident(
                 CaptureIncidentCategory.FENCE_ORPHAN_CLEARED,
                 CaptureIncidentStatus.RECOVERED,
@@ -2304,11 +2858,24 @@ class CaptureCoordinator(
      * time), so a later process can prove this one dead. The
      * fence is written to the lifecycle record — never to the
      * health document (audit A03).
+     *
+     * WRITE-FAILURE HARDENING (audit 7237720579, A03 residual):
+     * a failed lifecycle write must never silently leave a
+     * live-thread predecessor UNFENCED (a successor would then
+     * run alongside it). The publish retries the lifecycle
+     * channel, then falls back to writing the fence into the
+     * HEALTH DOCUMENT — the legacy location successors already
+     * adopt from when no lifecycle record exists, so the fence
+     * still binds them (their thread-exit clears cover that
+     * location too). Only when BOTH channels fail is the
+     * publish declared failed: a FENCE_PUBLISH_FAILED incident
+     * is recorded and the degraded state reports it — visible,
+     * never silent.
      */
     private fun publishSuccessorFenceIfNeeded(reason: String) {
         var publishedWorker = false
         var publishedWriter = false
-        val published = mutateLifecycle { fence ->
+        val fenceBlock: (JSONObject) -> Unit = { fence ->
             val workerAlive = captureWorker.isAlive
             val writerAlive = overflowWriter.isAlive
             if (workerAlive || writerAlive) {
@@ -2327,6 +2894,14 @@ class CaptureCoordinator(
                 publishedWriter = writerAlive
             }
         }
+        var published = false
+        var attempt = 0
+        while (!published && attempt < FENCE_PUBLISH_ATTEMPTS) {
+            attempt++
+            publishedWorker = false
+            publishedWriter = false
+            published = mutateLifecycle(fenceBlock)
+        }
         if (published && (publishedWorker || publishedWriter)) {
             logSafely(
                 "pagar penerus dicatat: worker/penulis pendahulu masih hidup " +
@@ -2334,6 +2909,98 @@ class CaptureCoordinator(
                     "penulis=$publishedWriter); koordinator pengganti " +
                     "ter-fence sampai keduanya berhenti",
             )
+            return
+        }
+        if (!captureWorker.isAlive && !overflowWriter.isAlive) {
+            // Nothing outlived close: no fence is owed, and a
+            // failed write of an unneeded fence is not a
+            // publish failure.
+            return
+        }
+        // Fallback channel: the fence inside the health
+        // document, in the exact legacy shape the successor
+        // adoption path reads.
+        publishedWorker = false
+        publishedWriter = false
+        val fallbackWritten = mutateHealth { doc ->
+            val workerAlive = captureWorker.isAlive
+            val writerAlive = overflowWriter.isAlive
+            if (workerAlive || writerAlive) {
+                val identity = healthStore?.processIdentity()
+                    ?: CaptureProcessIdentity(-1, -1)
+                doc.put(
+                    "fence",
+                    JSONObject().apply {
+                        put("active", true)
+                        put("owner", instanceId)
+                        put("owner_pid", identity.pid)
+                        put("owner_start", identity.startTicks)
+                        put("owner_known", identity.pid > 0)
+                        put("since_ms", clock())
+                        put("worker_alive", workerAlive)
+                        put("writer_alive", writerAlive)
+                        put("reason", reason)
+                    },
+                )
+                publishedWorker = workerAlive
+                publishedWriter = writerAlive
+            }
+        }
+        if (fallbackWritten && (publishedWorker || publishedWriter)) {
+            logSafely(
+                "pagar penerus dicatat lewat DOKUMEN KESEHATAN (saluran " +
+                    "lifecycle gagal $attempt kali): worker/penulis pendahulu " +
+                    "masih hidup sesudah close (worker=$publishedWorker, " +
+                    "penulis=$publishedWriter); pengganti ter-fence lewat " +
+                    "adopsi dokumen sampai keduanya berhenti",
+            )
+            return
+        }
+        // Both channels failed while threads are alive: the
+        // fence may be invisible to a successor. Record it —
+        // visible, never silent (audit 7237720579).
+        fencePublishFailed = true
+        recordIncident(
+            CaptureIncidentCategory.FENCE_PUBLISH_FAILED,
+            CaptureIncidentStatus.OPEN,
+            "publikasi pagar penerus gagal di saluran lifecycle " +
+                "($attempt percobaan) dan di dokumen kesehatan, padahal " +
+                "thread pendahulu masih hidup sesudah close — pengganti " +
+                "mungkin tidak melihat pagar ini",
+        )
+        logSafely(
+            "capture-lifecycle: publikasi pagar penerus GAGAL di kedua " +
+                "saluran padahal thread masih hidup — tercatat sebagai " +
+                "insiden fence_publish_failed",
+        )
+    }
+
+    /**
+     * Clears one half of this instance's fence in the HEALTH
+     * DOCUMENT — the fallback fence location (audit 7237720579:
+     * used when the lifecycle write channel itself failed at
+     * publish time). Mutates only when the document fence is
+     * ours and active, so the normal lifecycle path pays only
+     * one extra document mutation per thread exit.
+     */
+    private fun clearDocFenceHalf(workerHalf: Boolean) {
+        mutateHealth { doc ->
+            val fence = doc.optJSONObject("fence")
+            if (fence != null &&
+                fence.optBoolean("active", false) &&
+                fence.optString("owner") == instanceId
+            ) {
+                if (workerHalf) {
+                    fence.put("worker_alive", false)
+                } else {
+                    fence.put("writer_alive", false)
+                }
+                if (!fence.optBoolean("worker_alive", false) &&
+                    !fence.optBoolean("writer_alive", false)
+                ) {
+                    fence.put("active", false)
+                }
+            }
         }
     }
 
@@ -2346,6 +3013,7 @@ class CaptureCoordinator(
             fence.put("worker_alive", false)
             if (!fence.optBoolean("writer_alive")) fence.put("active", false)
         }
+        clearDocFenceHalf(workerHalf = true)
     }
 
     /** The overflow writer exited: clears its half of this instance's fence. */
@@ -2357,6 +3025,7 @@ class CaptureCoordinator(
             fence.put("writer_alive", false)
             if (!fence.optBoolean("worker_alive")) fence.put("active", false)
         }
+        clearDocFenceHalf(workerHalf = false)
     }
 
     /**
@@ -2408,7 +3077,7 @@ class CaptureCoordinator(
                     CaptureIncidentCategory.OVERFLOW_RECORD_LOST,
                     CaptureIncidentStatus.OPEN,
                     "${snapshot.packageName} @${snapshot.postTimeMs} (penulis overflow sudah berhenti)",
-                    identity = observationIdentity(snapshot),
+                    identity = obsIdentity(snapshot),
                 )
                 return
             }
@@ -2420,7 +3089,7 @@ class CaptureCoordinator(
                     CaptureIncidentCategory.OVERFLOW_RECORD_LOST,
                     CaptureIncidentStatus.OPEN,
                     "${snapshot.packageName} @${snapshot.postTimeMs} (antrean penulis overflow penuh)",
-                    identity = observationIdentity(snapshot),
+                    identity = obsIdentity(snapshot),
                 )
             }
         }
@@ -2534,7 +3203,7 @@ class CaptureCoordinator(
                     //   nothing about a lost one.
                     recoverIncident(CaptureIncidentCategory.DB_PERMANENT_FAILURE, "")
                     recoverOverflowRecordMetadata(
-                        observationIdentity(record.snapshot),
+                        obsIdentity(record.snapshot),
                     )
                 }
             }
@@ -2612,7 +3281,7 @@ class CaptureCoordinator(
                         CaptureIncidentCategory.OVERFLOW_RECORD_LOST,
                         CaptureIncidentStatus.OPEN,
                         "${snapshot.packageName} @${snapshot.postTimeMs} (antrean retry penuh)",
-                        identity = observationIdentity(snapshot),
+                        identity = obsIdentity(snapshot),
                     )
                     logSafely(
                         "catatan overflow hilang saat retry (${snapshot.packageName})",
@@ -2639,7 +3308,7 @@ class CaptureCoordinator(
                     CaptureIncidentStatus.OPEN,
                     "${snapshot.packageName} @${snapshot.postTimeMs} " +
                         "(retry habis: ${record.attempts} percobaan)",
-                    identity = observationIdentity(snapshot),
+                    identity = obsIdentity(snapshot),
                 )
                 logSafely(
                     "catatan overflow menyerah setelah ${record.attempts} percobaan " +
@@ -2710,6 +3379,7 @@ class CaptureCoordinator(
         overflowWriterFailures = overflowWriterFailures.get(),
         healthIncidentsDropped = healthIncidentsDropped.get(),
         healthStoreFailures = healthStoreFailures.get(),
+        healthJournalTimeouts = healthJournalTimeouts.get(),
     )
 
     /**
@@ -2790,6 +3460,20 @@ class CaptureCoordinator(
             reasons += "catatan lifecycle (pagar penerus) rusak — dipertahankan " +
                 "utuh sebagai bukti dan tidak pernah ditimpa; kepemilikan " +
                 "dianggap tidak dikenal, penerus menunggu fail-safe"
+        }
+        if (fencePublishFailed) {
+            reasons += "publikasi pagar penerus gagal di saluran lifecycle " +
+                "dan di dokumen kesehatan padahal thread pendahulu masih " +
+                "hidup — pengganti mungkin tidak melihat pagar ini " +
+                "(insiden fence_publish_failed tercatat)"
+        }
+        if (journalLagging || c.healthJournalTimeouts > 0) {
+            reasons += "jurnal penawaran insiden tertinggal dari counter " +
+                "(penyimpanan kesehatan lebih lambat dari batas " +
+                "${JOURNAL_WRITE_BOUND_MS}ms atau gagal): " +
+                "${c.healthJournalTimeouts} sinkronisasi melampaui batas — " +
+                "penawaran di jendela lag ini terpapar celah residual yang " +
+                "dinyatakan bila proses mati sebelum jurnal mengejar"
         }
         // Unresolved losses, exposed independently of component
         // health (audit P1-3): identity-keyed loss/unknown
@@ -3009,6 +3693,16 @@ class CaptureCoordinator(
                     "insiden terantre tetap ditulis di latar belakang",
             )
         }
+        // Final offer-journal sync (audit 7237720579, A06):
+        // every RECORD offered during this close (stranded
+        // overflow records, close settlements) must be durable
+        // in the journal before close returns, so the next
+        // start's reconciliation sees exact totals. Bounded
+        // like every journal wait; the journal executor then
+        // shuts down (later offers are counted as journal lag,
+        // never queued to a dead executor).
+        writeJournalBounded()
+        journalExecutor.shutdown()
     }
 
     /**
@@ -3052,7 +3746,7 @@ class CaptureCoordinator(
                     CaptureIncidentCategory.UNRESOLVED_AT_CLOSE,
                     CaptureIncidentStatus.OPEN,
                     "${active.snapshot?.packageName} @${active.snapshot?.postTimeMs}",
-                    identity = active.snapshot?.let { observationIdentity(it) } ?: "",
+                    identity = active.snapshot?.let { obsIdentity(it) } ?: "",
                 )
                 logSafely(
                     "capture tidak terselesaikan saat penutupan: " +
@@ -3089,7 +3783,7 @@ class CaptureCoordinator(
                     CaptureIncidentStatus.UNRECOVERABLE,
                     "${interrupted.snapshot?.packageName} " +
                         "@${interrupted.snapshot?.postTimeMs} (outcome=${interrupted.outcome})",
-                    identity = interrupted.snapshot?.let { observationIdentity(it) } ?: "",
+                    identity = interrupted.snapshot?.let { obsIdentity(it) } ?: "",
                 )
             }
             logSafely(
@@ -3594,7 +4288,7 @@ class CaptureCoordinator(
             val pkg = it.sourcePackage
             val sha = it.contentSha256
             if (pkg != null && sha != null) {
-                observationIdentity(pkg, it.occurredAtMs, sha)
+                obsIdentity(pkg, it.occurredAtMs, sha)
             } else {
                 null
             }

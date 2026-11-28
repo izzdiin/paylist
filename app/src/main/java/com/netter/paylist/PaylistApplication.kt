@@ -92,6 +92,17 @@ class PaylistApplication : Application(), Configuration.Provider {
         /** Key of the offer journal inside [CAPTURE_JOURNAL_PREFS]. */
         const val CAPTURE_JOURNAL_KEY: String = "capture_health_journal_v1"
 
+        /**
+         * Vault entry id of the capture OBSERVATION KEY (audit
+         * 7237720579, A05/A06): the durable HMAC key for
+         * observation identities. It lives in the SecretVault
+         * (Keystore-encrypted, its own prefs file) — never in
+         * the health document, the lifecycle record, the
+         * journal, or Room, i.e. never alongside the identities
+         * it derives.
+         */
+        const val OBSERVATION_KEY_ENTRY: String = "capture-observation-key"
+
         /** Monitor serialising capture-health file-lock sections inside this process. */
         private val HEALTH_FILE_LOCK_MONITOR = Any()
     }
@@ -102,6 +113,46 @@ class PaylistApplication : Application(), Configuration.Provider {
     val db: PaylistDatabase by lazy { PaylistDatabase.create(this) }
 
     val store: Store by lazy { Store(this) }
+
+    /**
+     * The durable observation key (audit 7237720579,
+     * A05/A06), loaded (or created) once per process from the
+     * SecretVault. When the vault cannot persist it
+     * (Keystore unavailable), the fallback is a
+     * process-lifetime random key: identities then stay keyed
+     * and unguessable, they just do not survive a restart —
+     * the unkeyed derivation is never used in production.
+     */
+    val observationKey: ByteArray? by lazy { loadOrCreateObservationKey() }
+
+    private fun loadOrCreateObservationKey(): ByteArray? {
+        val vault = SecretVault(this)
+        when (val existing = vault.secretFor(OBSERVATION_KEY_ENTRY)) {
+            is com.netter.paylist.security.SecretResult.Present -> {
+                val decoded = runCatching {
+                    java.util.Base64.getDecoder().decode(existing.value)
+                }.getOrNull()
+                if (decoded != null && decoded.size == 32) return decoded
+                // A malformed entry is replaced below.
+            }
+            else -> Unit
+        }
+        val fresh = ByteArray(32).also {
+            java.security.SecureRandom().nextBytes(it)
+        }
+        val stored = vault.putSecret(
+            OBSERVATION_KEY_ENTRY,
+            java.util.Base64.getEncoder().encodeToString(fresh),
+        )
+        return if (stored) {
+            fresh
+        } else {
+            // Vault write failed (e.g. Keystore invalidated):
+            // keep the key for this process only — still keyed,
+            // never a silent downgrade to unkeyed identities.
+            fresh
+        }
+    }
 
     val modeGate: ModeGate by lazy {
         ModeGate {
@@ -180,9 +231,12 @@ class PaylistApplication : Application(), Configuration.Provider {
         // a SIGKILL can beat). commit() for the document runs
         // ONLY on the coordinator's health-writer thread (and on
         // close / operator paths), never on a pipeline caller
-        // thread; the offer journal's minimal counter commit is
-        // the one deliberate exception (audit A06 — it is what
-        // makes pre-durable loss detectable). A failed commit
+        // thread; the offer journal's minimal counter commits
+        // run on the coordinator's dedicated journal thread,
+        // with offering callers waiting at most
+        // JOURNAL_WRITE_BOUND_MS for a sync (audit 7237720579,
+        // A06 — the bounded form of the A06 marker that makes
+        // pre-durable loss detectable). A failed commit
         // throws, so the failure is counted and surfaced instead
         // of swallowed. Document read-modify-writes serialise
         // process-wide through a file lock (plus a JVM monitor
@@ -268,6 +322,7 @@ class PaylistApplication : Application(), Configuration.Provider {
             consentStore = consentStore,
             captureLogDao = db.captureLogDao(),
             healthStore = healthStore,
+            observationKeyProvider = { observationKey },
         )
     }
 
