@@ -3336,4 +3336,522 @@ class CaptureOverflowTest {
             }
         }
 
+    @Test
+    fun ownershipRegistry_handshakeVariants_noOrphanClaim() {
+        // Audit 7242084700 (A03), the registry handshake in
+        // isolation, all three interleavings:
+        // (1) both exits recorded BEFORE the claim is
+        //     attempted — the claim must NOT be inserted, even
+        //     if the sampled threads (stale objects) still
+        //     report alive;
+        // (2) claim inserted while both halves live — it
+        //     stands;
+        // (3) exits AFTER the claim — the first exit leaves
+        //     the claim standing (one half still lives), the
+        //     second releases it in the same critical section.
+        val identity = CaptureProcessIdentity(4242, 111L)
+        val exitedFirst = "handshake-variant-exited-first"
+        CaptureOwnershipRegistry.noteThreadExit(exitedFirst, workerHalf = true)
+        CaptureOwnershipRegistry.noteThreadExit(exitedFirst, workerHalf = false)
+        assertFalse(
+            "exits recorded before the claim: no claim may be inserted",
+            CaptureOwnershipRegistry.claimIfAlive(
+                exitedFirst, identity, { true }, { true },
+            ),
+        )
+        assertFalse(
+            CaptureOwnershipRegistry.hasForeignClaim("handshake-observer"),
+        )
+        val claimedFirst = "handshake-variant-claimed-first"
+        assertTrue(
+            CaptureOwnershipRegistry.claimIfAlive(
+                claimedFirst, identity, { true }, { true },
+            ),
+        )
+        assertTrue(
+            "claim stands while both halves live",
+            CaptureOwnershipRegistry.hasForeignClaim("handshake-observer"),
+        )
+        CaptureOwnershipRegistry.noteThreadExit(claimedFirst, workerHalf = true)
+        assertTrue(
+            "one half still lives: claim still stands",
+            CaptureOwnershipRegistry.hasForeignClaim("handshake-observer"),
+        )
+        CaptureOwnershipRegistry.noteThreadExit(claimedFirst, workerHalf = false)
+        assertFalse(
+            "second exit releases the claim",
+            CaptureOwnershipRegistry.hasForeignClaim("handshake-observer"),
+        )
+    }
+
+    @Test
+    fun ownershipHandshake_exitBetweenSampleAndClaim_noOrphanClaim_successorProceeds() =
+        runBlocking {
+            // Audit 7242084700 (A03), the deterministic barrier
+            // test: the publish is parked INSIDE the registry
+            // handshake — after the liveness sample, before the
+            // claim insertion — and the stuck writer is then
+            // released so its exit handler runs INTO the parked
+            // handshake (it queues on the registry lock). The
+            // old code inserted the claim after both exits had
+            // already released, stranding a permanent foreign
+            // claim; the atomic handshake records the exit the
+            // moment the publish completes and releases the
+            // claim in the same section. The successor then
+            // proceeds WITHOUT a restart.
+            val health = FakeCaptureHealthStore()
+            coordinator = newCoordinator(healthStore = health)
+            val latch = blockExecutorWith(POST_TIME)
+            val writerLatch = CountDownLatch(1)
+            val claimParked = CountDownLatch(1)
+            val claimResume = CountDownLatch(1)
+            CaptureOwnershipRegistry.claimBarrierHook = {
+                claimParked.countDown()
+                claimResume.await(15, TimeUnit.SECONDS)
+            }
+            try {
+                awaitCondition("blocker capture-log row written") {
+                    store.captureLog.values.any {
+                        it.outcome == CaptureOutcome.CAPTURED
+                    }
+                }
+                for (i in 1..3) {
+                    coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+                }
+                captureLogDao.insertBlockLatch = writerLatch
+                coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+                awaitCondition("writer stuck inside the overflow insert") {
+                    captureLogDao.insertEntered.get() >= 1
+                }
+                health.failLifecycleWrites = true
+                health.failDocWrites = true
+                val closeThread = Thread { coordinator.close() }
+                closeThread.start()
+                assertTrue(
+                    "publish parked between liveness sample and claim",
+                    claimParked.await(15, TimeUnit.SECONDS),
+                )
+                // The writer exits into the parked handshake.
+                writerLatch.countDown()
+                Thread.sleep(500)
+                claimResume.countDown()
+                closeThread.join(20_000)
+                assertFalse("close() returned", closeThread.isAlive)
+                awaitCondition("writer thread exited") {
+                    !coordinator.isOverflowWriterAlive()
+                }
+                Thread.sleep(500)
+                val successor = newCoordinator(healthStore = health)
+                try {
+                    assertFalse(
+                        "no permanent foreign claim from the raced publish",
+                        successor.degradedState().successorFenced,
+                    )
+                    val eventsBefore = eventDao.count()
+                    successor.capture(snapshot(postTime = POST_TIME + 9_000L))
+                    awaitCondition("successor proceeds without a restart") {
+                        eventDao.count() == eventsBefore + 1
+                    }
+                } finally {
+                    runCatching { successor.close() }
+                }
+            } finally {
+                CaptureOwnershipRegistry.claimBarrierHook = null
+                claimResume.countDown()
+                captureLogDao.insertBlockLatch = null
+                writerLatch.countDown()
+                latch.countDown()
+            }
+        }
+
+    @Test
+    fun constructionDuringClose_successorWaits_concurrentCloseIsOneShot() =
+        runBlocking {
+            // Audit 7242084700 (A03): construction/close
+            // serialisation. The predecessor's close is parked
+            // mid-publish (both durable channels failing, writer
+            // stuck); a successor constructed DURING that close
+            // must already be excluded — the ownership claim is
+            // taken at the START of close, not only at publish —
+            // and a second, concurrent close() call must be a
+            // no-op (the one-shot sequence). Once the writer
+            // exits, the successor proceeds.
+            val health = FakeCaptureHealthStore()
+            coordinator = newCoordinator(healthStore = health)
+            val latch = blockExecutorWith(POST_TIME)
+            val writerLatch = CountDownLatch(1)
+            val claimParked = CountDownLatch(1)
+            val claimResume = CountDownLatch(1)
+            CaptureOwnershipRegistry.claimBarrierHook = {
+                claimParked.countDown()
+                claimResume.await(15, TimeUnit.SECONDS)
+            }
+            try {
+                awaitCondition("blocker capture-log row written") {
+                    store.captureLog.values.any {
+                        it.outcome == CaptureOutcome.CAPTURED
+                    }
+                }
+                for (i in 1..3) {
+                    coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+                }
+                captureLogDao.insertBlockLatch = writerLatch
+                coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+                awaitCondition("writer stuck inside the overflow insert") {
+                    captureLogDao.insertEntered.get() >= 1
+                }
+                health.failLifecycleWrites = true
+                health.failDocWrites = true
+                val closeThread = Thread { coordinator.close() }
+                closeThread.start()
+                assertTrue(
+                    "close parked mid-publish",
+                    claimParked.await(15, TimeUnit.SECONDS),
+                )
+                // Concurrent second close: returns at once,
+                // changes nothing.
+                val secondClose = Thread { coordinator.close() }
+                secondClose.start()
+                secondClose.join(5_000)
+                assertFalse(
+                    "concurrent close() is a no-op and returns",
+                    secondClose.isAlive,
+                )
+                // Successor constructed during the parked close.
+                val eventsBefore = eventDao.count()
+                val successor = newCoordinator(healthStore = health)
+                try {
+                    successor.capture(snapshot(postTime = POST_TIME + 9_000L))
+                    Thread.sleep(800)
+                    assertEquals(
+                        "successor constructed during close must not stage",
+                        eventsBefore, eventDao.count(),
+                    )
+                    assertTrue(
+                        "successor reports itself fenced during the close",
+                        successor.degradedState().successorFenced,
+                    )
+                    claimResume.countDown()
+                    writerLatch.countDown()
+                    closeThread.join(20_000)
+                    assertFalse("close() returned", closeThread.isAlive)
+                    awaitCondition(
+                        "successor proceeds once the predecessor's threads exited",
+                    ) {
+                        eventDao.count() == eventsBefore + 1
+                    }
+                } finally {
+                    runCatching { successor.close() }
+                }
+            } finally {
+                CaptureOwnershipRegistry.claimBarrierHook = null
+                claimResume.countDown()
+                captureLogDao.insertBlockLatch = null
+                writerLatch.countDown()
+                latch.countDown()
+            }
+        }
+
+    @Test
+    fun journalBudget_multiEpisodeBurstAndSlowLogger_totalWaitBounded() = runBlocking {
+        // Audit 7242084700 (A06): three corrections over the
+        // previous round. (1) The budget window is per BURST,
+        // not per sync episode: with a journal store that
+        // answers in ~150 ms, every offer's sync SETTLES before
+        // the next offer, so the old per-episode window handed
+        // each offer a fresh budget — twelve offers would have
+        // waited ~1.8 s. (2) The deadline is MONOTONIC: the
+        // window cannot be stretched by wall-clock movement
+        // (the budget path no longer reads the wall clock at
+        // all — the injected coordinator clock below is the
+        // wall clock the rest of the pipeline uses, and
+        // swinging it mid-burst changes nothing). (3) The lag
+        // log lines are OFF the caller: the logger below sleeps
+        // 300 ms per line, and the previous round emitted the
+        // lag lines synchronously, outside the wait budget.
+        val slowLines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val slowLogger = object : CaptureLogSink {
+            override fun logEvent(pkg: String, text: String) {
+                slowLines.add("$pkg: $text")
+            }
+
+            override fun logLocal(text: String) {
+                Thread.sleep(300)
+                slowLines.add(text)
+            }
+        }
+        val health = FakeCaptureHealthStore()
+        health.journalWriteDelayMs = 150
+        coordinator = newCoordinator(healthStore = health, loggerOverride = slowLogger)
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            val started = System.nanoTime()
+            for (i in 4..15) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            val elapsedMs = (System.nanoTime() - started) / 1_000_000
+            assertEquals(12, coordinator.counters().droppedOverflow)
+            assertTrue(
+                "a 12-record multi-episode burst with a 300 ms logger " +
+                    "stays inside one monotonic budget window " +
+                    "(was ${elapsedMs}ms; per-episode waits alone " +
+                    "would exceed 1.8 s)",
+                elapsedMs < 1_200,
+            )
+            awaitCondition("skipped waits counted as journal lag") {
+                coordinator.counters().healthJournalTimeouts >= 3
+            }
+        } finally {
+            latch.countDown()
+        }
+        health.journalWriteDelayMs = 0
+        coordinator.close()
+        awaitCondition("journal caught up after the store healed", 15_000L) {
+            val j = JSONObject(health.journal ?: "{}")
+            val d = JSONObject(health.doc ?: "{}")
+            j.optLong("offered", 0L) - j.optLong("dropped", 0L) ==
+                d.optLong("applied_count", 0L)
+        }
+        val successor = newCoordinator(healthStore = health)
+        try {
+            successor.flushHealthIncidents(5_000)
+            assertEquals(
+                "no unknown loss once the journal caught up",
+                null, health.incident(CaptureIncidentCategory.UNKNOWN_LOSS),
+            )
+        } finally {
+            runCatching { successor.close() }
+        }
+    }
+
+    @Test
+    fun journalBudget_monotonicDeadline_fakeClockJump_endsBurstWaits() = runBlocking {
+        // Audit 7242084700 (A06): the deadline arithmetic is
+        // driven by the monotonic source, deterministically:
+        // with the journal store slow (3 s), the first offers
+        // wait inside the window; when the monotonic clock is
+        // jumped past the deadline mid-burst (the deterministic
+        // stand-in for any real clock disturbance — the wall
+        // clock is not consulted on this path at all), every
+        // further offer in the burst returns WITHOUT waiting
+        // and is counted as lag, and the journal still catches
+        // up exactly once the store heals.
+        val health = FakeCaptureHealthStore()
+        health.journalWriteDelayMs = 3_000
+        coordinator = newCoordinator(healthStore = health)
+        val realNanos = { System.nanoTime() }
+        val jumpNanos = java.util.concurrent.atomic.AtomicLong(0L)
+        coordinator.monotonicNowNanos = { realNanos() + jumpNanos.get() }
+        val latch = blockExecutorWith(POST_TIME)
+        try {
+            for (i in 1..3) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            coordinator.capture(snapshot(postTime = POST_TIME + 4 * 1_000L))
+            // Jump the monotonic source PAST the burst
+            // deadline: the first offer's wait consumed ~250 ms
+            // of the 500 ms window, so +300 ms from here lands
+            // beyond the deadline while staying inside the
+            // burst's quiet gap measured from the last offer
+            // ACTIVITY (the waiting offer was never quiet) —
+            // the burst is the same burst, its window is simply
+            // over, whatever the wall clock does. (A jump of a
+            // minute would be indistinguishable from a minute
+            // of real quiet and would legitimately open a NEW
+            // burst; monotonic time cannot tell the two apart,
+            // by design.)
+            jumpNanos.set(300_000_000L)
+            val started = System.nanoTime()
+            for (i in 5..9) {
+                coordinator.capture(snapshot(postTime = POST_TIME + i * 1_000L))
+            }
+            val elapsedMs = (System.nanoTime() - started) / 1_000_000
+            assertTrue(
+                "offers after the monotonic deadline do not wait " +
+                    "(was ${elapsedMs}ms)",
+                elapsedMs < 400,
+            )
+            awaitCondition("post-deadline offers counted as journal lag") {
+                coordinator.counters().healthJournalTimeouts >= 5
+            }
+        } finally {
+            latch.countDown()
+        }
+        health.journalWriteDelayMs = 0
+        coordinator.close()
+        awaitCondition("journal caught up after the store healed", 15_000L) {
+            val j = JSONObject(health.journal ?: "{}")
+            val d = JSONObject(health.doc ?: "{}")
+            j.optLong("offered", 0L) - j.optLong("dropped", 0L) ==
+                d.optLong("applied_count", 0L)
+        }
+    }
+
+    @Test
+    fun reconcile_mixedJournal_legacyRemainderAndAttributed_claimedExactlyOnce() =
+        runBlocking {
+            // Audit 7242084700 (A06): the mixed-journal
+            // migration. The durable journal carries BOTH
+            // pre-attribution totals (offered 9, dropped 1) AND
+            // one attributed entry (dead-owner: offered 4,
+            // dropped 0) — the state left when the first
+            // attributed instance synced its entry, then died
+            // before a start reconciled the legacy totals. The
+            // document applied 2 in total, 1 of them attributed
+            // to dead-owner. Exact decomposition:
+            //   attributed gap = (4 - 0) - 1 = 3
+            //   legacy remainder = (9 - 4) - (1 - 0) = 4
+            //     accounted, applied share = 2 - 1 = 1 -> gap 3
+            // Total claim must be exactly 6, applied_count must
+            // land on offered - dropped = 8, and the next start
+            // must claim nothing more.
+            val health = FakeCaptureHealthStore()
+            health.journal = JSONObject().apply {
+                put("offered", 9L)
+                put("dropped", 1L)
+                put(
+                    "instances",
+                    JSONObject().apply {
+                        put(
+                            "dead-owner",
+                            JSONObject().apply {
+                                put("offered", 4L)
+                                put("dropped", 0L)
+                                put("pid", 9999)
+                                put("start", 5L)
+                            },
+                        )
+                    },
+                )
+            }.toString()
+            health.seedDoc(
+                JSONObject().apply {
+                    put("version", 2)
+                    put("applied_count", 2L)
+                    put(
+                        "applied_by",
+                        JSONObject().apply { put("dead-owner", 1L) },
+                    )
+                    put("incidents", org.json.JSONArray())
+                }.toString(),
+            )
+            val claimer = newCoordinator(healthStore = health)
+            coordinator = claimer
+            try {
+                awaitCondition("mixed journal claimed") {
+                    health.incident(CaptureIncidentCategory.UNKNOWN_LOSS) != null
+                }
+                assertEquals(
+                    "legacy remainder + attributed gap claimed exactly",
+                    6L,
+                    health.incident(CaptureIncidentCategory.UNKNOWN_LOSS)
+                        ?.optLong("count"),
+                )
+                awaitCondition("applied_count lands on offered - dropped") {
+                    JSONObject(health.doc ?: "{}")
+                        .optLong("applied_count", 0L) == 8L
+                }
+            } finally {
+                runCatching { claimer.close() }
+            }
+            val second = newCoordinator(healthStore = health)
+            coordinator = second
+            try {
+                Thread.sleep(1_500)
+                second.flushHealthIncidents(5_000)
+                assertEquals(
+                    "the mixed claim is not repeated by the next start",
+                    6L,
+                    health.incident(CaptureIncidentCategory.UNKNOWN_LOSS)
+                        ?.optLong("count"),
+                )
+            } finally {
+                runCatching { second.close() }
+            }
+        }
+
+    @Test
+    fun reconcile_lateJournalUpdate_claimedExactlyOnceOnNextStart() = runBlocking {
+        // Audit 7242084700 (A06): a LATE journal update — the
+        // dead owner's lagging sync lands AFTER a successor
+        // already reconciled the owner's then-current gap.
+        // Phase 1: journal says dead-owner offered 3, applied
+        // 1 -> the first successor claims exactly 2 and marks
+        // reconciled_by = 2. Phase 2: the journal entry grows
+        // to offered 5 (the late delta) -> the next start
+        // claims exactly the growth (2 more, total 4), never
+        // the whole gap again. Phase 3: a further start claims
+        // nothing.
+        val health = FakeCaptureHealthStore()
+        fun journalWith(offered: Long): String = JSONObject().apply {
+            put("offered", offered)
+            put("dropped", 0L)
+            put(
+                "instances",
+                JSONObject().apply {
+                    put(
+                        "dead-owner",
+                        JSONObject().apply {
+                            put("offered", offered)
+                            put("dropped", 0L)
+                            put("pid", 9999)
+                            put("start", 5L)
+                        },
+                    )
+                },
+            )
+        }.toString()
+        health.journal = journalWith(3L)
+        health.seedDoc(
+            JSONObject().apply {
+                put("version", 2)
+                put("applied_count", 1L)
+                put(
+                    "applied_by",
+                    JSONObject().apply { put("dead-owner", 1L) },
+                )
+                put("incidents", org.json.JSONArray())
+            }.toString(),
+        )
+        val first = newCoordinator(healthStore = health)
+        coordinator = first
+        try {
+            awaitCondition("first claim lands") {
+                health.incident(CaptureIncidentCategory.UNKNOWN_LOSS)
+                    ?.optLong("count") == 2L
+            }
+        } finally {
+            runCatching { first.close() }
+        }
+        // The late delta lands after the first reconciliation.
+        health.journal = journalWith(5L)
+        val second = newCoordinator(healthStore = health)
+        coordinator = second
+        try {
+            awaitCondition("late growth claimed exactly once") {
+                health.incident(CaptureIncidentCategory.UNKNOWN_LOSS)
+                    ?.optLong("count") == 4L
+            }
+        } finally {
+            runCatching { second.close() }
+        }
+        val third = newCoordinator(healthStore = health)
+        coordinator = third
+        try {
+            Thread.sleep(1_500)
+            third.flushHealthIncidents(5_000)
+            assertEquals(
+                "no third claim: the late update was counted exactly once",
+                4L,
+                health.incident(CaptureIncidentCategory.UNKNOWN_LOSS)
+                    ?.optLong("count"),
+            )
+        } finally {
+            runCatching { third.close() }
+        }
+    }
+
 }
